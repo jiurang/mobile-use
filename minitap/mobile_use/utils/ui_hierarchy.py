@@ -1,3 +1,6 @@
+import re
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from minitap.mobile_use.utils.logger import get_logger
@@ -121,12 +124,46 @@ class ElementBounds(BaseModel):
         )
 
 
+_ANDROID_BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+
+def _coord_to_int(value: Any) -> int:
+    """坐标转 int；iOS 客户端给的是 float。非数字会抛异常。"""
+    return int(round(float(value)))
+
+
 def get_bounds_for_element(element: dict) -> ElementBounds | None:
-    bounds = element.get("bounds", None)
-    if bounds:
-        try:
-            return ElementBounds(**bounds)
-        except Exception as e:
-            logger.error(f"Failed to validate bounds: {e}")
-            return None
+    """返回元素的 bounds，读不出来时返回 None。
+
+    覆盖各平台客户端实际会产出的全部形状：
+      - Android：``"bounds": "[x1,y1][x2,y2]"``（是**字符串**，来自 uiautomator）
+      - iOS / 云设备：``"frame": {"x", "y", "width", "height"}``（float）
+      - 部分调用方/测试：``"bounds": {"x", "y", "width", "height"}``
+    """
+    for key in ("bounds", "frame"):
+        raw = element.get(key)
+        if not raw:
+            continue
+
+        # Android 的字符串形式给的是两个角点，不是 x/y/width/height。
+        if isinstance(raw, str):
+            match = _ANDROID_BOUNDS_RE.match(raw.strip())
+            if not match:
+                logger.error(f"Failed to parse bounds: {raw!r}")
+                return None
+            x1, y1, x2, y2 = (_coord_to_int(v) for v in match.groups())
+            return ElementBounds(x=x1, y=y1, width=x2 - x1, height=y2 - y1)
+
+        if isinstance(raw, dict):
+            try:
+                return ElementBounds(
+                    x=_coord_to_int(raw["x"]),
+                    y=_coord_to_int(raw["y"]),
+                    width=_coord_to_int(raw["width"]),
+                    height=_coord_to_int(raw["height"]),
+                )
+            except (KeyError, TypeError, ValueError) as e:
+                logger.error(f"Failed to validate bounds: {e}")
+                return None
+
     return None

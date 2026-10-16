@@ -128,11 +128,11 @@ def test_get_bounds_for_element():
     bounds = get_bounds_for_element(element_no_bounds)
     assert bounds is None
 
-    # Suppress logger output for the invalid bounds test case
+    # 屏蔽非法 bounds 用例的日志输出
     with patch("minitap.mobile_use.utils.ui_hierarchy.logger.error"):
         element_invalid_bounds = {
             "bounds": {
-                "x": "invalid",  # Should be int
+                "x": "invalid",  # 本应是 int
                 "y": 20,
                 "width": 100,
                 "height": 50,
@@ -140,6 +140,40 @@ def test_get_bounds_for_element():
         }
         bounds = get_bounds_for_element(element_invalid_bounds)
         assert bounds is None
+
+
+def test_get_bounds_for_element_android_string_form():
+    """真实的 uiautomator 形状：bounds 是表示两个角点的**字符串**。
+
+    回归用例：以前这个字符串被直接塞进 `ElementBounds(**bounds)`，于是每个
+    Android 元素都抛 TypeError，再被 except 吞掉、静默返回 None。
+    """
+    bounds = get_bounds_for_element({"bounds": "[91,2446][1129,2583]"})
+    assert bounds == ElementBounds(x=91, y=2446, width=1038, height=137)
+
+    # center 才是点击路径真正要用的值
+    assert bounds is not None
+    assert bounds.get_center() == Point(x=610, y=2514)
+
+    # 负坐标 / 零尺寸也要得到结构合法的结果
+    assert get_bounds_for_element({"bounds": "[0,0][0,0]"}) == ElementBounds(
+        x=0, y=0, width=0, height=0
+    )
+
+    with patch("minitap.mobile_use.utils.ui_hierarchy.logger.error"):
+        assert get_bounds_for_element({"bounds": "not a bounds string"}) is None
+        assert get_bounds_for_element({"bounds": "[1,2][3]"}) is None
+
+
+def test_get_bounds_for_element_ios_frame_form():
+    """iOS / 云设备客户端给的是 `frame`，坐标是 float，而且没有 `bounds` 字段。"""
+    bounds = get_bounds_for_element(
+        {"frame": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 50.0}}
+    )
+    assert bounds == ElementBounds(x=10, y=20, width=100, height=50)
+
+    with patch("minitap.mobile_use.utils.ui_hierarchy.logger.error"):
+        assert get_bounds_for_element({"frame": {"x": 1, "y": 2}}) is None
 
 
 def test_element_bounds():
