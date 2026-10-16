@@ -1,15 +1,18 @@
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, Literal, TypeVar, overload
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable
 from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_openai import ChatOpenAI
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from minitap.mobile_use.config import (
     AgentNode,
@@ -208,24 +211,123 @@ def get_azure_llm(model_name: str, temperature: float = 1) -> AzureAIOpenAIApiCh
     return client
 
 
-class MiniMaxChatOpenAI(ChatOpenAI):
-    """ChatOpenAI variant that defaults structured output to tool calling.
+class _MiniMaxStructuredRunnable(Runnable):
+    """Bypass LangChain's with_structured_output for MiniMax models.
 
-    Every mobile-use agent extracts its result with ``with_structured_output(...)``.
-    ``ChatOpenAI`` defaults that to ``method="json_schema"`` (i.e. it sends
-    ``response_format: {"type": "json_schema", ...}``), but the MiniMax chat
-    completions API silently ignores ``response_format`` and answers with a
-    ``<think>...</think>`` prefixed free-form message. The OpenAI SDK then tries
-    to JSON-decode that text and raises ``ValueError: expected value at line 1
-    column 1``.
+    Why this exists:
 
-    MiniMax does honour classic tool calling, so force ``function_calling`` here
-    and every call site keeps working unchanged.
+    * langchain-openai 0.3.x ``ChatOpenAI.with_structured_output(method="function_calling")``
+      binds the schema as ``response_format`` (not as a tool), which routes the
+      response through OpenAI SDK's ``json_schema`` parser. Verified by hooking
+      ``_get_request_payload``: the payload contains ``response_format=<PydanticClass>``
+      and *no* ``tools`` field.
+    * MiniMax's OpenAI-compatible endpoint ignores ``response_format`` and
+      instead answers with either ``<think>...</think>`` (when thinking is on) or
+      ```json\n{...}\n``` (when thinking is off). Both fail the OpenAI SDK parser,
+      and ``result.parsed`` comes back as ``None``, which the planner then
+      trips over with ``AttributeError: 'NoneType' object has no attribute
+      'subgoals'``.
+
+    This runnable just calls ``ainvoke`` directly, then parses the resulting
+    ``AIMessage`` ourselves:
+
+    1. If ``tool_calls`` are present, validate the first one's ``args`` against
+       the schema (works when MiniMax honours tool calling, e.g. M3 with
+       thinking on, M2.7, etc.).
+    2. Otherwise strip ```json fences from ``content`` and validate (works when
+       MiniMax emits markdown JSON, e.g. M3 with thinking disabled).
+
+    Other call sites that use ``with_structured_output`` (orchestrator, cortex,
+    executor, contextor, hopper, outputter) all use Pydantic schemas, so this
+    single code path covers everything.
     """
 
-    def with_structured_output(self, schema=None, **kwargs):
-        kwargs.setdefault("method", "function_calling")
-        return super().with_structured_output(schema, **kwargs)
+    def __init__(self, llm: ChatOpenAI, schema: type[BaseModel]):
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        self.llm = llm
+        self.schema = schema
+        # Pre-bind the schema as an OpenAI tool with a forced tool_choice.
+        # Without a tool definition in the request, MiniMax-M3 (thinking on)
+        # answers by emitting ```json...``` inside its <think>...</think>
+        # content block instead of using tool_calls. Pre-binding makes M3 emit
+        # proper tool_calls, which we then parse in ``_parse``. We disable
+        # parallel tool calls to keep tool_choice deterministic.
+        tool_name = convert_to_openai_tool(schema)["function"]["name"]
+        self._bound = llm.bind_tools([schema], tool_choice=tool_name, parallel_tool_calls=False)
+
+    def invoke(self, input, config=None, **kwargs):
+        msg = self._bound.invoke(input, config=config, **kwargs)
+        return self._parse(msg)
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        msg = await self._bound.ainvoke(input, config=config, **kwargs)
+        return self._parse(msg)
+
+    @staticmethod
+    def _strip_markdown_json(text: str) -> str:
+        text = text.strip()
+        # Drop MiniMax-M3 <think>...</think> reasoning block first. With
+        # thinking on, M3 wraps the JSON inside the thinking block AND mimics
+        # the ```json fence it saw in the planner.md prompt, so the response
+        # looks like:
+        #     <think>...reasoning...\n```json\n{...}\n```</think>
+        # Strip thinking before stripping fences, otherwise the leading <think>
+        # survives and the JSON parser fails on "<" at column 1.
+        text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+        # ```json\n{...}\n```  or  ```\n{...}\n```
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        return text.strip()
+
+    def _parse(self, msg: AIMessage) -> BaseModel:
+        # 1) tool_calls 路径 (M3 thinking 开 / M2.7 等)
+        # Note: LangChain normalises OpenAI tool_calls into ``{"name", "args",
+        # "id", "type"}`` dicts where ``args`` is already parsed into a Python
+        # object, NOT a JSON string. So we use ``model_validate`` (dict) or
+        # ``model_validate_json`` (str) depending on the type we actually get.
+        for tc in msg.tool_calls or []:
+            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+            if args is None:
+                continue
+            try:
+                if isinstance(args, str):
+                    return self.schema.model_validate_json(args)
+                return self.schema.model_validate(args)
+            except ValidationError:
+                continue
+        # 2) content 路径 (M3 thinking 关 / Markdown JSON 兜底)
+        content = msg.content if isinstance(msg.content, str) else ""
+        if content.strip():
+            return self.schema.model_validate_json(self._strip_markdown_json(content))
+        raise ValueError(
+            f"MiniMax response had no tool_calls and no parseable content. "
+            f"finish_reason={getattr(msg, 'response_metadata', {}).get('finish_reason')!r}, "
+            f"content[:200]={content[:200]!r}"
+        )
+
+
+class MiniMaxChatOpenAI(ChatOpenAI):
+    """ChatOpenAI variant for MiniMax that bypasses LangChain's broken
+    ``with_structured_output`` integration.
+
+    See ``_MiniMaxStructuredRunnable`` for the full rationale. In short:
+    langchain-openai 0.3.x binds the schema as ``response_format`` (not as a
+    tool), but MiniMax does not honour ``response_format`` and replies with
+    either ``<think>...</think>`` or ```json...``` in the content field, which
+    the OpenAI SDK's json_schema parser cannot decode. We sidestep the whole
+    thing with a custom ``Runnable`` that parses the AIMessage directly.
+    """
+
+    def with_structured_output(self, schema=None, **kwargs):  # type: ignore[override]
+        # langchain-openai's signature accepts dict / TypedDict / Pydantic for
+        # ``schema``. mobile-use only ever passes Pydantic classes, but keep
+        # the door open: if a non-Pydantic schema slips in, fall back to the
+        # upstream implementation so we don't silently misbehave elsewhere.
+        if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+            kwargs.setdefault("method", "function_calling")
+            return super().with_structured_output(schema, **kwargs)
+        return _MiniMaxStructuredRunnable(self, schema)
 
 
 def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) -> ChatOpenAI:
