@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 from jinja2 import Template
@@ -27,6 +26,7 @@ from minitap.mobile_use.tools.index import (
 from minitap.mobile_use.utils.conversations import get_screenshot_message_for_llm
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.ui_hierarchy_view import render_ui_hierarchy
 
 logger = get_logger(__name__)
 
@@ -78,10 +78,9 @@ class CortexNode:
             messages.append(AIMessage(content=thought))
 
         if state.latest_ui_hierarchy:
-            ui_hierarchy_dict: list[dict] = state.latest_ui_hierarchy
-            ui_hierarchy_str = json.dumps(ui_hierarchy_dict, indent=2, ensure_ascii=False)
-            messages.append(HumanMessage(content="Here is the UI hierarchy:\n" + ui_hierarchy_str))
-
+            # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，
+            # 因为工具要拿它来解析 target。
+            messages.append(HumanMessage(content=render_ui_hierarchy(state.latest_ui_hierarchy)))
         if state.latest_screenshot:
             controller = create_device_controller(self.ctx)
             compressed_image_base64 = controller.get_compressed_b64_screenshot(

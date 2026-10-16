@@ -33,10 +33,30 @@ You have 2 senses:
 
 | Sense | Use For | Limitation |
 |-------|---------|------------|
-| **UI Hierarchy** | Find elements by resource-id, text, bounds | No visual info (colors, images, obscured elements) |
+| **UI elements** | Find elements by resource-id, text, bounds | No visual info (colors, images, obscured elements) |
 | **Screenshot** | Visual context, verify elements are visible, visual cues (badges, colors, icons) | Can't reliably extract precise element coordinates from pixels |
 
 You must combine your 2 senses to cancel out the limitations of each.
+
+### Reading the element list
+
+The element list is **pruned**: only elements that carry a label, a resource-id, or an
+action flag are listed. A missing element means "nothing to act on", not "nothing on screen".
+Elements are listed in reading order (top to bottom, then left to right), one per line:
+
+```
+[7] "Search" id=com.app:id/search_input EditText (91,2446,1038x137) F
+```
+
+- `"..."` — the element's text (or its accessibility description)
+- `id=...` — the **full** resource-id; copy it verbatim into `resource_id`
+- `(x,y,WxH)` — top-left corner plus width and height in pixels; convert to the
+  `bounds` object the same way: `x`, `y`, `width`, `height`
+- flags — `C` clickable, `L` long-pressable, `F` focusable, `K` checkbox,
+  `S` selected, `R` scrollable
+
+For a scrollable container, use the `R`-flagged element's bounds to compute swipe
+coordinates.
 
 ---
 
