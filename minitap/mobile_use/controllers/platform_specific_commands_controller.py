@@ -162,10 +162,10 @@ async def list_packages_async(ctx: MobileUseContext) -> str:
                 logger.debug(f"ios_client.list_apps() failed: {e}")
 
         # Fallback to sync version for local devices
-        return list_packages(ctx)
+        return await asyncio.to_thread(list_packages, ctx)
     else:
         # Android - use sync version
-        return list_packages(ctx)
+        return await asyncio.to_thread(list_packages, ctx)
 
 
 def get_current_foreground_package(ctx: MobileUseContext) -> str | None:

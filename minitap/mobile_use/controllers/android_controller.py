@@ -91,7 +91,11 @@ class AndroidDeviceController(MobileDeviceController):
         """Get screen data using the UIAutomator2 client"""
         try:
             logger.info("Using UIAutomator2 for screen data retrieval")
-            ui_data = self.ui_adb_client.get_screen_data()
+            # to_thread: UIAutomatorClient is a sync client (adb subprocess +
+            # HTTP to the on-device u2 agent), and this runs on the same event
+            # loop as the TUI. Calling it inline freezes the UI for the whole
+            # hierarchy dump + screenshot.
+            ui_data = await asyncio.to_thread(self.ui_adb_client.get_screen_data)
             return ScreenDataResponse(
                 base64=ui_data.base64,
                 elements=ui_data.elements,

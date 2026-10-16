@@ -1,4 +1,4 @@
-import time
+import asyncio
 from typing import Annotated
 
 from langchain_core.messages import ToolMessage
@@ -43,7 +43,10 @@ def get_wait_for_delay_tool(ctx: MobileUseContext):
         if time_in_ms > MAX_DELAY_MS:
             time_in_ms = MAX_DELAY_MS
         try:
-            time.sleep(time_in_ms / 1000)
+            # `await asyncio.sleep`, never `time.sleep`: this tool and the TUI
+            # share one event loop, so a blocking sleep freezes the whole UI
+            # (spinner, clock, event pump, key handling) for the full delay.
+            await asyncio.sleep(time_in_ms / 1000)
             output = None
             has_failed = False
         except Exception as e:
