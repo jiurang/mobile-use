@@ -28,6 +28,10 @@ dependencies = [
     "langchain-anthropic>=1.0.0",
     "langchain-openai>=1.0.0",
     "typer==0.16.0",
+    "textual>=8.2.8,<9.0.0",
+    # PIL is imported directly by controllers/sdk (and by the TUI screenshot panel),
+    # but was only ever pulled in transitively.
+    "pillow>=11.0.0",
     "langchain-cerebras>=0.8.0",
     "inquirer>=3.4.0",
     "sseclient-py>=1.8.0",
@@ -58,6 +62,7 @@ dev = [
 
 [project.scripts]
 mobile-use = "minitap.mobile_use.main:cli"
+mobile-use-tui = "minitap.mobile_use.tui.cli:cli"
 
 [project.urls]
 "Homepage" = "https://minitap.ai/"

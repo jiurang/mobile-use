@@ -260,6 +260,48 @@ python ./minitap/mobile_use/main.py \
 > [!NOTE]
 > If you haven't configured a specific model, mobile-use will prompt you to choose one from the available options.
 
+### 🖥️ Interactive TUI
+
+For hands-on work, `mobile-use-tui` opens a terminal UI instead of exiting after
+one goal. It keeps a single agent session alive, so you can send several goals in
+a row and watch each one being executed, with a live view of the device screen.
+
+```bash
+mobile-use-tui                 # interactive session on a connected device
+mobile-use-tui --demo          # UI preview: fake device, no LLM key needed
+```
+
+Type a goal in the prompt and press enter. While a goal runs, the status bar
+shows a spinner, the agent currently executing and the elapsed time. The panel
+on the right reports the connected device (platform, id, screen size), token
+spend, elapsed time and progress counters (steps and device actions). Press
+`ctrl+t` to stop the running task, `ctrl+l` to clear the timeline, `ctrl+o` to
+show the SDK's own logs (they are captured rather than printed over the screen —
+warnings and errors are always visible), and `ctrl+c` to quit.
+
+> [!NOTE]
+> The token counter shows `n/a` when the configured provider does not report
+> usage. Some OpenAI-compatible endpoints — including the MiniMax one this
+> project defaults to — omit it from the response entirely, and reporting a
+> zero would read as "this run was free".
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--demo` | off | Run with a fake device and no LLM key (UI preview). |
+| `-d`, `--device-type` | `local` | `local` for connected devices, `cloud` for Minitap cloud devices. |
+| `--cloud-platform` | — | Cloud device platform: `android` or `ios`. Required with `--device-type cloud`. |
+| `--with-video-recording-tools` | off | Enable AI agents to use video recording tools. |
+| `--wda-url` | — | Override the WebDriverAgent URL (iOS). |
+| `--wda-auto-start-wda` / `--no-wda-auto-start-wda` | — | Auto-build and run WDA if it is not responding (iOS). |
+| `--wda-project-path` | — | Path to `WebDriverAgent.xcodeproj` (iOS). |
+| `--idb-host` / `--idb-port` | — | IDB companion host and port (iOS simulators). |
+
+> [!NOTE]
+> The TUI needs an interactive terminal. For CI, non-TTY scripts or piped
+> output, keep using `mobile-use "<goal>"`. The agents call their models with
+> `ainvoke()` rather than streaming, so the TUI shows discrete agent/tool events
+> (with durations) rather than a token-by-token stream.
+
 ## 🔎 Agentic System Overview
 
 <div align="center">
