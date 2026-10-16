@@ -1,13 +1,10 @@
 import asyncio
-import base64
 import re
 import tempfile
 import time
-from io import BytesIO
 from pathlib import Path
 
 from adbutils import AdbClient, AdbDevice
-from PIL import Image
 
 from minitap.mobile_use.clients.ui_automator_client import UIAutomatorClient
 from minitap.mobile_use.controllers.device_controller import (
@@ -15,6 +12,7 @@ from minitap.mobile_use.controllers.device_controller import (
     ScreenDataResponse,
 )
 from minitap.mobile_use.controllers.types import Bounds, CoordinatesSelectorRequest, TapOutput
+from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.video import (
     ANDROID_MAX_RECORDING_DURATION_SECONDS,
@@ -301,17 +299,7 @@ class AndroidDeviceController(MobileDeviceController):
         pass
 
     def get_compressed_b64_screenshot(self, image_base64: str, quality: int = 50) -> str:
-        if image_base64.startswith("data:image"):
-            image_base64 = image_base64.split(",")[1]
-
-        image_data = base64.b64decode(image_base64)
-        image = Image.open(BytesIO(image_data))
-
-        compressed_io = BytesIO()
-        image.save(compressed_io, format="JPEG", quality=quality, optimize=True)
-
-        compressed_base64 = base64.b64encode(compressed_io.getvalue()).decode("utf-8")
-        return compressed_base64
+        return compress_screenshot_base64(image_base64, quality=quality)
 
     async def _start_android_segment(
         self, session: RecordingSession

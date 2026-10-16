@@ -6,6 +6,7 @@ from langchain_core.messages import BaseMessage
 
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.controller_factory import create_device_controller
+from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -22,8 +23,12 @@ async def record_interaction(ctx: MobileUseContext, response: BaseMessage):
     screenshot_base64 = await controller.screenshot()
     logger.info("Screenshot taken")
     try:
-        controller = create_device_controller(ctx)
-        compressed_screenshot_base64 = controller.get_compressed_b64_screenshot(screenshot_base64)
+        # 录制走的是**证据**路径，不缩放：`get_compressed_b64_screenshot` 默认会把长边
+        # 压到视觉 tile 尺寸（省给 LLM 的 token），但复盘 bug 时需要看清小字和角标，
+        # 糊掉的截图会让排查无从下手。这里显式传 None 保留原始分辨率。
+        compressed_screenshot_base64 = compress_screenshot_base64(
+            screenshot_base64, max_width=None, max_height=None
+        )
     except Exception as e:
         logger.error(f"Error compressing screenshot: {e}")
         return "Could not record this interaction"

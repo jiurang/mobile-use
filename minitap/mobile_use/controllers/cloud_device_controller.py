@@ -5,14 +5,11 @@ Supports both Android (via ADB forwarding with SDK-based WebSocket tunnel) and i
 """
 
 import asyncio
-import base64
 import re
 import shlex
-from io import BytesIO
 
 from adbutils import AdbClient
 from idb.common.types import HIDButtonType
-from PIL import Image
 
 from minitap.mobile_use.clients.adb_tunnel import AdbTunnel
 from minitap.mobile_use.clients.idb_client import IOSAppInfo
@@ -23,6 +20,7 @@ from minitap.mobile_use.controllers.device_controller import (
     ScreenDataResponse,
 )
 from minitap.mobile_use.controllers.types import Bounds, CoordinatesSelectorRequest, TapOutput
+from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.video import DEFAULT_MAX_DURATION_SECONDS, VideoRecordingResult
 
@@ -406,16 +404,7 @@ class CloudAndroidController(MobileDeviceController):
 
     def get_compressed_b64_screenshot(self, image_base64: str, quality: int = 50) -> str:
         """Compress a base64 image."""
-        if image_base64.startswith("data:image"):
-            image_base64 = image_base64.split(",")[1]
-
-        image_data = base64.b64decode(image_base64)
-        image = Image.open(BytesIO(image_data))
-
-        compressed_io = BytesIO()
-        image.save(compressed_io, format="JPEG", quality=quality, optimize=True)
-
-        return base64.b64encode(compressed_io.getvalue()).decode("utf-8")
+        return compress_screenshot_base64(image_base64, quality=quality)
 
     async def start_video_recording(
         self,
