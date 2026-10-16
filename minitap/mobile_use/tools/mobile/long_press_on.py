@@ -10,6 +10,7 @@ from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.tools.bounds_validation import coordinates_look_like_hierarchy_derived
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.utils.logger import get_logger
@@ -50,31 +51,42 @@ def get_long_press_on_tool(ctx: MobileUseContext) -> BaseTool:
 
         # 1. Try with COORDINATES FIRST (visual approach)
         if target.bounds:
-            try:
-                center_point = target.bounds.get_center()
-                logger.info(
-                    f"Attempting to long press using coordinates: {center_point.x},{center_point.y}"
-                )
-                latest_selector_info = f"coordinates='{target.bounds}'"
-                result = await controller.tap_at(
-                    x=center_point.x,
-                    y=center_point.y,
-                    long_press=True,
-                    long_press_duration=duration_ms,
-                )
-                if result.error is None:  # Success
-                    error_obj = None
-                else:
-                    logger.warning(
-                        f"Long press with coordinates '{target.bounds}' failed. "
-                        f"Error: {result.error}"
+            # 与 tap 同一套校验：坐标若不像是从层级树抄来的，就别去点一个不知道在哪的地方，
+            # 直接让位给 resource_id / text 两级兜底。
+            derived_ok, derived_reason = await coordinates_look_like_hierarchy_derived(
+                ctx=ctx, target=target
+            )
+            if not derived_ok:
+                logger.warning(f"Long press coordinates rejected: {derived_reason}")
+                latest_selector_info = f"coordinates='{target.bounds}' rejected"
+                error_obj = {"error": derived_reason}
+            else:
+                try:
+                    center_point = target.bounds.get_center()
+                    logger.info(
+                        "Attempting to long press using coordinates: "
+                        f"{center_point.x},{center_point.y}"
                     )
-                    error_obj = {"error": result.error}
-            except Exception as e:
-                logger.warning(
-                    f"Exception during long press with coordinates '{target.bounds}': {e}"
-                )
-                error_obj = {"error": str(e)}
+                    latest_selector_info = f"coordinates='{target.bounds}'"
+                    result = await controller.tap_at(
+                        x=center_point.x,
+                        y=center_point.y,
+                        long_press=True,
+                        long_press_duration=duration_ms,
+                    )
+                    if result.error is None:  # Success
+                        error_obj = None
+                    else:
+                        logger.warning(
+                            f"Long press with coordinates '{target.bounds}' failed. "
+                            f"Error: {result.error}"
+                        )
+                        error_obj = {"error": result.error}
+                except Exception as e:
+                    logger.warning(
+                        f"Exception during long press with coordinates '{target.bounds}': {e}"
+                    )
+                    error_obj = {"error": str(e)}
 
         # 2. If coordinates failed or weren't provided, try with resource_id
         if error_obj is not None and target.resource_id:

@@ -10,6 +10,7 @@ from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.tools.bounds_validation import coordinates_look_like_hierarchy_derived
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.tools.utils import has_valid_selectors, validate_coordinates_bounds
@@ -64,20 +65,29 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                     {"selector": selector_info, "error": f"Out of bounds: {bounds_error}"}
                 )
             else:
-                try:
-                    center_point = target.bounds.get_center()
-                    logger.info(f"Attempting tap with {selector_info}")
-                    result = await controller.tap_at(x=center_point.x, y=center_point.y)
-                    if result.error is None:
-                        success = True
-                        successful_selector = selector_info
-                    else:
-                        error_msg = result.error
-                        logger.warning(f"Tap with {selector_info} failed: {error_msg}")
-                        attempts.append({"selector": selector_info, "error": error_msg})
-                except Exception as e:
-                    logger.warning(f"Exception during tap with {selector_info}: {e}")
-                    attempts.append({"selector": selector_info, "error": str(e)})
+                # 屏幕矩形内不代表点得对：坐标若是从缩放后的截图上目测来的，
+                # 一样能落在屏幕内但会点空。要求它与层级树中的真实元素高度重合。
+                derived_ok, derived_reason = await coordinates_look_like_hierarchy_derived(
+                    ctx=ctx, target=target
+                )
+                if not derived_ok:
+                    logger.warning(f"Coordinates rejected: {derived_reason}")
+                    attempts.append({"selector": selector_info, "error": derived_reason})
+                else:
+                    try:
+                        center_point = target.bounds.get_center()
+                        logger.info(f"Attempting tap with {selector_info}")
+                        result = await controller.tap_at(x=center_point.x, y=center_point.y)
+                        if result.error is None:
+                            success = True
+                            successful_selector = selector_info
+                        else:
+                            error_msg = result.error
+                            logger.warning(f"Tap with {selector_info} failed: {error_msg}")
+                            attempts.append({"selector": selector_info, "error": error_msg})
+                    except Exception as e:
+                        logger.warning(f"Exception during tap with {selector_info}: {e}")
+                        attempts.append({"selector": selector_info, "error": str(e)})
 
         # 2. If coordinates failed or weren't provided, try with resource_id
         if not success and target.resource_id:
