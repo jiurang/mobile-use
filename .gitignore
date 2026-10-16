@@ -13,3 +13,6 @@ llm-config.override.jsonc
 *.DS_Store
 
 .idea
+
+# 探针脚本产出的中间文件（截图对比图等），跑 scripts/probe_*.py 可重新生成
+probe_out/
