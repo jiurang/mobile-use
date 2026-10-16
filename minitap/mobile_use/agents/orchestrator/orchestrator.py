@@ -81,8 +81,17 @@ class OrchestratorNode:
             ctx=self.ctx, name="orchestrator", use_fallback=True, temperature=1
         ).with_structured_output(OrchestratorOutput)
         response: OrchestratorOutput = await with_fallback(
-            main_call=lambda: invoke_llm_with_timeout_message(llm.ainvoke(messages)),
-            fallback_call=lambda: invoke_llm_with_timeout_message(llm_fallback.ainvoke(messages)),
+            main_call=lambda: invoke_llm_with_timeout_message(
+                llm.ainvoke(messages),
+                agent_name="orchestrator",
+                task_id=self.ctx.trace_id,
+            ),
+            fallback_call=lambda: invoke_llm_with_timeout_message(
+                llm_fallback.ainvoke(messages),
+                agent_name="orchestrator",
+                task_id=self.ctx.trace_id,
+                used_fallback=True,
+            ),
         )  # type: ignore
         if response.needs_replaning:
             thoughts = [response.reason]

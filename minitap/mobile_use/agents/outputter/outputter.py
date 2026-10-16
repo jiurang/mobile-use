@@ -68,9 +68,16 @@ async def outputter(
             structured_llm_fallback = llm_fallback.with_structured_output(schema)
 
     response = await with_fallback(
-        main_call=lambda: invoke_llm_with_timeout_message(structured_llm.ainvoke(messages)),
+        main_call=lambda: invoke_llm_with_timeout_message(
+            structured_llm.ainvoke(messages),
+            agent_name="outputter",
+            task_id=ctx.trace_id,
+        ),
         fallback_call=lambda: invoke_llm_with_timeout_message(
-            structured_llm_fallback.ainvoke(messages)
+            structured_llm_fallback.ainvoke(messages),
+            agent_name="outputter",
+            task_id=ctx.trace_id,
+            used_fallback=True,
         ),
     )  # type: ignore
     if isinstance(response, BaseModel):

@@ -90,10 +90,17 @@ async def analyze_video(
 
         response = await with_fallback(
             main_call=lambda: invoke_llm_with_timeout_message(
-                llm.ainvoke(messages), timeout_seconds=120
+                llm.ainvoke(messages),
+                timeout_seconds=120,
+                agent_name="video_analyzer",
+                task_id=ctx.trace_id,
             ),
             fallback_call=lambda: invoke_llm_with_timeout_message(
-                llm_fallback.ainvoke(messages), timeout_seconds=120
+                llm_fallback.ainvoke(messages),
+                timeout_seconds=120,
+                agent_name="video_analyzer",
+                task_id=ctx.trace_id,
+                used_fallback=True,
             ),
         )
 

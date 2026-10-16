@@ -33,6 +33,8 @@ from typing import Any
 
 from langchain_core.callbacks.base import BaseCallbackHandler
 
+from minitap.mobile_use.utils.llm_usage import extract_usage
+
 # Graph node -> display label. Mirrors the `add_node` calls in graph/graph.py.
 # Nodes outside this set (the graph itself, LangGraph internals, sub-chains
 # inside a node such as structured-output parsers) are ignored on purpose.
@@ -118,74 +120,13 @@ def extract_thought(outputs: Any) -> str | None:
     return None
 
 
-def _int(value: Any) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, number)
-
-
 def _extract_usage(response: Any) -> tuple[int, int] | None:
-    """Best-effort (input, output) token counts from an LLM response.
+    """读取 LLM 响应的 token 用量。
 
-    Two wrinkles make this messier than it looks:
-
-    * ``on_llm_end`` is handed an ``LLMResult``, not an ``AIMessage``. The
-      interesting fields live on ``result.generations[0][0].message``, so the
-      wrapper is unwrapped first -- otherwise usage is never found even for
-      providers that do report it.
-    * The shape differs per provider and per langchain-core version, so the
-      standard field is tried first, then two common fallbacks. A provider that
-      reports nothing must not break the run, hence ``None`` instead of an
-      exception.
-
-    Note that OpenAI-compatible endpoints are free to omit usage entirely; in
-    that case this returns ``None`` and the UI shows "—" rather than a
-    misleading zero.
+    实现在 `utils/llm_usage.py`，与 telemetry 共用同一份 —— usage 的形状随
+    langchain 版本和 provider 变化，是最容易漂移的地方，不能两处各写一遍。
     """
-    if response is None:
-        return None
-
-    # Unwrap LLMResult -> ChatGeneration -> AIMessage.
-    generations = getattr(response, "generations", None)
-    if generations:
-        try:
-            message = generations[0][0].message
-        except (IndexError, AttributeError, TypeError):
-            message = None
-        if message is not None and message is not response:
-            return _extract_usage(message)
-
-    # langchain-core >= 0.3 normalises to usage_metadata.
-    usage = getattr(response, "usage_metadata", None)
-    if isinstance(usage, dict) and usage:
-        return _int(usage.get("input_tokens")), _int(usage.get("output_tokens"))
-
-    # OpenAI-style: llm_output["token_usage"].
-    llm_output = getattr(response, "llm_output", None)
-    if isinstance(llm_output, dict):
-        token_usage = llm_output.get("token_usage") or llm_output.get("usage")
-        if isinstance(token_usage, dict) and token_usage:
-            return _int(token_usage.get("prompt_tokens", token_usage.get("input_tokens"))), _int(
-                token_usage.get("completion_tokens", token_usage.get("output_tokens"))
-            )
-
-    # Everything else: response_metadata["usage"] under a dozen spellings.
-    metadata = getattr(response, "response_metadata", None)
-    if isinstance(metadata, dict):
-        raw = metadata.get("usage") or metadata.get("token_usage")
-        if isinstance(raw, dict) and raw:
-            return _int(
-                raw.get("input_tokens", raw.get("prompt_tokens", raw.get("promptTokenCount")))
-            ), _int(
-                raw.get(
-                    "output_tokens",
-                    raw.get("completion_tokens", raw.get("candidatesTokenCount")),
-                )
-            )
-
-    return None
+    return extract_usage(response)
 
 
 class AgentEventBridge(BaseCallbackHandler):

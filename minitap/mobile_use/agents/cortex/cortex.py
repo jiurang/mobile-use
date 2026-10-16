@@ -108,8 +108,17 @@ class CortexNode:
             ctx=self.ctx, name="cortex", use_fallback=True, temperature=1
         ).with_structured_output(CortexOutput)
         response: CortexOutput = await with_fallback(
-            main_call=lambda: invoke_llm_with_timeout_message(llm.ainvoke(messages)),
-            fallback_call=lambda: invoke_llm_with_timeout_message(llm_fallback.ainvoke(messages)),
+            main_call=lambda: invoke_llm_with_timeout_message(
+                llm.ainvoke(messages),
+                agent_name="cortex",
+                task_id=self.ctx.trace_id,
+            ),
+            fallback_call=lambda: invoke_llm_with_timeout_message(
+                llm_fallback.ainvoke(messages),
+                agent_name="cortex",
+                task_id=self.ctx.trace_id,
+                used_fallback=True,
+            ),
         )  # type: ignore
 
         EMPTY_STRING_TOKENS = ["{}", "[]", "null", "", "None"]

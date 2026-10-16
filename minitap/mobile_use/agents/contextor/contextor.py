@@ -168,8 +168,17 @@ class ContextorNode:
         ).with_structured_output(ContextorOutput)
 
         response: ContextorOutput = await with_fallback(
-            main_call=lambda: invoke_llm_with_timeout_message(llm.ainvoke(messages)),
-            fallback_call=lambda: invoke_llm_with_timeout_message(llm_fallback.ainvoke(messages)),
+            main_call=lambda: invoke_llm_with_timeout_message(
+                llm.ainvoke(messages),
+                agent_name="contextor",
+                task_id=self.ctx.trace_id,
+            ),
+            fallback_call=lambda: invoke_llm_with_timeout_message(
+                llm_fallback.ainvoke(messages),
+                agent_name="contextor",
+                task_id=self.ctx.trace_id,
+                used_fallback=True,
+            ),
         )  # type: ignore
 
         return response

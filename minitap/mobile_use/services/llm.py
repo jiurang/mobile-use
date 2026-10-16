@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, Literal, TypeVar, overload
 
@@ -23,6 +24,8 @@ from minitap.mobile_use.config import (
     settings,
 )
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.services.telemetry import telemetry
+from minitap.mobile_use.utils.llm_usage import extract_usage
 from minitap.mobile_use.utils.logger import get_logger
 
 # Logger for internal messages (ex: fallback)
@@ -34,17 +37,28 @@ user_messages_logger = get_logger(__name__)
 async def invoke_llm_with_timeout_message[T](
     llm_call: Coroutine[Any, Any, T],
     timeout_seconds: int = 10,
+    agent_name: str | None = None,
+    task_id: str | None = None,
+    used_fallback: bool = False,
 ) -> T:
     """
     Send a LLM call and display a timeout message if it takes too long.
 
+    这是**所有** agent 调 LLM 的唯一汇聚点，所以 token 埋点放在这里 ——
+    一处覆盖 cortex / executor / planner / orchestrator / contextor / outputter /
+    hopper / video_analyzer，不用逐个 agent 改。
+
     Args:
         llm_call: The coroutine of the LLM call to execute.
         timeout_seconds: The delay in seconds before displaying the message.
+        agent_name: 调用方 agent 名，用于成本归因。
+        task_id: 任务 trace id。
+        used_fallback: 本次是否走 fallback 模型（主模型失败时为 True）。
 
     Returns:
         The result of the LLM call.
     """
+    started_at = time.perf_counter()
     llm_task = asyncio.create_task(llm_call)
     waiter_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
 
@@ -53,11 +67,66 @@ async def invoke_llm_with_timeout_message[T](
     if llm_task in done:
         # The LLM call has finished before the timeout, cancel the timer
         waiter_task.cancel()
-        return llm_task.result()
+        result = llm_task.result()
     else:
         # The timeout has been reached, display the message and wait for the call to finish
         user_messages_logger.info("Waiting for LLM call response...")
-        return await llm_task
+        result = await llm_task
+
+    _record_usage(
+        result,
+        agent_name=agent_name,
+        task_id=task_id,
+        duration_seconds=time.perf_counter() - started_at,
+        used_fallback=used_fallback,
+    )
+    return result
+
+
+def _record_usage(
+    result: Any,
+    *,
+    agent_name: str | None,
+    task_id: str | None,
+    duration_seconds: float,
+    used_fallback: bool,
+) -> None:
+    """记录 token 用量。任何异常都不允许影响主流程。
+
+    注意 usage 必须从**原始响应**上取：cortex / planner 等用的是
+    `with_structured_output`，返回的是 pydantic 对象而不是 AIMessage，
+    那种情况下读不到 usage，只能记 0 —— 这是已知限制，不影响趋势分析。
+    """
+    if not agent_name:
+        return
+    try:
+        usage = extract_usage(result)
+        input_tokens, output_tokens = usage if usage else (0, 0)
+        telemetry.capture_llm_usage(
+            task_id=task_id or "unknown",
+            agent=agent_name,
+            model=_extract_model_name(result),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            duration_seconds=duration_seconds,
+            used_fallback=used_fallback,
+        )
+    except Exception as e:  # noqa: BLE001
+        # 埋点永远不能把任务带崩
+        llm_logger.debug(f"Failed to record LLM usage: {e}")
+
+
+def _extract_model_name(result: Any) -> str | None:
+    """从响应里取模型名。provider 各有各的字段名，逐个试，都拿不到就返回 None。"""
+    for attr in ("model", "response_metadata", "llm_output"):
+        value = getattr(result, attr, None)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            for key in ("model_name", "model", "modelVersion"):
+                if value.get(key):
+                    return str(value[key])
+    return None
 
 
 def _build_custom_headers(agent_name: str | None = None) -> dict[str, str]:

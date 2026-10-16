@@ -74,8 +74,17 @@ class ExecutorNode:
         llm = llm.bind_tools(**llm_bind_tools_kwargs)
         llm_fallback = llm_fallback.bind_tools(**llm_bind_tools_kwargs)
         response = await with_fallback(
-            main_call=lambda: invoke_llm_with_timeout_message(llm.ainvoke(messages)),
-            fallback_call=lambda: invoke_llm_with_timeout_message(llm_fallback.ainvoke(messages)),
+            main_call=lambda: invoke_llm_with_timeout_message(
+                llm.ainvoke(messages),
+                agent_name="executor",
+                task_id=self.ctx.trace_id,
+            ),
+            fallback_call=lambda: invoke_llm_with_timeout_message(
+                llm_fallback.ainvoke(messages),
+                agent_name="executor",
+                task_id=self.ctx.trace_id,
+                used_fallback=True,
+            ),
         )
         return await state.asanitize_update(
             ctx=self.ctx,

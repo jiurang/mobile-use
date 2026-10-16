@@ -309,6 +309,45 @@ class TelemetryService:
         except Exception as e:
             logger.debug(f"Failed to capture exception telemetry: {e}")
 
+    def capture_llm_usage(
+        self,
+        task_id: str,
+        agent: str,
+        model: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        duration_seconds: float | None = None,
+        used_fallback: bool = False,
+    ) -> None:
+        """记录一次 LLM 调用的 token 用量。
+
+        这是成本核算的**唯一数据源**。之前 `doc/token-context-analysis.md` 里的所有
+        token 数字都是按公式离线估算的（例如截图按 Gemini tile 公式
+        `(w//768+1)*(h//768+1)*258`），无法验证真实端到端用量，也就无法证明
+        截图降分辨率这类优化到底省了多少。接上之后才是真实 API 返回的 usage。
+
+        Args:
+            task_id: 任务 trace id。
+            agent: 调用方 agent 名（cortex / executor / planner ...）。
+            model: 模型标识。
+            input_tokens / output_tokens: provider 报告的用量；读不到时传 0。
+            duration_seconds: 本次调用耗时。
+            used_fallback: 是否走了 fallback 模型。
+        """
+        self.capture(
+            "llm_usage",
+            {
+                "task_id": task_id,
+                "agent": agent,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "duration_seconds": duration_seconds,
+                "used_fallback": used_fallback,
+            },
+        )
+
     def capture_task_started(
         self,
         task_id: str,
