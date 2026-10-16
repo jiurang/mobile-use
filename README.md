@@ -92,6 +92,20 @@ Mobile-use runs on your own Android or iOS device with your choice of supported 
 
     Available models: `MiniMax-M2.7` (200K context, recommended), `MiniMax-M2.7-highspeed` (200K context, faster inference).
 
+    **Using DeepSeek:**
+
+    [DeepSeek](https://platform.deepseek.com/) serves DeepSeek-V4 models over an OpenAI-compatible API at `https://api.deepseek.com`. To use it:
+
+    1. Set `DEEPSEEK_API_KEY` in your `.env`
+    2. Copy the contents of the `deepseek` preset object from `llm-config.defaults.jsonc` into your `llm-config.override.jsonc`, or set `"provider": "deepseek"` on individual agent nodes.
+
+    Available models: `deepseek-v4-pro` (1M context, text only), `deepseek-flash` (1M context, faster/cheaper, accepts screenshots).
+
+    > [!NOTE]
+    > DeepSeek answers in **thinking mode** by default: it emits a chain of thought in `reasoning_content` before every answer, which costs extra latency and completion tokens on every agent call. Add `DEEPSEEK_THINKING="false"` to your `.env` to send `{"thinking": {"type": "disabled"}}` and trade that reasoning for speed.
+    >
+    > `temperature` only has an effect in non-thinking mode.
+
     **Using Anthropic Claude:**
 
     [Anthropic](https://www.anthropic.com/) provides Claude — a capable, safety-focused model family. To use it:

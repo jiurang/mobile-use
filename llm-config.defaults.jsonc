@@ -137,61 +137,126 @@
   // To use it, copy the contents of this object into llm-config.override.jsonc.
   "minimax": {
     "planner": {
-      "provider": "minimax",
-      "model": "MiniMax-M2.7",
-      "fallback": {
         "provider": "minimax",
-        "model": "MiniMax-M2.7-highspeed"
+        "model": "MiniMax-M3",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3.1-Flash-Preview"
+        }
+      },
+      "orchestrator": {
+        "provider": "minimax",
+        "model": "MiniMax-M3",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3.1-Flash-Preview"
+        }
+      },
+      "cortex": {
+        "provider": "minimax",
+        "model": "MiniMax-M3",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3.1-Flash-Preview"
+        }
+      },
+      "executor": {
+        "provider": "minimax",
+        "model": "MiniMax-M3",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3.1-Flash-Preview"
+        }
+      },
+      "contextor": {
+        "provider": "minimax",
+        "model": "MiniMax-M3",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3.1-Flash-Preview"
+        }
+      },
+      "utils": {
+        "hopper": {
+          "provider": "minimax",
+          "model": "MiniMax-M3",
+          "fallback": {
+            "provider": "minimax",
+            "model": "MiniMax-M3.1-Flash-Preview"
+          }
+        },
+        "outputter": {
+          "provider": "minimax",
+          "model": "MiniMax-M3",
+          "fallback": {
+            "provider": "minimax",
+            "model": "MiniMax-M3.1-Flash-Preview"
+          }
+        },
+        "video_analyzer": null
+      }
+  },
+  // DeepSeek preset – domestic platform (platform.deepseek.com), 1M context on both models.
+  // To use it, copy the contents of this object into llm-config.override.jsonc.
+  // Note: DeepSeek answers in "thinking mode" by default (CoT in reasoning_content).
+  // Set DEEPSEEK_THINKING=false in .env to trade that reasoning for lower latency/cost.
+  "deepseek": {
+    "planner": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "fallback": {
+        "provider": "deepseek",
+        "model": "deepseek-flash"
       }
     },
     "orchestrator": {
-      "provider": "minimax",
-      "model": "MiniMax-M2.7",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
       "fallback": {
-        "provider": "minimax",
-        "model": "MiniMax-M2.7-highspeed"
+        "provider": "deepseek",
+        "model": "deepseek-flash"
       }
     },
     "cortex": {
-      "provider": "minimax",
-      "model": "MiniMax-M2.7",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
       "fallback": {
-        "provider": "minimax",
-        "model": "MiniMax-M2.7-highspeed"
+        "provider": "deepseek",
+        "model": "deepseek-flash"
       }
     },
     "executor": {
-      "provider": "minimax",
-      "model": "MiniMax-M2.7-highspeed",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
       "fallback": {
-        "provider": "minimax",
-        "model": "MiniMax-M2.7"
+        "provider": "deepseek",
+        "model": "deepseek-flash"
       }
     },
     "contextor": {
-      "provider": "minimax",
-      "model": "MiniMax-M2.7-highspeed",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
       "fallback": {
-        "provider": "minimax",
-        "model": "MiniMax-M2.7"
+        "provider": "deepseek",
+        "model": "deepseek-flash"
       }
     },
     "utils": {
       "hopper": {
-        // Ideally needs a 256k context window; MiniMax-M2.7 caps at 200k.
-        "provider": "minimax",
-        "model": "MiniMax-M2.7",
+        // Needs at least a 256k context window; both DeepSeek models do 1M.
+        "provider": "deepseek",
+        "model": "deepseek-flash",
         "fallback": {
-          "provider": "minimax",
-          "model": "MiniMax-M2.7-highspeed"
+          "provider": "deepseek",
+          "model": "deepseek-flash"
         }
       },
       "outputter": {
-        "provider": "minimax",
-        "model": "MiniMax-M2.7-highspeed",
+        "provider": "deepseek",
+        "model": "deepseek-flash",
         "fallback": {
-          "provider": "minimax",
-          "model": "MiniMax-M2.7"
+          "provider": "deepseek",
+          "model": "deepseek-flash"
         }
       }
     }

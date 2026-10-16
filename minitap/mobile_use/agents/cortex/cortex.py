@@ -2,7 +2,6 @@ from pathlib import Path
 
 from jinja2 import Template
 from langchain_core.messages import (
-    AIMessage,
     HumanMessage,
     RemoveMessage,
     SystemMessage,
@@ -29,6 +28,10 @@ from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ui_hierarchy_view import render_ui_hierarchy
 
 logger = get_logger(__name__)
+
+# state.py:113 的 reducer 只增不减，而 cortex 每轮全量重发，所以这里要自己封顶。
+# 取值与 contextor.MAX_AGENTS_THOUGHTS 保持一致。
+MAX_CORTEX_AGENTS_THOUGHTS = 25
 
 
 class CortexNode:
@@ -74,8 +77,18 @@ class CortexNode:
                 else ""
             ),
         ]
-        for thought in state.agents_thoughts:
-            messages.append(AIMessage(content=thought))
+        # 这些 thought 绝不能塞成 assistant 回合。state.py:113 给每条加了 "[role] "
+        # 前缀，模型会把它们当成 few-shot 照抄，于是无视 tool_choice 改用纯文本回答，
+        # _parse() 再把这段中文当 JSON 解析 -> pydantic json_invalid -> 整个 goal 挂掉。
+        # 压成单个 user 回合后，MiniMax-M3 的 tool_calls 实测恢复 2/2。
+        # 见 v/probe_cortex_toolcall_ab.py、v/probe_cortex_history_len.py。
+        thoughts = state.agents_thoughts[-MAX_CORTEX_AGENTS_THOUGHTS:]
+        if thoughts:
+            messages.append(
+                HumanMessage(
+                    content="Agent thoughts history (newest last):\n" + "\n".join(thoughts)
+                )
+            )
 
         if state.latest_ui_hierarchy:
             # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，

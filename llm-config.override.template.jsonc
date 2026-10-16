@@ -1,8 +1,9 @@
 // Override the LLM config here for the agents.
 
-// Supported providers: openai, google, openrouter, xai, vertexai, anthropic, azure, minimax
+// Supported providers: openai, google, openrouter, xai, vertexai, anthropic, azure, minimax, deepseek
 // You can use any model as long as it is supported by the provider.
 // MiniMax models: MiniMax-M2.7 (200k context), MiniMax-M2.7-highspeed
+// DeepSeek models: deepseek-v4-pro (1M context, no vision), deepseek-flash (1M context, vision)
 
 // Do not modify this file directly, instead copy it to llm-config.override.jsonc and modify it there.
 

@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: SecretStr | None = None
     AZURE_API_KEY: SecretStr | None = None
     MINIMAX_API_KEY: SecretStr | None = None
+    DEEPSEEK_API_KEY: SecretStr | None = None
     MINITAP_API_KEY: SecretStr | None = None
 
     OPENAI_BASE_URL: str | None = None
@@ -37,6 +38,14 @@ class Settings(BaseSettings):
     # A domestic key sent to the global endpoint fails with 401 "invalid api key (2049)".
     # Falls back to the global endpoint (upstream default) when unset.
     MINIMAX_BASE_URL: str | None = None
+    # DeepSeek's OpenAI-compatible endpoint (domestic platform, platform.deepseek.com).
+    # /v1 is accepted too, so both spellings work; we default to the documented one.
+    DEEPSEEK_BASE_URL: str | None = None
+    # DeepSeek models answer in "thinking mode" by default (effort=high): the CoT
+    # comes back in `reasoning_content` and costs extra latency + completion tokens
+    # on every agent call. Set to false to send {"thinking": {"type": "disabled"}}.
+    # None -> we don't send the parameter at all and DeepSeek's default applies.
+    DEEPSEEK_THINKING: bool | None = None
 
     ADB_HOST: str | None = None
     ADB_PORT: int | None = None
@@ -105,7 +114,16 @@ def record_events(output_path: Path | None, events: list[str] | BaseModel | Any)
 ### LLM Configuration
 
 LLMProvider = Literal[
-    "openai", "google", "openrouter", "xai", "vertexai", "minitap", "anthropic", "azure", "minimax"
+    "openai",
+    "google",
+    "openrouter",
+    "xai",
+    "vertexai",
+    "minitap",
+    "anthropic",
+    "azure",
+    "minimax",
+    "deepseek",
 ]
 LLMUtilsNode = Literal["outputter", "hopper", "video_analyzer"]
 LLMUtilsNodeWithFallback = LLMUtilsNode
@@ -166,6 +184,9 @@ class LLM(BaseModel):
             case "minimax":
                 if not settings.MINIMAX_API_KEY:
                     raise Exception(f"{name} requires MINIMAX_API_KEY in .env")
+            case "deepseek":
+                if not settings.DEEPSEEK_API_KEY:
+                    raise Exception(f"{name} requires DEEPSEEK_API_KEY in .env")
 
     def __str__(self):
         return f"{self.provider}/{self.model}"
