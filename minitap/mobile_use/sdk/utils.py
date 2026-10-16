@@ -16,7 +16,7 @@ def load_llm_config_override(path: Path) -> LLMConfig:
     override_config_dict = {}
     if os.path.exists(path):
         logger.info(f"Loading custom LLM config from {path.resolve()}...")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             override_config_dict = load_jsonc(f)
     else:
         logger.warning("Custom LLM config not found - using the default config")

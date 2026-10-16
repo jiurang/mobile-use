@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     OPENAI_BASE_URL: str | None = None
     AZURE_BASE_URL: str | None = None
     MINITAP_API_BASE_URL: str = "https://platform.minitap.ai/api/v1"
+    # MiniMax runs two separate platforms whose API keys are NOT interchangeable:
+    #   domestic  platform.minimaxi.com -> https://api.minimaxi.com/v1
+    #   global    platform.minimax.io  -> https://api.minimax.io/v1
+    # A domestic key sent to the global endpoint fails with 401 "invalid api key (2049)".
+    # Falls back to the global endpoint (upstream default) when unset.
+    MINIMAX_BASE_URL: str | None = None
 
     ADB_HOST: str | None = None
     ADB_PORT: int | None = None
@@ -227,7 +233,7 @@ def get_default_llm_config() -> LLMConfig:
     try:
         if not os.path.exists(ROOT_DIR / DEFAULT_LLM_CONFIG_FILENAME):
             raise Exception("Default llm config not found")
-        with open(ROOT_DIR / DEFAULT_LLM_CONFIG_FILENAME) as f:
+        with open(ROOT_DIR / DEFAULT_LLM_CONFIG_FILENAME, encoding="utf-8") as f:
             default_config_dict = load_jsonc(f)
         return LLMConfig.model_validate(default_config_dict["default"])
     except Exception as e:
@@ -354,7 +360,7 @@ def parse_llm_config() -> LLMConfig:
     override_config_dict = {}
     if os.path.exists(ROOT_DIR / OVERRIDE_LLM_CONFIG_FILENAME):
         logger.info("Loading custom llm config...")
-        with open(ROOT_DIR / OVERRIDE_LLM_CONFIG_FILENAME) as f:
+        with open(ROOT_DIR / OVERRIDE_LLM_CONFIG_FILENAME, encoding="utf-8") as f:
             override_config_dict = load_jsonc(f)
     else:
         logger.warning("Custom llm config not found, loading default config")

@@ -208,14 +208,34 @@ def get_azure_llm(model_name: str, temperature: float = 1) -> AzureAIOpenAIApiCh
     return client
 
 
+class MiniMaxChatOpenAI(ChatOpenAI):
+    """ChatOpenAI variant that defaults structured output to tool calling.
+
+    Every mobile-use agent extracts its result with ``with_structured_output(...)``.
+    ``ChatOpenAI`` defaults that to ``method="json_schema"`` (i.e. it sends
+    ``response_format: {"type": "json_schema", ...}``), but the MiniMax chat
+    completions API silently ignores ``response_format`` and answers with a
+    ``<think>...</think>`` prefixed free-form message. The OpenAI SDK then tries
+    to JSON-decode that text and raises ``ValueError: expected value at line 1
+    column 1``.
+
+    MiniMax does honour classic tool calling, so force ``function_calling`` here
+    and every call site keeps working unchanged.
+    """
+
+    def with_structured_output(self, schema=None, **kwargs):
+        kwargs.setdefault("method", "function_calling")
+        return super().with_structured_output(schema, **kwargs)
+
+
 def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) -> ChatOpenAI:
     assert settings.MINIMAX_API_KEY is not None
     clamped_temperature = max(0.0, min(1.0, temperature))
-    client = ChatOpenAI(
+    client = MiniMaxChatOpenAI(
         model=model_name,
         api_key=settings.MINIMAX_API_KEY,
         temperature=clamped_temperature,
-        base_url="https://api.minimax.io/v1",
+        base_url=settings.MINIMAX_BASE_URL or "https://api.minimax.io/v1",
     )
     return client
 

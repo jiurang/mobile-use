@@ -231,7 +231,7 @@ class TaskRequestBuilder[TIn](TaskRequestCommonBuilder):
         Raises:
             ValueError: If required fields are missing
         """
-        if not self._goal:
+        if not self._goal or not self._goal.strip():
             raise ValueError("Task goal is required")
 
         if self._output_format and self._output_description:
