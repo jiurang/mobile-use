@@ -1,3 +1,5 @@
+import asyncio
+import time
 from pathlib import Path
 
 from jinja2 import Template
@@ -13,6 +15,8 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
 )
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
+from minitap.mobile_use.services.ocr import get_ocr_engine
+from minitap.mobile_use.services.ocr.types import OcrText
 from minitap.mobile_use.utils.app_launch_utils import launch_app_with_retries
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
@@ -35,7 +39,6 @@ class ContextorNode:
         current_app_package = await get_current_foreground_package_async(self.ctx)
         device_date = get_device_date(self.ctx)
         agent_outcome: str | None = None
-
         if self.ctx.execution_setup and self.ctx.execution_setup.app_lock_status:
             locked_app_package = self.ctx.execution_setup.app_lock_status.locked_app_package
             should_verify_app_lock = (
@@ -65,10 +68,13 @@ class ContextorNode:
                     "but initial launch was not successful, skipping"
                 )
 
+        ocr_results = await self._run_ocr(device_data.base64)
+
         return await state.asanitize_update(
             ctx=self.ctx,
             update={
                 "latest_ui_hierarchy": device_data.elements,
+                "latest_ocr_results": ocr_results,
                 "latest_screenshot": device_data.base64,
                 "focused_app_info": current_app_package,
                 "screen_size": (device_data.width, device_data.height),
@@ -77,6 +83,38 @@ class ContextorNode:
             },
             agent="contextor",
         )
+
+    async def _run_ocr(self, screenshot_base64: str | None) -> list[OcrText] | None:
+        """对刚截的图跑 OCR。
+
+        复用 `get_screen_data()` 已经取到的**原分辨率**截图，不再单独截一次 ——
+        OCR 的框要精确到能当点击目标用，拿压缩过的图会把框算歪。
+
+        失败只降级不中断：OCR 是增强感知，层级树和截图还在。
+        """
+        if not self.ctx.perception.ocr:
+            return None
+        if not screenshot_base64:
+            logger.warning("No screenshot available; skipping OCR")
+            return None
+
+        engine = get_ocr_engine(self.ctx)
+        if engine is None:
+            return None
+
+        try:
+            started = time.perf_counter()
+            # CPU 推理是同步阻塞的，别卡住事件循环。
+            results = await asyncio.to_thread(engine.recognize, screenshot_base64)
+            logger.info(
+                f"OCR: {len(results)} texts in "
+                f"{(time.perf_counter() - started) * 1000:.0f}ms "
+                f"(engine={engine.name})"
+            )
+            return results
+        except Exception as e:
+            logger.warning(f"OCR failed, continuing without it: {type(e).__name__}: {e}")
+            return None
 
     async def _handle_app_lock_verification(
         self, state: State, current_app_package: str, locked_app_package: str

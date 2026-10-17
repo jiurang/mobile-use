@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.services.ocr.types import OcrText
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.recorder import record_interaction
 
@@ -35,6 +36,11 @@ class State(BaseModel):
     # contextor related keys
     latest_ui_hierarchy: Annotated[
         list[dict] | None, "Latest UI hierarchy of the device", take_last
+    ]
+    latest_ocr_results: Annotated[
+        list[OcrText] | None,
+        "Latest OCR results of the device screen (text + bounds + confidence)",
+        take_last,
     ]
     latest_screenshot: Annotated[str | None, "Latest screenshot base64 of the device", take_last]
     focused_app_info: Annotated[str | None, "Focused app info", take_last]

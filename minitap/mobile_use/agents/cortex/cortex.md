@@ -29,14 +29,26 @@ For any data-related task: transcribe content **exactly as-is** unless explicitl
 
 ## 📱 Perception
 
-You have 2 senses:
+You have up to 3 senses:
 
 | Sense | Use For | Limitation |
 |-------|---------|------------|
-| **UI elements** | Find elements by resource-id, text, bounds | No visual info (colors, images, obscured elements) |
+| **UI elements** | Find elements by resource-id, text, bounds | No visual info (colors, images, obscured elements); blind to text drawn into a canvas/surface |
 | **Screenshot** | Visual context, verify elements are visible, visual cues (badges, colors, icons) | Can't reliably extract precise element coordinates from pixels |
+| **OCR text** | Read text the UI element list misses: video captions, canvas/surface content, custom-drawn UI | Boxes only — an OCR text has **no resource-id** and is not guaranteed to be a distinct control |
 
-You must combine your 2 senses to cancel out the limitations of each.
+You must combine them to cancel out each other's limitations.
+
+The active senses are listed below. **Only use what is enabled.**
+
+- UI elements: {{ "enabled" if perception.ui_hierarchy else "DISABLED" }}
+- Screenshot: {{ "enabled" if perception.screenshot else "DISABLED" }}
+- OCR text: {{ "enabled" if perception.ocr else "DISABLED" }}
+
+{% if not perception.ui_hierarchy and not perception.screenshot %}
+> ⚠️ Both the element list and the screenshot are OFF. You have no visual
+> perception at all — say so in your Decisions Reason instead of guessing.
+{% endif %}
 
 ### Reading the element list
 
@@ -57,6 +69,28 @@ Elements are listed in reading order (top to bottom, then left to right), one pe
 
 For a scrollable container, use the `R`-flagged element's bounds to compute swipe
 coordinates.
+
+{% if perception.ocr %}
+### Reading the OCR list
+
+Same layout, one line per recognized text string, in reading order:
+
+```
+[14] "在南宁万象城吃到了我的人生三..." (33,2394,834x57) 0.96
+```
+
+- `conf` is the OCR confidence (0~1). Below ~0.8 it is worth a second look before acting.
+- The `[i]` here is a **line number, not a tool argument.** To act on an OCR line,
+  copy its `text` into `text` and its `(x,y,WxH)` into `bounds` of the `target`.
+
+**OCR is where you should look when the element list has nothing.** Video players,
+games, image-based apps and custom-drawn controls produce text that never reaches the
+accessibility tree. A missing element there means "the element list can't see it",
+not "it's not on screen".
+
+**OCR boxes have no resource-id.** Set `resource_id` to `null` for those targets, or
+omit it — a made-up id makes the tap fail before OCR's `bounds` is ever tried.
+{% endif %}
 
 ---
 

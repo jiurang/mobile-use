@@ -1,5 +1,5 @@
 {
-  "exclude": [".venv/**"],
+  "exclude": [".venv/**", "probe_out/**", "minitap/v/**", "minitap/mobile-use-setup/**"],
   "pythonVersion": "3.12",
   "venvPath": ".",
   "venv": ".venv"

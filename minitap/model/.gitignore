@@ -1,0 +1,11 @@
+# OCR 模型权重不入库：3 个文件 29.7 MB（det.onnx 9.4MB + rec.onnx 20.2MB + keys.txt）。
+#
+# 这些是外部下载的产物，不是源码。模型目录本身保留在磁盘上，
+# 通过 OcrConfig.model_dir 或 MOBILE_USE_OCR_MODEL_DIR 指定；
+# 想换一套权重时把 det.onnx / rec.onnx / keys.txt 三件套放进来即可。
+*.onnx
+keys.txt
+
+# 目录里可以留说明文件
+!.gitignore
+!README.md

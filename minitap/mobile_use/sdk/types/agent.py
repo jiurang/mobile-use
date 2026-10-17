@@ -3,10 +3,10 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from langchain_core.callbacks.base import Callbacks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from minitap.mobile_use.clients.ios_client_config import BrowserStackClientConfig, IosClientConfig
-from minitap.mobile_use.context import DevicePlatform
+from minitap.mobile_use.context import DevicePlatform, PerceptionConfig
 from minitap.mobile_use.controllers.cloud_device_controller import (
     CloudAndroidController,
     CloudIosController,
@@ -103,6 +103,8 @@ class AgentConfig(BaseModel):
         device_platform: Platform of the device to target.
         servers: Custom server configurations.
         video_recording_enabled: Whether video recording tools are enabled.
+        perception: Which perception channels (screenshot / UI hierarchy / OCR) are on.
+            All three are enabled by default.
         cloud_device_config: Configuration for cloud device provisioning.
         cloud_android_controller: Pre-configured cloud Android controller.
         cloud_ios_controller: Pre-configured cloud iOS controller.
@@ -118,6 +120,7 @@ class AgentConfig(BaseModel):
     ios_client_config: IosClientConfig | None = None
     browserstack_config: BrowserStackClientConfig | None = None
     video_recording_enabled: bool = False
+    perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
     cloud_device_config: CloudDeviceConfig | None = None
     cloud_android_controller: CloudAndroidController | None = None
     cloud_ios_controller: CloudIosController | None = None

@@ -629,6 +629,7 @@ class Agent:
                 self._config.video_recording_enabled
                 and agent_profile.llm_config.utils.video_analyzer is not None
             ),
+            perception=self._config.perception,
         )
 
         self._prepare_tracing(task=task, context=context)
@@ -1204,6 +1205,7 @@ class Agent:
             initial_goal=task.request.goal,
             subgoal_plan=[],
             latest_ui_hierarchy=None,
+            latest_ocr_results=None,
             latest_screenshot=None,
             focused_app_info=None,
             device_date=None,

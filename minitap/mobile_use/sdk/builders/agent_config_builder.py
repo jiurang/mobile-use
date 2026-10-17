@@ -8,7 +8,7 @@ from langchain_core.callbacks.base import Callbacks
 
 from minitap.mobile_use.clients.ios_client_config import BrowserStackClientConfig, IosClientConfig
 from minitap.mobile_use.config import get_default_llm_config, get_default_minitap_llm_config
-from minitap.mobile_use.context import DevicePlatform
+from minitap.mobile_use.context import DevicePlatform, PerceptionConfig
 from minitap.mobile_use.controllers.cloud_device_controller import (
     CloudAndroidController,
     CloudIosController,
@@ -55,6 +55,7 @@ class AgentConfigBuilder:
         self._ios_client_config: IosClientConfig | None = None
         self._browserstack_config: BrowserStackClientConfig | None = None
         self._video_recording_enabled: bool = False
+        self._perception: PerceptionConfig = PerceptionConfig()
         self._cloud_device_config: CloudDeviceConfig | None = None
         self._cloud_android_controller: CloudAndroidController | None = None
         self._cloud_ios_controller: CloudIosController | None = None
@@ -325,6 +326,30 @@ class AgentConfigBuilder:
         self._device_platform = DevicePlatform.IOS
         return self
 
+    def with_perception(self, perception: PerceptionConfig) -> "AgentConfigBuilder":
+        """
+        Configure which perception channels the Cortex agent receives.
+
+        All three are on by default. Turning one off only removes that channel's
+        information and cost; the other two are unaffected.
+
+        Args:
+            perception: Screenshot / UI hierarchy / OCR switches, plus the OCR
+                engine configuration.
+
+        Example:
+            >>> from minitap.mobile_use.context import PerceptionConfig
+            >>> from minitap.mobile_use.services.ocr import OcrConfig
+            >>> config = (Builders.AgentConfig
+            ...     .with_perception(PerceptionConfig(
+            ...         screenshot=False,
+            ...         ocr_config=OcrConfig(engine="paddle_onnx"),
+            ...     ))
+            ...     .build())
+        """
+        self._perception = copy.deepcopy(perception)
+        return self
+
     def with_video_recording_tools(self) -> "AgentConfigBuilder":
         """
         Enable video recording tools (start_video_recording, stop_video_recording).
@@ -410,6 +435,7 @@ class AgentConfigBuilder:
             ios_client_config=self._ios_client_config,
             browserstack_config=self._browserstack_config,
             video_recording_enabled=self._video_recording_enabled,
+            perception=self._perception,
             cloud_device_config=self._cloud_device_config,
             cloud_android_controller=self._cloud_android_controller,
             cloud_ios_controller=self._cloud_ios_controller,

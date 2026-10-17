@@ -25,6 +25,7 @@ from minitap.mobile_use.tools.index import (
 from minitap.mobile_use.utils.conversations import get_screenshot_message_for_llm
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.ocr_view import render_ocr_results
 from minitap.mobile_use.utils.ui_hierarchy_view import render_ui_hierarchy
 
 logger = get_logger(__name__)
@@ -64,6 +65,7 @@ class CortexNode:
             executor_feedback=executor_feedback,
             executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_wrappers),
             locked_app_package=current_locked_app_package,
+            perception=self.ctx.perception,
         )
         messages = [
             SystemMessage(content=system_message),
@@ -90,11 +92,13 @@ class CortexNode:
                 )
             )
 
-        if state.latest_ui_hierarchy:
+        if self.ctx.perception.ui_hierarchy and state.latest_ui_hierarchy:
             # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，
             # 因为工具要拿它来解析 target。
             messages.append(HumanMessage(content=render_ui_hierarchy(state.latest_ui_hierarchy)))
-        if state.latest_screenshot:
+        if self.ctx.perception.ocr and state.latest_ocr_results:
+            messages.append(HumanMessage(content=render_ocr_results(state.latest_ocr_results)))
+        if self.ctx.perception.screenshot and state.latest_screenshot:
             controller = create_device_controller(self.ctx)
             compressed_image_base64 = controller.get_compressed_b64_screenshot(
                 state.latest_screenshot
@@ -151,6 +155,7 @@ class CortexNode:
                 "structured_decisions": response.decisions,
                 "complete_subgoals_by_ids": response.complete_subgoals_by_ids,
                 "latest_ui_hierarchy": None,
+                "latest_ocr_results": None,
                 "latest_screenshot": None,
                 "focused_app_info": None,
                 "device_date": None,

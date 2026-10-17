@@ -46,12 +46,26 @@
                                        最小的大容器只有 5.35%
                                        （scripts/probe_container_area.py），
                                        任何单一门限都会误伤其中一类。
+
+OCR 框也是合法来源
+-----------------
+本模块排斥的从来不是「坐标来自层级树」这件事，而是「坐标是**目测**的」。
+OCR 框是对像素做分割后测出来的，和层级树框一样属于可信来源，所以它同样
+能通过校验。实测（Redmi Turbo 4，抖音视频屏）：同名文本的 OCR 框与层级树框
+原始 IoU 在 0.52~0.82 之间，中心偏差很小，归一化后门限 0.9 可以通过。
+
+不接 OCR 会怎样：视频 App 上约 1/3 的可见文本（视频文案、相关搜索、顶部导航）
+在层级树里没有任何对应节点，用它们的坐标点会被判成目测而直接拒绝 —— OCR 感知
+就只剩「读」的能力，没有任何可操作性。
 """
 
 from __future__ import annotations
 
+import asyncio
+
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
+from minitap.mobile_use.services.ocr.types import OcrText
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ui_hierarchy import ElementBounds, get_bounds_for_element
@@ -137,12 +151,44 @@ def _label_of(element: dict | None) -> str:
     )
 
 
+def ocr_texts_as_elements(ocr_texts: list[OcrText] | None) -> list[dict]:
+    """把 `OcrText` 转成校验器认得的元素形状。
+
+    `get_bounds_for_element` 本来就接受 `bounds` 为 dict 的形式（iOS 那条路径），
+    所以这里只是换个壳，让 OCR 框能和层级树节点走同一套 IoU 计算。
+    """
+    elements: list[dict] = []
+    for item in ocr_texts or []:
+        b = item.bounds
+        elements.append(
+            {
+                "text": item.text,
+                "bounds": {"x": b.x, "y": b.y, "width": b.width, "height": b.height},
+            }
+        )
+    return elements
+
+
 def coordinates_look_like_hierarchy_derived_from_elements(
     target: Target,
     elements: list[dict],
+    ocr_texts: list[OcrText] | None = None,
     min_iou: float = MIN_IOU,
 ) -> tuple[bool, str | None]:
-    """判断 target.bounds 是否像是从层级树抄来的（而不是从截图目测的）。
+    """判断 target.bounds 是否真的来自 UI 层级树或 OCR，而不是从截图目测的。
+
+    **OCR 框是合法的坐标来源。** 层级树框是系统结构导出，OCR 框是对像素做
+    分割测量 —— 两者都不是「目测」。本函数要排斥的从来是后者。
+
+    这一条是 OCR 感知能不能落地的前提：视频 App 上约 1/3 的可见文本
+    （视频文案、相关搜索、顶部导航）在层级树里**完全没有对应节点**，
+    若只认层级树，用它们点坐标会被判成目测而直接拒绝 —— OCR 就只剩「读」的能力。
+
+    Args:
+        target: 模型给出的定位。
+        elements: UI 层级树节点。
+        ocr_texts: 本屏 OCR 结果。为空表示 OCR 关闭或没跑，退回只看层级树。
+        min_iou: 归一化 IoU 门限。
 
     Returns:
         (是否可信, 失败原因)。可信时原因为 None。
@@ -155,26 +201,60 @@ def coordinates_look_like_hierarchy_derived_from_elements(
         return True, None
 
     iou, matched_bounds, matched_element = normalized_iou_for_bounds(target.bounds, elements)
+    if matched_bounds is not None and iou >= min_iou:
+        return True, None
+
+    ocr_iou: float | None = None
+    ocr_bounds: ElementBounds | None = None
+    ocr_element: dict | None = None
+    if ocr_texts:
+        ocr_iou, ocr_bounds, ocr_element = normalized_iou_for_bounds(
+            target.bounds, ocr_texts_as_elements(ocr_texts)
+        )
+        if ocr_bounds is not None and ocr_iou >= min_iou:
+            logger.debug(
+                f"Coordinates matched an OCR text box (normalized IoU {ocr_iou:.2f}): "
+                f"{_label_of(ocr_element)!r}"
+            )
+            return True, None
+
+    center = target.bounds.get_center()
+    ocr_note = ""
+    if ocr_texts:
+        ocr_name = _label_of(ocr_element)[:60] or "none"
+        ocr_note = f"; closest OCR text: {ocr_name!r} at normalized IoU {ocr_iou or 0.0:.2f}"
 
     if matched_bounds is None:
         return False, (
-            f"coordinates ({target.bounds.get_center().x}, {target.bounds.get_center().y}) "
-            "do not overlap any element in the UI hierarchy. The bounds were likely "
-            "estimated from the screenshot; use resource_id or text instead."
+            f"coordinates ({center.x}, {center.y}) do not overlap any UI element or OCR "
+            f"text box{ocr_note}. The bounds were likely estimated from the screenshot; "
+            "use resource_id or text instead."
         )
 
-    if iou >= min_iou:
-        return True, None
-
-    center = target.bounds.get_center()
     label = _label_of(matched_element)
     return False, (
-        f"coordinates ({center.x}, {center.y}) do not line up with any UI element "
-        f"(closest: {label[:60] if label else 'unnamed'} at "
+        f"coordinates ({center.x}, {center.y}) do not line up with any UI element or OCR "
+        f"text box (closest element: {label[:60] if label else 'unnamed'} at "
         f"({matched_bounds.x},{matched_bounds.y},{matched_bounds.width}x{matched_bounds.height}), "
-        f"normalized IoU {iou:.2f} < {min_iou:.2f}). The bounds were likely estimated from "
-        "the screenshot instead of copied from the element list; use resource_id or text instead."
+        f"normalized IoU {iou:.2f}{ocr_note}; both must be >= {min_iou:.2f}). The bounds were "
+        "likely estimated from the screenshot instead of copied from a listed element; "
+        "use resource_id or text instead."
     )
+
+
+async def _recognize_ocr(ctx: MobileUseContext) -> list[OcrText] | None:
+    """现截一张图跑 OCR。只在层级树已经拒绝坐标之后才会被调用。"""
+    from minitap.mobile_use.services.ocr import get_ocr_engine
+
+    engine = get_ocr_engine(ctx)
+    if engine is None:
+        return None
+    try:
+        screenshot = await UnifiedMobileController(ctx).take_screenshot()
+        return await asyncio.to_thread(engine.recognize, screenshot)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not run OCR for bounds validation: {e}")
+        return None
 
 
 async def coordinates_look_like_hierarchy_derived(
@@ -186,10 +266,17 @@ async def coordinates_look_like_hierarchy_derived(
 
     为什么必须实时 dump
     ------------------
-    不能用 `state.latest_ui_hierarchy`：`cortex.py:144` 在 cortex 返回时就把该字段
+    不能用 `state.latest_ui_hierarchy`：`cortex.py:153` 在 cortex 返回时就把该字段
     置为 None，executor 工具执行时 state 里已经没有层级树了。
     `UnifiedMobileController.get_ui_elements()` 是现成的实时取数路径
-    （`tap_element` 本来就用它）。
+    （`tap_element` 本来就用它）。OCR 同理：`latest_ocr_results` 也在 cortex 返回时
+    清空，所以这里现截现识。
+
+    OCR 是惰性的
+    ------------
+    先只拿层级树验一遍。**只有它拒绝了**才去截屏跑 OCR。
+    于是正常点击（目标是真实控件）的额外开销是 0，只有「本来就要被拒」的那条
+    路径才会多付一次截屏 + 约 380ms 推理。OCR 关掉时行为与改造前完全一致。
 
     失败策略
     --------
@@ -209,6 +296,14 @@ async def coordinates_look_like_hierarchy_derived(
         logger.warning("Empty UI hierarchy; skipping bounds validation")
         return True, None
 
+    verdict = coordinates_look_like_hierarchy_derived_from_elements(target, elements, None, min_iou)
+    if verdict[0]:
+        return verdict
+
+    if not ctx.perception.ocr:
+        return verdict
+
+    ocr_texts = await _recognize_ocr(ctx)
     return coordinates_look_like_hierarchy_derived_from_elements(
-        target, elements, min_iou=min_iou
+        target, elements, ocr_texts, min_iou
     )
