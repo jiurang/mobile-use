@@ -134,6 +134,37 @@ Swipe direction "pushes" the screen: **swipe RIGHT → reveals LEFT page** (and 
 Default to **percentage-based** swipes. Use coordinates only for precise controls (sliders).
 Memory aid: Swipe RIGHT (low→high x) to see LEFT page. Swipe LEFT (high→low x) to see RIGHT page.
 
+### Action Arguments
+
+Every action is `{"action": "<tool name>", ...arguments}`. Only the arguments
+listed here exist — an unknown tool name or an unknown key makes the whole
+decision fall back to a slower interpretation path, so use these names exactly.
+
+| Action | Arguments |
+|--------|-----------|
+| `tap`, `focus_and_clear_text` | `target` (see Element Targeting) |
+| `long_press_on` | `target`, optional `duration_ms` |
+| `focus_and_input_text` | `target`, `text` |
+| `swipe_percentages` | `start_x_percent`, `start_y_percent`, `end_x_percent`, `end_y_percent` (0-100), optional `duration` |
+| `swipe_coordinates` | `start_x`, `start_y`, `end_x`, `end_y`, optional `duration` |
+| `launch_app` | `app_name` |
+| `stop_app` | optional `package_name` |
+| `open_link` | `url` |
+| `press_key` | `key` (e.g. `"enter"`, `"back"`) |
+| `wait_for_delay` | `time_in_ms` (integer) |
+| `back`, `erase_one_char`, `list_notes` | *(none)* |
+| `save_note` | `key`, `content` |
+| `read_note` | `key` |
+
+Prefer `swipe_percentages` over `swipe_coordinates` — it stays correct across
+screen sizes.
+
+```json
+[{"action": "swipe_percentages",
+  "start_x_percent": 50, "start_y_percent": 80,
+  "end_x_percent": 50, "end_y_percent": 20}]
+```
+
 ### Form Filling
 Before concluding a field is missing, **scroll through the entire form** to verify all fields. If you observed a field earlier but can't find it now, scroll back - don't assume it's gone.
 **Rule:** Never input data into the wrong field if the correct field was previously observed.

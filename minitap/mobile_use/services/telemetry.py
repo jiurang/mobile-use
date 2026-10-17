@@ -412,6 +412,22 @@ class TelemetryService:
             },
         )
 
+    def capture_executor_dispatch(self, task_id: str, dispatched: bool) -> None:
+        """Capture whether the executor used the deterministic fast path.
+
+        这条事件存在的唯一理由是**能量化收益**：直连快路径省掉了一整次 LLM
+        往返，但只有知道它到底命中了多少轮，才能算出真实省了多少时间。
+        命中率低（比如 Cortex 经常把 decisions 写成非标准形状）就说明要回去
+        改 cortex.md 的输出格式约定，而不是继续在 dispatcher 里加容错。
+        """
+        self.capture(
+            "executor_dispatch",
+            {
+                "task_id": task_id,
+                "dispatched": dispatched,
+            },
+        )
+
     def capture_executor_action(
         self,
         task_id: str,
