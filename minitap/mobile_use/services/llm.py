@@ -462,14 +462,64 @@ class MiniMaxChatOpenAI(ChatOpenAI):
         return _ToolCallStructuredRunnable(self, schema)
 
 
+MINIMAX_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
+def resolve_minimax_effort() -> str | None:
+    """把 ``MINIMAX_EFFORT`` 归一化成官方文档里的合法档位，或 ``None``（不发）。
+
+    归一化而不是裸传，是因为这个值直接进请求体：大小写或空格写错，服务端要么
+    400，要么静默回落到默认（默认是 ``max``，最贵那档）—— 实测里最难查的那类
+    「配置改了没反应」。
+
+    返回 ``None`` 表示**不发** ``output_config``，走服务端默认。
+    """
+    raw = settings.MINIMAX_EFFORT
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if not value:
+        return None
+    if value in MINIMAX_EFFORT_LEVELS:
+        return value
+    llm_logger.warning(
+        f"未知的 MINIMAX_EFFORT={raw!r}，按「不发送」处理"
+        f"（即服务端默认 max）。可选：{', '.join(MINIMAX_EFFORT_LEVELS)}"
+    )
+    return None
+
+
 def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) -> ChatOpenAI:
+    """构造 MiniMax 客户端。
+
+    下发 ``output_config.effort``（默认 ``max``）。M3.1-Flash-Preview **关不掉**思考
+    （官方：always thinks），只能调深度；这个值决定思考花多少 token 和多少时间。
+
+    这里**不下发** ``thinking`` 参数。M3.1 官方明确 "If type is sent it must be
+    adaptive; disabled returns HTTP 400"，M2.x 则是 "disabled is accepted but
+    ignored" —— 两边都是死开关，发它只会制造 400 风险，没有任何收益。
+
+    为什么非要换到 M3.1：真机同批 prompt n=16 实测，M3 会把思考内容写进
+    ``content`` 且经常不闭合，``_ToolCallStructuredRunnable._parse`` 靠 ``</think>``
+    剥不掉 -> 没有 tool_calls -> "returned no parseable CortexOutput" -> 整个
+    goal 崩。M3.1 的思考走独立字段，16 次 ``content`` 里 0 次混入 <think>。
+    """
     assert settings.MINIMAX_API_KEY is not None
     clamped_temperature = max(0.0, min(1.0, temperature))
+
+    extra_body: dict[str, Any] = {}
+    effort = resolve_minimax_effort()
+    if effort is not None:
+        extra_body["output_config"] = {"effort": effort}
+
     client = MiniMaxChatOpenAI(
         model=model_name,
         api_key=settings.MINIMAX_API_KEY,
         temperature=clamped_temperature,
         base_url=settings.MINIMAX_BASE_URL or "https://api.minimax.io/v1",
+        # 显式传而不是 **dict 解包：解包会让类型检查器把整个 dict 当成
+        # **kwargs 逐个参数校验，一堆误报。空的时候给 None（不发这个字段）。
+        extra_body=extra_body or None,
     )
     return client
 

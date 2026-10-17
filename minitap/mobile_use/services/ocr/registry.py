@@ -21,7 +21,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from minitap.mobile_use.services.ocr.types import OcrConfig, OcrEngine
+from minitap.mobile_use.services.ocr.types import (
+    OcrConfig,
+    OcrEngine,
+    resolve_device,
+    resolve_rec_batch,
+)
 from minitap.mobile_use.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -45,14 +50,26 @@ def available_ocr_engines() -> list[str]:
 
 
 def _cache_key(config: OcrConfig) -> tuple:
+    # 注意用的是 `resolve_device` / `resolve_rec_batch` 的**解析结果**，
+    # 不是原始字段：走 MOBILE_USE_OCR_DEVICE 环境变量时 `config.device` 是 None，
+    # `cpu` 和 `cuda` 两种环境设置会算出
+    # **同一个 key**，于是第二次直接拿到上一次的引擎实例 —— 设了 cpu 却仍在
+    # CUDA 上跑，且没有任何报错。实测踩过。
+    #
+    # key 还要覆盖全部会影响这个实例行为的字段。漏一个就等于「改配置没反应
+    # 但也不报错」，是最难查的一类。
     return (
         config.engine,
         str(config.model_dir) if config.model_dir else None,
+        resolve_device(config),
+        config.device_id,
         config.det_limit_side_len,
         config.det_thresh,
         config.det_box_thresh,
         config.det_unclip_ratio,
         config.rec_min_score,
+        resolve_rec_batch(config),
+        config.max_texts,
     )
 
 

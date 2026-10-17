@@ -62,6 +62,26 @@ ocr = [
     "opencv-python-headless>=4.9.0",
     "pyclipper>=1.4.0,<1.5.0",
 ]
+# OCR 走 GPU。**和 [ocr] 互斥，不能同时装** —— onnxruntime / onnxruntime-gpu
+# 提供同一个 `onnxruntime` 模块，装在一起会互相覆盖文件。
+#
+# 版本必须和本机 CUDA 大版本配套，锁 1.19~1.22（CUDA 12 系列）：
+# 1.23+ 起要 CUDA 13，报 `cublasLt64_13.dll` 缺失。装完还要有 cudart /
+# cublas / cublasLt / cufft / cudnn 的 dll，路径给 MOBILE_USE_CUDA_DLL_DIR
+# （完整装了 CUDA Toolkit 的机器不用设，靠 PATH）。
+ocr-gpu = [
+    "onnxruntime-gpu>=1.19.0,<1.23.0",
+    "opencv-python-headless>=4.9.0",
+    "pyclipper>=1.4.0,<1.5.0",
+]
+# Windows 上的 DirectML 后端。同样和 [ocr] / [ocr-gpu] 互斥。
+# 实测它比 CPU 慢（见 paddle_onnx 模块 docstring），所以 `device=auto` 不会选它，
+# 只有显式 `device="dml"` 才会用。
+ocr-dml = [
+    "onnxruntime-directml>=1.20.0",
+    "opencv-python-headless>=4.9.0",
+    "pyclipper>=1.4.0,<1.5.0",
+]
 dev = [
     "ruff>=0.15.2",
     "pytest>=8.4.1",

@@ -28,6 +28,52 @@
   只收 4 个点。这里按 PaddleOCR 的做法退化成外接矩形，并保留它对竖排
   文字的 90° 旋转处理。
 - **polygon area 用鞋带公式**，不为一个面积计算引入 shapely。
+
+## GPU 后端：实测结论（RTX 4060 Laptop / 驱动 566.26 / ORT-GPU 1.22 / Python 3.12）
+
+先说结论：**GPU 化本身没用，GPU 化 + 批处理才有 2.44x**。
+
+`rec.onnx` 的输入是 `[N, 3, 48, W]`，N 和 W 都是动态的，所以一批框可以一次喂进去。
+但改造前是**逐框串行** `run()` 的，一屏 26 个框就是 26 次调用 —— **这才是瓶颈**。
+
+稳态中位耗时（1220x2712 真机截图，25/26 框，跑 4 轮取中位）：
+
+| 阶段 | CPU | CUDA | |
+| --- | --- | --- | --- |
+| det 前向 | 111.3ms | 30.1ms | **3.69x** |
+| det 全程（含后处理） | 115.2ms | 34.3ms | 3.35x |
+| rec 批量（1 次调用） | 113.2ms | 59.2ms | 1.91x |
+| rec 逐框（1 次调用） | 6.2ms | 40.5ms | **0.15x** |
+| **合计** | **228.4ms** | **93.6ms** | **2.44x** |
+
+最后两行是全部关键：**CUDA 每次 `run()` 的固定开销约 40ms，CPU 只要 6.2ms**
+（H2D/D2H 拷贝 + kernel launch + 同步）。所以逐框串行时 GPU 会被这些开销吃掉，
+反而比 CPU 慢 4 倍（实测 741ms vs 178ms）；批量化把 26 次调用压成 1 次之后，
+GPU 才真正开始发挥 —— det 前向上它确实快 3.7 倍。
+
+DirectML 更差：批量化后仍然打不过 CPU（139.8ms vs 118.8ms），逐框时慢 4 倍。
+所以 `device=auto` **只探 CUDA，不探 DML**：DirectML 要额外装
+`onnxruntime-directml`，却换不来速度，不该被 auto 悄悄选中。
+
+另外两个数据：
+
+- **det 的后处理只占 4ms**（115.2 - 111.3），findContours / unclip / pyclipper
+  都不是瓶颈。所以 det 不需要为 GPU 做任何改造，模型搬上 GPU 就够了。
+- **单轮比稳态慢得多**（端到端单轮 238ms vs 稳态 94ms），差的是首次调用的
+  内存分配与 kernel 加载。这也是 `_warmup` 存在的原因。
+
+CUDA EP 另有两条硬约束，都实测撞过：
+
+1. **ORT 版本和 CUDA 大版本必须配套。** `onnxruntime-gpu` 1.31 要
+   **CUDA 13 + cuDNN 9**，报 `cublasLt64_13.dll` 缺失；而 1.19~1.22 是
+   CUDA 12 系列。选错版本就是一堆缺 dll，且降级是**静默**的。
+2. **Windows 上 onnxruntime 不会自动搜 CUDA dll 目录**，而且
+   `os.add_dll_directory` **对它无效**（它用原生 `LoadLibrary`）。
+   必须在进程内改 PATH —— 见 `register_cuda_dll_dirs`。
+
+**ORT 拿到 GPU provider 后如果初始化失败，会静默退回 CPU 并只打日志**（实测
+`SESSION OK -> ['CPUExecutionProvider']`）。所以每次建完 session 都要用
+`get_providers()` 校验实际落点，见 `verify_provider` —— 不校验等于没改。
 """
 
 from __future__ import annotations
@@ -37,7 +83,15 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from minitap.mobile_use.services.ocr.types import OcrConfig, OcrText
+from minitap.mobile_use.services.ocr.types import (
+    DEVICE_PROVIDERS as _DEVICE_PROVIDERS,
+)
+from minitap.mobile_use.services.ocr.types import (
+    OcrConfig,
+    OcrText,
+    resolve_device,
+    resolve_rec_batch,
+)
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ui_hierarchy import ElementBounds
 
@@ -55,6 +109,9 @@ _DET_MULTIPLE = 32
 # rec 的输入固定高度，以及长宽比上限（PaddleOCR rec_image_shape=[3,48,320]）
 _REC_HEIGHT = 48
 _REC_MAX_WIDTH = 320
+# 批量 pad 时的填充值：归一化之后纯黑是 (0 - 0.5) / 0.5 = -1。
+# 别用 0 —— 那对应中灰，会被 CTC 当成内容读出多余字符。
+_REC_PAD_VALUE = -1.0
 
 
 class OcrDependenciesMissing(RuntimeError):
@@ -108,6 +165,147 @@ def resolve_model_dir(config: OcrConfig) -> Path:
     from minitap.mobile_use.config import ROOT_DIR
 
     return ROOT_DIR / "minitap" / "model" / "ocr"
+
+
+# ---------------------------------------------------------------- device / provider
+
+# device 名 -> provider 名的映射，以及 `resolve_device`，都在 types.py 里 ——
+# registry 的实例缓存 key 也要用**最终生效**的后端，不能直接读 `config.device`。
+#
+# GPU provider 后面必须跟 CPU provider：ORT 是在**节点级**回退的，只给 GPU 时
+# 一旦某个算子没有 GPU 实现就直接报错；两个都给，它会自动把那几个节点放 CPU。
+
+# auto 模式只探 CUDA，不探 DML。见模块 docstring 的实测表：DirectML 批量化后
+# 仍然打不过 CPU，还要额外装 onnxruntime-directml，不该被 auto 悄悄选中。
+_AUTO_ORDER: tuple[str, ...] = ("cuda",)
+
+# `os.add_dll_directory` 的返回值必须持有住，否则目录立刻会被从搜索路径移除。
+_DLL_DIR_HANDLES: list[Any] = []
+
+
+def resolve_provider_options(config: OcrConfig, providers: list[str]) -> list[dict[str, str]]:
+    """给每个 provider 配一份 options，长度必须和 `providers` 一致。
+
+    `device_id` 在这里才真正生效。之前它只是个装饰性字段：写进了缓存 key、
+    文档也写了「多卡机器上指定用哪张」，但**从来没传给 onnxruntime** ——
+    多卡机器上改它完全没有作用，而且没有任何报错。
+
+    只给 GPU provider 配：CPU EP 不认 `device_id`，给了会被 ORT 判为非法 key。
+    """
+    options: list[dict[str, str]] = [{} for _ in providers]
+    for index, name in enumerate(providers):
+        if name in (
+            _DEVICE_PROVIDERS["cuda"],
+            _DEVICE_PROVIDERS["dml"],
+        ):
+            options[index] = {"device_id": str(config.device_id)}
+    return options
+
+
+def resolve_providers(config: OcrConfig, onnxruntime: Any) -> tuple[list[str], str, bool]:
+    """按配置解析 provider 列表。
+
+    返回 `(providers, expected, explicit)`：
+    - `providers`  按优先级排列，第一个是**期望**落到的 provider。
+    - `expected`   期望落点，用来和 `session.get_providers()` 对账。
+    - `explicit`   用户是不是点名要了某个后端（点名了但没拿到必须 warn）。
+
+    解析不出来时不报错：降级到 CPU 并交给上层上报。OCR 是增强感知，
+    不该因为显卡的事把整轮感知搞挂。
+    """
+    device = resolve_device(config)
+    explicit = device in _DEVICE_PROVIDERS
+    if explicit:
+        order = [_DEVICE_PROVIDERS[device]]
+    elif device != "auto":
+        logger.warning(
+            f"未知的 OCR device '{device}'，按 auto 处理。可选：{', '.join(_DEVICE_PROVIDERS)}"
+        )
+        order = [_DEVICE_PROVIDERS[name] for name in _AUTO_ORDER]
+    else:
+        order = [_DEVICE_PROVIDERS[name] for name in _AUTO_ORDER]
+
+    available = set(onnxruntime.get_available_providers())
+    providers = [ep for ep in order if ep in available]
+    cpu = _DEVICE_PROVIDERS["cpu"]
+    if not providers:
+        providers = [cpu]
+    elif cpu not in providers:
+        providers.append(cpu)
+
+    return providers, providers[0], explicit
+
+
+def register_cuda_dll_dirs() -> list[str]:
+    """把 `MOBILE_USE_CUDA_DLL_DIR` 里的目录接进本进程的 DLL 搜索路径。
+
+    **只调 `os.add_dll_directory` 是不够的** —— 实测踩过：注册成功、日志也打了
+    `cuda_dll_dirs=...`，但建 session 仍然报 `cublasLt64_12.dll` 缺失。
+
+    原因是 ORT 的 provider dll 由 C++ 侧用原生 `LoadLibrary` 加载
+    （`onnxruntime_pybind_state.cc`），**不走** Python 3.8+ 的
+    `LOAD_LIBRARY_SEARCH_USER_DIRS` 标志，所以 `add_dll_directory` 注册的目录
+    它根本看不见。原生 `LoadLibrary` 认的是进程启动时的 PATH，而 Python 3.8+
+    又不再替 `ctypes` 拼 PATH。
+
+    所以两件事都要做：
+    1. 改 `os.environ["PATH"]` —— 对原生 `LoadLibrary` 生效，**这步是关键**；
+    2. `os.add_dll_directory` —— 给走 Python ctypes 的加载路径兜底。
+
+    `add_dll_directory` 返回的句柄必须持有住，否则目录立刻从搜索路径移除。
+
+    多个目录用 `os.pathsep`（Windows 上是 `;`）分隔。只警告不抛 —— dll 找不到
+    会表现为降级到 CPU，不需要在这里拦。
+    """
+    import os
+
+    raw = os.getenv("MOBILE_USE_CUDA_DLL_DIR", "")
+    dirs = [item.strip() for item in raw.split(os.pathsep) if item.strip()]
+    if not dirs:
+        return []
+
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory is not None:
+        for directory in dirs:
+            try:
+                _DLL_DIR_HANDLES.append(add_dll_directory(directory))
+            except OSError as e:
+                logger.warning(f"CUDA dll 目录不可用 {directory}: {type(e).__name__}: {e}")
+
+    # 关键一步：对原生 LoadLibrary 生效。已存在的同名目录不要重复拼。
+    existing = os.environ.get("PATH", "").split(os.pathsep)
+    added = [d for d in dirs if d not in existing]
+    if added:
+        os.environ["PATH"] = os.pathsep.join([*added, os.environ.get("PATH", "")])
+
+    return dirs
+
+
+def verify_provider(session: Any, expected: str, explicit: bool, device_label: str) -> str:
+    """核对 session 实际落在哪个 provider 上，返回实际 provider。
+
+    这一步不能省：ORT 拿到 GPU provider 后如果初始化失败，会**静默**退回
+    CPU 并只往 stderr 打一行日志（实测 `SESSION OK -> ['CPUExecutionProvider']`）。
+    不对账的话，「配了 GPU」和「跑在 GPU 上」完全是两回事，而代码看起来一切正常。
+    """
+    actual = session.get_providers()[0] if session.get_providers() else "(none)"
+    if actual == expected:
+        logger.info(f"OCR inference backend: {actual}")
+        return actual
+
+    message = (
+        f"OCR 推理后端降级：要的是 {expected}（device={device_label}），"
+        f"实际拿到 {actual}。"
+        + (
+            " CUDA EP 通常是因为 onnxruntime-gpu 的版本和本机 CUDA 大版本不匹配"
+            "（1.31 要 CUDA 13，1.19~1.22 是 CUDA 12），"
+            "或缺 CUDA/cuDNN dll —— 可用 MOBILE_USE_CUDA_DLL_DIR 指向解压目录。"
+            if expected == _DEVICE_PROVIDERS["cuda"]
+            else ""
+        )
+    )
+    (logger.warning if explicit else logger.info)(message)
+    return actual
 
 
 # ---------------------------------------------------------------- det
@@ -287,7 +485,13 @@ def _crop(img: np.ndarray, box: list[list[float]]) -> np.ndarray | None:
     return crop
 
 
-def _rec_preprocess(crop: np.ndarray) -> np.ndarray:
+def _rec_row(crop: np.ndarray) -> np.ndarray:
+    """crop -> `[3, 48, target_w]`，按**自己的**高宽比缩放。
+
+    宽度取各自算出来的 target_w（所以窄框保持窄），这样 pad 成一批时
+    每行字形的几何比例都不变。见 `_recognize_crops` 里 `pad` 和 `resize`
+    的区别。
+    """
     import cv2
     import numpy as np
 
@@ -295,7 +499,24 @@ def _rec_preprocess(crop: np.ndarray) -> np.ndarray:
     target_w = min(int(np.ceil(height * (_REC_MAX_WIDTH / _REC_HEIGHT))), _REC_MAX_WIDTH)
     resized = cv2.resize(crop, (max(1, target_w), _REC_HEIGHT))
     rgb = resized[:, :, ::-1].astype(np.float32) / 255.0
-    return ((rgb - 0.5) / 0.5).transpose(2, 0, 1)[None].astype(np.float32)
+    return ((rgb - 0.5) / 0.5).transpose(2, 0, 1)
+
+
+def _rec_normalize_rows(rows: list[np.ndarray]) -> np.ndarray:
+    """一组同尺寸 BGR 图 -> `[N, 3, 48, W]` 归一化张量。"""
+    import cv2
+    import numpy as np
+
+    stacked = np.stack([cv2.resize(r, (r.shape[1], _REC_HEIGHT)) for r in rows])
+    rgb = stacked[:, :, :, ::-1].astype(np.float32) / 255.0
+    return ((rgb - 0.5) / 0.5).transpose(0, 3, 1, 2).astype(np.float32)
+
+
+def _rec_preprocess(crop: np.ndarray) -> np.ndarray:
+    """单图版，带 batch 维。走 `serial` 路径时用。"""
+    import numpy as np
+
+    return _rec_row(crop)[None].astype(np.float32)
 
 
 def _ctc_decode(feat: np.ndarray, keys: list[str]) -> tuple[str, float]:
@@ -353,9 +574,23 @@ class PaddleOcrOnnxEngine:
         options = onnxruntime.SessionOptions()
         options.log_severity_level = 3  # 只留错误，避免每轮刷屏
         options.intra_op_num_threads = max(1, (os.cpu_count() or 4) // 2)
-        providers = ["CPUExecutionProvider"]
-        self._det_sess = onnxruntime.InferenceSession(str(det_path), options, providers=providers)
-        self._rec_sess = onnxruntime.InferenceSession(str(rec_path), options, providers=providers)
+
+        dll_dirs = register_cuda_dll_dirs()
+        device_label = resolve_device(self._config)
+        providers, expected, explicit = resolve_providers(self._config, onnxruntime)
+        provider_options = resolve_provider_options(self._config, providers)
+
+        self._det_sess = onnxruntime.InferenceSession(
+            str(det_path), options, providers=providers, provider_options=provider_options
+        )
+        det_actual = verify_provider(self._det_sess, expected, explicit, device_label)
+        self._rec_sess = onnxruntime.InferenceSession(
+            str(rec_path), options, providers=providers, provider_options=provider_options
+        )
+        rec_actual = verify_provider(self._rec_sess, expected, explicit, device_label)
+
+        # 两个模型的算子集不同，可能一个落 GPU 一个落 CPU，两个都核一遍。
+        self._device = det_actual if det_actual == rec_actual else f"{det_actual}+{rec_actual}"
 
         # keys.txt 是 UTF-8。一行一个字符，不要用系统默认编码读 ——
         # 中文 Windows 上按 GBK 解会直接 UnicodeDecodeError。
@@ -363,10 +598,96 @@ class PaddleOcrOnnxEngine:
         if not self._keys:
             raise ValueError(f"OCR 字典为空：{keys_path}")
 
+        warmup_ms = self._warmup()
+
         logger.info(
             f"OCR engine '{self.name}' ready | models={self._model_dir} "
-            f"dict={len(self._keys)} entries"
+            f"dict={len(self._keys)} entries | backend={self._device} "
+            f"(requested device={device_label}) "
+            + (f"| cuda_dll_dirs={','.join(dll_dirs)}" if dll_dirs else "")
+            + (f" | warmup={warmup_ms:.0f}ms" if warmup_ms is not None else "")
         )
+
+    @property
+    def device(self) -> str:
+        """**实际**跑到哪个后端，不是配置里请求的那个。
+
+        两者可能不一致（GPU provider 初始化失败会静默退回 CPU），所以想确认
+        显卡有没有被用上，要看这个，不要看 `config.device`。
+        """
+        return getattr(self, "_device", "CPUExecutionProvider")
+
+    def _warmup(self) -> float | None:
+        """用一张极小的合成图先跑一遍 det + rec。
+
+        GPU 后端的第一次 `run()` 普遍比后续慢：DirectML 要 JIT 编译 shader，
+        CUDA 要加载 cublas kernel。agent 的第一轮感知不该替这份开销买单，
+        所以在构造函数里就付掉。
+
+        预热失败不影响可用性（形状问题之类），只记 debug。
+        """
+        import time
+
+        import numpy as np
+
+        if self._device.startswith("CPU") and self._device.count("+") == 0:
+            return None  # CPU 后端没有这个开销，不必白跑一次
+
+        try:
+            start = time.perf_counter()
+            self._det_sess.run(None, {"x": np.zeros((1, 3, 64, 64), dtype=np.float32)})
+            self._rec_sess.run(None, {"x": np.zeros((1, 3, 48, 32), dtype=np.float32)})
+            return (time.perf_counter() - start) * 1000
+        except Exception as e:  # noqa: BLE001 — 预热是优化，不是功能
+            logger.debug(f"OCR warmup skipped: {type(e).__name__}: {e}")
+            return None
+
+    def _recognize_crops(self, crops: list[Any]) -> list[Any]:
+        """把一批 crop 送进 rec，返回与输入同序的特征列表。
+
+        `rec_batch` 有三种，差别是**调用次数**和**每行的几何**：
+
+        - `serial`  逐框调用。与改造前逐字一致，CPU 上 26 框约 178ms。
+        - `pad`     每行保持 `_rec_row` 算出的自己的宽度（**与 serial 逐像素
+          相同**），右侧用黑色补齐到组内最大宽度，一次调用。CTC 靠 blank 跳过
+          把补齐区读成空白。CPU 约 1.5x、CUDA 约 5.5x。
+        - `resize`  把所有行强行拉到组内最大宽度，一次调用。矮框因此被**额外
+          横向拉长**（实测 220px 的框拉成 320px，1.45x），长句会读错。
+
+        为什么值得做：rec 的输入是 `[N, 3, 48, W]`，N 和 W 都是动态的，
+        所以一批本来就能一次喂进去。改造前是逐框 `run()`，一屏 26 个框
+        就是 26 次调用 —— **这才是瓶颈，不是算力**。GPU 尤其吃亏：每次
+        `run()` 的 H2D/D2H 拷贝加同步约 40ms，而 CPU 只要 6.2ms，所以
+        不批量化的话 CUDA 会比 CPU 慢 4 倍（实测 741ms vs 178ms）。
+
+        注意 `_rec_row` 的目标宽度只由 crop 的**高度**决定 —— 这是 PaddleOCR
+        rec 的固有设计（固定高 48 + 按比例算宽），不是这里引入的形变。
+        `pad` 与 `serial` 的每行内容因此完全一致，差别仅在右侧多出的黑边。
+        """
+        import cv2
+        import numpy as np
+
+        if not crops:
+            return []
+
+        mode = resolve_rec_batch(self._config)
+        if mode == "serial" or len(crops) == 1:
+            return [self._rec_sess.run(None, {"x": _rec_preprocess(c)})[0][0] for c in crops]
+
+        if mode == "resize":
+            common_w = max(_rec_row(crop).shape[2] for crop in crops)
+            stretched = [cv2.resize(crop, (common_w, _REC_HEIGHT)) for crop in crops]
+            blob = _rec_normalize_rows(stretched)
+        else:  # pad
+            rows = [_rec_row(crop) for crop in crops]
+            common_w = max(row.shape[2] for row in rows)
+            batch = np.full((len(rows), 3, _REC_HEIGHT, common_w), _REC_PAD_VALUE, dtype=np.float32)
+            for index, row in enumerate(rows):
+                batch[index, :, :, : row.shape[2]] = row
+            blob = batch
+
+        out = self._rec_sess.run(None, {"x": blob})[0]
+        return [out[index] for index in range(out.shape[0])]
 
     def recognize(self, image_base64: str) -> list[OcrText]:
         import numpy as np
@@ -378,12 +699,17 @@ class PaddleOcrOnnxEngine:
 
         boxes = _detect(image, self._det_sess, self._config)
 
-        results: list[OcrText] = []
+        # 先裁剪再批量识别：批量只省 run() 的次数，裁剪本来就得逐框做。
+        pairs: list[tuple[list[list[float]], Any]] = []
         for box in boxes:
             crop = _crop(image, box)
-            if crop is None:
-                continue
-            feat = self._rec_sess.run(None, {"x": _rec_preprocess(crop)})[0][0]
+            if crop is not None:
+                pairs.append((box, crop))
+
+        feats = self._recognize_crops([crop for _, crop in pairs])
+
+        results: list[OcrText] = []
+        for (box, _crop_unused), feat in zip(pairs, feats):
             text, score = _ctc_decode(feat, self._keys)
             text = text.strip()
             if not text or score < self._config.rec_min_score:

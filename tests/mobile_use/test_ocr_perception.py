@@ -278,6 +278,660 @@ class TestOcrRegistry:
         assert get_ocr_engine(FakeCtx()) is None  # type: ignore[arg-type]
 
 
+class _FakeOrt:
+    """只提供 `resolve_providers` 用到的那一个接口。"""
+
+    def __init__(self, available: list[str]):
+        self._available = available
+
+    def get_available_providers(self) -> list[str]:
+        return list(self._available)
+
+
+class _FakeSession:
+    def __init__(self, providers: list[str]):
+        self._providers = providers
+
+    def get_providers(self) -> list[str]:
+        return self._providers
+
+
+class TestResolveProviders:
+    def _resolve(self, device: str, available: list[str]):
+        from minitap.mobile_use.services.ocr.paddle_onnx import resolve_providers
+
+        return resolve_providers(OcrConfig(device=device), _FakeOrt(available))
+
+    def test_cpu_only_runtime_never_requests_cuda(self):
+        """装的是 CPU 版 onnxruntime 时，auto 必须老实要 CPU。"""
+        providers, expected, explicit = self._resolve("auto", ["CPUExecutionProvider"])
+        assert providers == ["CPUExecutionProvider"]
+        assert expected == "CPUExecutionProvider"
+        assert explicit is False
+
+    def test_auto_prefers_cuda_when_available(self):
+        providers, expected, _ = self._resolve(
+            "auto", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        assert expected == "CUDAExecutionProvider"
+        # CPU 必须一起给：ORT 是节点级回退，只给 GPU 时遇到没实现的算子直接报错。
+        assert providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def test_auto_does_not_pick_dml(self):
+        """DirectML 实测比 CPU 慢，还要额外装包，auto 不能选它。
+
+        选了就是「用户没要求 GPU，却因为有独显被悄悄换到更慢的后端」。
+        """
+        providers, expected, _ = self._resolve(
+            "auto", ["DmlExecutionProvider", "CPUExecutionProvider"]
+        )
+        assert expected == "CPUExecutionProvider"
+        assert providers == ["CPUExecutionProvider"]
+
+    def test_explicit_cuda_on_cpu_only_runtime_stays_explicit(self):
+        """点名了 cuda 却没拿到：仍然要报成「显式但没兑现」，让上层 warn。
+
+        不能因为「反正降级了」就标成 auto —— 那会把用户的显式要求
+        静默吞掉，日志里只留一条 info。
+        """
+        _, expected, explicit = self._resolve("cuda", ["CPUExecutionProvider"])
+        assert expected == "CPUExecutionProvider"
+        assert explicit is True
+
+    def test_explicit_device_wins_over_auto(self):
+        _, expected, explicit = self._resolve(
+            "cpu", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        assert expected == "CPUExecutionProvider"
+        assert explicit is True
+
+    def test_unknown_device_falls_back_to_auto_without_raising(self):
+        """拼错的 device 名不该把整轮感知搞挂。"""
+        providers, expected, explicit = self._resolve(
+            "gpu-please", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        assert expected == "CUDAExecutionProvider"
+        assert providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert explicit is False
+
+    def test_empty_available_still_yields_cpu(self):
+        providers, expected, _ = self._resolve("cuda", [])
+        assert providers == ["CPUExecutionProvider"]
+        assert expected == "CPUExecutionProvider"
+
+    def test_device_is_case_and_space_insensitive(self):
+        _, expected, explicit = self._resolve(
+            "  CUDA ", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        assert expected == "CUDAExecutionProvider"
+        assert explicit is True
+
+
+class TestVerifyProvider:
+    """ORT 拿到 GPU provider 后初始化失败会**静默**退回 CPU。
+
+    不对账的话，「配了 GPU」和「跑在 GPU 上」完全是两件事，
+    而代码看起来一切正常 —— 这是 GPU 化最容易出现的假成功。
+    """
+
+    def test_matching_backend_is_returned(self):
+        from minitap.mobile_use.services.ocr.paddle_onnx import verify_provider
+
+        session = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+        assert verify_provider(session, "CUDAExecutionProvider", True, "cuda") == (
+            "CUDAExecutionProvider"
+        )
+
+    def test_silent_fallback_to_cpu_is_detected(self):
+        from minitap.mobile_use.services.ocr.paddle_onnx import verify_provider
+
+        session = _FakeSession(["CPUExecutionProvider"])
+        assert verify_provider(session, "CUDAExecutionProvider", True, "cuda") == (
+            "CPUExecutionProvider"
+        )
+
+    def test_empty_provider_list_does_not_raise(self):
+        from minitap.mobile_use.services.ocr.paddle_onnx import verify_provider
+
+        session = _FakeSession([])
+        assert verify_provider(session, "CUDAExecutionProvider", True, "cuda") == "(none)"
+
+
+class TestResolveDevice:
+    """`配置 -> 环境变量 -> auto` 的优先级，和 `resolve_model_dir` 同一套。
+
+    有环境变量入口是故意的：换后端要连带 dll 路径、调 onnxruntime 包，
+    这些都在环境里摆着，不该要求使用者改代码。
+    """
+
+    @staticmethod
+    def _resolve(device: str | None, monkeypatch, env: str | None = None):
+        from minitap.mobile_use.services.ocr.paddle_onnx import resolve_device
+
+        if env is None:
+            monkeypatch.delenv("MOBILE_USE_OCR_DEVICE", raising=False)
+        else:
+            monkeypatch.setenv("MOBILE_USE_OCR_DEVICE", env)
+        return resolve_device(OcrConfig(device=device))
+
+    def test_default_is_auto(self, monkeypatch):
+        assert self._resolve(None, monkeypatch) == "auto"
+
+    def test_env_var_is_used_when_config_is_unset(self, monkeypatch):
+        assert self._resolve(None, monkeypatch, env="cuda") == "cuda"
+
+    def test_explicit_config_beats_env_var(self, monkeypatch):
+        """在代码里写死 device 时，环境变量**不能**覆盖它 ——
+        否则 CI 里设一次 MOBILE_USE_OCR_DEVICE 就悄悄改掉了本地显式配置。
+        """
+        assert self._resolve("cpu", monkeypatch, env="cuda") == "cpu"
+
+    def test_is_normalized(self, monkeypatch):
+        assert self._resolve("  CUDA ", monkeypatch) == "cuda"
+
+    def test_blank_env_var_falls_back_to_auto(self, monkeypatch):
+        assert self._resolve(None, monkeypatch, env="   ") == "auto"
+
+
+class TestRegisterCudaDllDirs:
+    def test_no_env_means_no_handles(self, monkeypatch):
+        from minitap.mobile_use.services.ocr import paddle_onnx
+
+        monkeypatch.delenv("MOBILE_USE_CUDA_DLL_DIR", raising=False)
+        before = len(paddle_onnx._DLL_DIR_HANDLES)
+        assert paddle_onnx.register_cuda_dll_dirs() == []
+        assert len(paddle_onnx._DLL_DIR_HANDLES) == before
+
+    def test_missing_dir_is_returned_but_does_not_raise(self, monkeypatch, tmp_path):
+        """目录不存在**不能抛** —— dll 缺失会表现为降级到 CPU，
+        在这里崩等于把「降级上报」变成「硬拦截」。
+
+        PATH 方式对不存在的目录天然无害（LoadLibrary 跳过），所以照样返回。
+        """
+        from minitap.mobile_use.services.ocr import paddle_onnx
+
+        monkeypatch.setattr(paddle_onnx, "_DLL_DIR_HANDLES", [], raising=False)
+        monkeypatch.setenv("MOBILE_USE_CUDA_DLL_DIR", str(tmp_path / "nope"))
+        assert paddle_onnx.register_cuda_dll_dirs() == [str(tmp_path / "nope")]
+
+    def test_path_env_var_is_the_thing_that_matters(self, monkeypatch, tmp_path):
+        """**关键**：ORT 用原生 `LoadLibrary`，不认 `add_dll_directory`。
+
+        真正让 dll 被找到的是改进程内 PATH，不是注册 dll 目录。少这一步的
+        症状是：日志明明打了 `cuda_dll_dirs=...`，建 session 仍然报
+        `cublasLt64_12.dll` 缺失（实测踩过）。
+        """
+        import os
+
+        from minitap.mobile_use.services.ocr import paddle_onnx
+
+        monkeypatch.setattr(paddle_onnx, "_DLL_DIR_HANDLES", [], raising=False)
+        monkeypatch.setenv("MOBILE_USE_CUDA_DLL_DIR", str(tmp_path))
+        monkeypatch.setenv("PATH", "C:\\windows")
+
+        registered = paddle_onnx.register_cuda_dll_dirs()
+        assert registered == [str(tmp_path)]
+        assert str(tmp_path) in os.environ["PATH"].split(os.pathsep)
+        assert len(paddle_onnx._DLL_DIR_HANDLES) == 1  # 句柄必须留活
+
+    def test_existing_path_entries_are_not_duplicated(self, monkeypatch, tmp_path):
+        import os
+
+        from minitap.mobile_use.services.ocr import paddle_onnx
+
+        monkeypatch.setattr(paddle_onnx, "_DLL_DIR_HANDLES", [], raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("MOBILE_USE_CUDA_DLL_DIR", str(tmp_path))
+
+        paddle_onnx.register_cuda_dll_dirs()
+        assert os.environ["PATH"].split(os.pathsep).count(str(tmp_path)) == 1
+
+
+class _FakeRecSession:
+    """记录每次 run 的输入形状和内容，用来断言批处理真的把调用压少了。"""
+
+    def __init__(self):
+        self.calls: list[tuple[int, int]] = []
+        self.blobs: list[object] = []
+
+    def run(self, _outputs, feed):
+        import numpy as np
+
+        blob = feed["x"]
+        self.calls.append((int(blob.shape[0]), int(blob.shape[3])))
+        self.blobs.append(blob)
+        return [np.zeros((blob.shape[0], 8, 4), dtype=np.float32)]
+
+    def get_providers(self) -> list[str]:
+        return ["CPUExecutionProvider"]
+
+
+def _crops(count: int, width: int = 30):
+    import numpy as np
+
+    return [np.full((20, width, 3), 128, dtype=np.uint8) for _ in range(count)]
+
+
+# crop 高 20px 时按自身高宽比缩放出来的目标宽度：ceil(20 * 320 / 48) = 134。
+_EXPECTED_TARGET_W = 134
+
+
+class TestRecBatching:
+    """批处理是 GPU 化的前提：CUDA 单次 run 约 40ms，CPU 只要 6.2ms。
+
+    不把 26 次调用压成 1~2 次，GPU 会比 CPU 慢 4 倍。
+    """
+
+    KEYS = ["a", "b"]
+
+    @staticmethod
+    def _engine(mode: str, session: _FakeRecSession):
+        from minitap.mobile_use.services.ocr.paddle_onnx import PaddleOcrOnnxEngine
+        from minitap.mobile_use.services.ocr.types import OcrConfig
+
+        engine = _BatchHarness(OcrConfig(rec_batch=mode), session)
+        engine._recognize_crops = PaddleOcrOnnxEngine._recognize_crops.__get__(engine)
+        return engine
+
+    def test_serial_calls_once_per_crop(self):
+        session = _FakeRecSession()
+        self._engine("serial", session)._recognize_crops(_crops(5))
+        assert len(session.calls) == 5
+
+    def test_pad_collapses_to_a_single_call(self):
+        session = _FakeRecSession()
+        self._engine("pad", session)._recognize_crops(_crops(5))
+        assert session.calls[0][0] == 5
+
+    def test_resize_collapses_to_a_single_call(self):
+        session = _FakeRecSession()
+        self._engine("resize", session)._recognize_crops(_crops(5))
+        assert session.calls[0][0] == 5
+
+    def test_pad_keeps_each_row_at_its_own_width(self):
+        """pad 不额外拉伸窄框 —— 这是选它做默认的原因。
+
+        `_rec_row` 的宽度只由 **height** 决定（PaddleOCR 的 rec 就是按固定高 48
+        + 比例宽训练的），所以矮框算出的 target_w 就窄。pad 保留每行自己算出的
+        宽度（**与 serial 逐像素一致**），只把右侧补黑到组内最大宽度；
+        而 `resize` 会把所有行强行拉到组内最大宽度，矮框被横向拉长。
+
+        这里用 height=20（target_w=134）和 height=48（target_w=320）两行来证明：
+        batch 宽度是 320，但矮行只有前 134 列是真内容，右边全是填充。
+        """
+        import numpy as np
+
+        session = _FakeRecSession()
+        short = np.full((20, 20, 3), 128, dtype=np.uint8)
+        tall = np.full((48, 200, 3), 128, dtype=np.uint8)
+        self._engine("pad", session)._recognize_crops([short, tall])
+
+        batch_n, batch_w = session.calls[0]
+        assert batch_n == 2
+        assert batch_w == 320  # 组内最大 = 48px 高那行的 target_w
+
+        blob = session.blobs[0]
+        from minitap.mobile_use.services.ocr.paddle_onnx import _REC_PAD_VALUE
+
+        # 矮行：前 134 列有内容，之后全是黑色填充（说明没被拉成 320 宽）
+        assert np.all(blob[0, :, :, 134:] == _REC_PAD_VALUE)
+        assert not np.all(blob[0, :, :, :134] == _REC_PAD_VALUE)
+        # 高行：整行填满，没有填充
+        assert not np.all(blob[1] == _REC_PAD_VALUE)
+
+    def test_resize_stretches_short_rows_to_common_width(self):
+        """对照组：resize 会把矮行也填满 320 宽 —— 几何被改动了。"""
+        import numpy as np
+
+        session = _FakeRecSession()
+        short = np.full((20, 20, 3), 128, dtype=np.uint8)
+        tall = np.full((48, 200, 3), 128, dtype=np.uint8)
+        self._engine("resize", session)._recognize_crops([short, tall])
+
+        blob = session.blobs[0]
+        from minitap.mobile_use.services.ocr.paddle_onnx import _REC_PAD_VALUE
+
+        assert session.calls[0] == (2, 320)
+        # 没有黑色填充，因为两行都被拉满了
+        assert not np.any(blob == _REC_PAD_VALUE)
+
+    def test_pad_fill_value_is_black_not_mid_grey(self):
+        """填充值是归一化后的纯黑 (-1)；用 0 会被 CTC 当成中灰内容读出来。"""
+        from minitap.mobile_use.services.ocr.paddle_onnx import _REC_PAD_VALUE
+
+        assert _REC_PAD_VALUE == -1.0
+
+    def test_single_crop_still_works_in_pad_mode(self):
+        session = _FakeRecSession()
+        assert len(self._engine("pad", session)._recognize_crops(_crops(1))) == 1
+        assert session.calls[0][0] == 1
+
+    def test_empty_input_is_safe(self):
+        assert self._engine("pad", _FakeRecSession())._recognize_crops([]) == []
+
+    def test_default_is_pad(self):
+        """schema 默认是 None（「未设置」），实际生效值才是 pad。
+
+        区分这两者很重要：None 才能读环境变量，默认写成 "pad" 的话
+        `MOBILE_USE_OCR_REC_BATCH` 永远不生效。
+        """
+        from minitap.mobile_use.services.ocr.types import resolve_rec_batch
+
+        assert OcrConfig().rec_batch is None
+        assert resolve_rec_batch(OcrConfig()) == "pad"
+
+
+class TestResolveRecBatch:
+    """批处理方式必须先归一化再用。
+
+    改造前直接拿裸字符串比 `== "serial"`，于是 `rec_batch="SERIAL"` 会掉进
+    else 分支被当成 pad —— **识别结果悄悄变了**（标点、长句都可能不同），
+    而且没有任何提示。
+    """
+
+    @staticmethod
+    def _resolve(raw: str | None, monkeypatch, env: str | None = None):
+        from minitap.mobile_use.services.ocr.types import resolve_rec_batch
+
+        if env is None:
+            monkeypatch.delenv("MOBILE_USE_OCR_REC_BATCH", raising=False)
+        else:
+            monkeypatch.setenv("MOBILE_USE_OCR_REC_BATCH", env)
+        return resolve_rec_batch(OcrConfig(rec_batch=raw))
+
+    def test_legal_values_pass_through(self, monkeypatch):
+        for mode in ("serial", "pad", "resize"):
+            assert self._resolve(mode, monkeypatch) == mode
+
+    def test_case_and_whitespace_are_normalized(self, monkeypatch):
+        assert self._resolve("SERIAL", monkeypatch) == "serial"
+        assert self._resolve("Resize", monkeypatch) == "resize"
+        assert self._resolve("  pad  ", monkeypatch) == "pad"
+
+    def test_illegal_value_falls_back_and_warns(self, monkeypatch, caplog):
+        """降级必须有 warning —— 静默降级在这里等于悄悄改识别结果。"""
+        import logging
+
+        from minitap.mobile_use.utils.logger import get_logger
+
+        underlying = get_logger("minitap.mobile_use.services.ocr.types").logger
+        with caplog.at_level(logging.WARNING, logger=underlying.name):
+            assert self._resolve("bogus", monkeypatch) == "pad"
+        assert any("rec_batch" in r.getMessage() for r in caplog.records)
+
+    def test_blank_means_unset_and_does_not_warn(self, monkeypatch, caplog):
+        """空值 = 没设置，回落到默认是正常的，不该刷警告。"""
+        import logging
+
+        from minitap.mobile_use.utils.logger import get_logger
+
+        underlying = get_logger("minitap.mobile_use.services.ocr.types").logger
+        with caplog.at_level(logging.WARNING, logger=underlying.name):
+            assert self._resolve("", monkeypatch) == "pad"
+            assert self._resolve(None, monkeypatch) == "pad"
+        assert not any("rec_batch" in r.getMessage() for r in caplog.records)
+
+    def test_env_var_is_used_when_config_is_unset(self, monkeypatch):
+        assert self._resolve(None, monkeypatch, env="serial") == "serial"
+
+    def test_explicit_config_beats_env_var(self, monkeypatch):
+        assert self._resolve("resize", monkeypatch, env="serial") == "resize"
+
+    def test_normalization_actually_changes_the_run_count(self, monkeypatch):
+        """回归：`"SERIAL"` 之前会被当成 pad（1 次调用），归一化后必须是 8 次。"""
+        from minitap.mobile_use.services.ocr.paddle_onnx import PaddleOcrOnnxEngine
+
+        counts = {}
+        for raw in ("serial", "SERIAL", "pad", "resize", "RESIZE"):
+            session = _FakeRecSession()
+            engine = _BatchHarness(OcrConfig(rec_batch=raw), session)
+            engine._recognize_crops = PaddleOcrOnnxEngine._recognize_crops.__get__(engine)
+            engine._recognize_crops(_crops(8))
+            counts[raw] = len(session.calls)
+        assert counts["SERIAL"] == counts["serial"] == 8
+        assert counts["RESIZE"] == counts["resize"] == 1
+        assert counts["pad"] == 1
+
+
+class TestDeviceIdReachesOnnxRuntime:
+    """`device_id` 之前是纯装饰：写进了缓存 key，文档也写着「多卡指定哪张卡」，
+    但**从来没传给 onnxruntime** —— 多卡机器上改它毫无作用，也不报错。
+    """
+
+    @staticmethod
+    def _options(providers: list[str], device_id: int = 0):
+        from minitap.mobile_use.services.ocr.paddle_onnx import resolve_provider_options
+
+        return resolve_provider_options(OcrConfig(device_id=device_id), providers)
+
+    def test_gpu_provider_receives_device_id(self):
+        options = self._options(["CUDAExecutionProvider", "CPUExecutionProvider"], 2)
+        assert options[0] == {"device_id": "2"}
+
+    def test_directml_provider_receives_device_id(self):
+        options = self._options(["DmlExecutionProvider", "CPUExecutionProvider"], 1)
+        assert options[0] == {"device_id": "1"}
+
+    def test_cpu_provider_does_not(self):
+        """CPU EP 不认 device_id，给了会被 ORT 判为非法 key。"""
+        assert self._options(["CPUExecutionProvider"], 2) == [{}]
+
+    def test_length_always_matches_providers(self):
+        for providers in (
+            ["CPUExecutionProvider"],
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            ["CUDAExecutionProvider", "CPUExecutionProvider", "DmlExecutionProvider"],
+        ):
+            assert len(self._options(providers)) == len(providers)
+
+    def test_options_are_actually_passed_to_the_session(self, monkeypatch, tmp_path):
+        """端到端：确认 provider_options 真的交给了 InferenceSession 构造函数。"""
+        import minitap.mobile_use.services.ocr.paddle_onnx as paddle_onnx
+
+        captured: list[dict] = []
+
+        class FakeSession:
+            def __init__(self, path, options=None, providers=None, provider_options=None):
+                captured.append({"providers": providers, "provider_options": provider_options})
+
+            def get_providers(self):
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        class FakeOptions:
+            """SessionOptions 会被写 log_severity_level / intra_op_num_threads。"""
+
+            def __init__(self):
+                self.log_severity_level = 0
+                self.intra_op_num_threads = 0
+
+        class FakeOrt:
+            SessionOptions = FakeOptions
+            InferenceSession = FakeSession
+
+            @staticmethod
+            def get_available_providers():
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        for name in ("det.onnx", "rec.onnx", "keys.txt"):
+            (tmp_path / name).write_bytes(b"x")
+
+        monkeypatch.setattr(paddle_onnx, "_require_deps", lambda: (None, FakeOrt, None))
+        paddle_onnx.PaddleOcrOnnxEngine(OcrConfig(model_dir=tmp_path, device="cuda", device_id=3))
+        assert len(captured) == 2  # det + rec
+        for call in captured:
+            assert call["provider_options"][0] == {"device_id": "3"}
+
+
+class TestCacheKeyCoversEveryField:
+    """加字段时忘了加进缓存 key = 「改配置没反应但也不报错」。
+
+    这是最难查的一类 bug，所以用测试守住：key 必须覆盖全部配置字段
+    （含经 `resolve_*` 间接读取的）。
+    """
+
+    @staticmethod
+    def _fields_in_key() -> set[str]:
+        import inspect
+        import re
+
+        from minitap.mobile_use.services.ocr.registry import _cache_key
+        from minitap.mobile_use.services.ocr import types as ocr_types
+
+        found = set(re.findall(r"config\.(\w+)", inspect.getsource(_cache_key)))
+        for name in ("resolve_device", "resolve_rec_batch"):
+            found |= set(
+                re.findall(
+                    r"config\.(\w+)",
+                    inspect.getsource(getattr(ocr_types, name)),
+                )
+            )
+        return found
+
+    def test_no_field_is_missing_from_the_cache_key(self):
+        missing = set(OcrConfig.model_fields) - self._fields_in_key()
+        assert not missing, (
+            f"这些字段不在 OCR 引擎缓存 key 里，改了它们不会换实例：{sorted(missing)}。"
+            " 在 registry._cache_key 里补上。"
+        )
+
+    def test_key_must_not_bypass_the_resolvers(self):
+        """key 里只能出现**解析后**的值，直接读原始字段是同一个 bug 换个写法。
+
+        `config.device` 在走环境变量时是 None —— 用它算 key 的话，
+        `=cuda` 和 `=cpu` 算出同一个 key，改配置不报错却没反应。
+        上面的「字段出现过」检查抓不到这种，因为它只认字段名不认取值方式。
+        """
+        import ast
+        import inspect
+
+        from minitap.mobile_use.services.ocr.registry import _cache_key
+
+        # 用 AST 只看真实的属性访问，不看注释 —— 注释里为了说明问题会提到
+        # `config.device`，按正则扫文本会把说明文字当成代码。
+        tree = ast.parse(inspect.getsource(_cache_key))
+        used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        for field in ("device", "rec_batch"):
+            assert field not in used, (
+                f"_cache_key 直接读了 config.{field}，绕过了解析函数。"
+                " 环境变量路径下它是 None，会让不同后端算出同一个 key。"
+            )
+
+    def test_max_texts_is_covered(self):
+        """max_texts 曾被漏掉 —— 当时靠实例各自持有 config 才侥幸正确。"""
+        from minitap.mobile_use.services.ocr.registry import _cache_key
+
+        assert _cache_key(OcrConfig(max_texts=3)) != _cache_key(OcrConfig(max_texts=80))
+
+
+class _BatchHarness:
+    """只借用 `_recognize_crops` 的最小宿主，避免真去建 ONNX session。"""
+
+    def __init__(self, config, rec_sess):
+        self._config = config
+        self._rec_sess = rec_sess
+        self._keys = ["a", "b"]
+
+    _recognize_crops = None  # 由 _engine 绑定真实实现
+
+
+class TestDeviceIsPartOfTheCacheKey:
+    def test_same_config_different_device_are_different_instances(self):
+        """换后端必须换实例，否则改配置后还拿着 CPU session 在跑。"""
+        clear_ocr_engine_cache()
+        calls = []
+
+        class FakeEngine:
+            name = "fake"
+
+            def __init__(self, config: OcrConfig):
+                self.device = config.device
+
+            def recognize(self, image_base64: str) -> list[OcrText]:
+                return []
+
+        def factory(config: OcrConfig):
+            calls.append(config.device)
+            return FakeEngine(config)
+
+        register_ocr_engine("fake", factory)
+        try:
+            a = create_ocr_engine(OcrConfig(engine="fake", device="cpu"))
+            b = create_ocr_engine(OcrConfig(engine="fake", device="cuda"))
+            assert a is not b
+            assert calls == ["cpu", "cuda"]
+        finally:
+            from minitap.mobile_use.services.ocr.registry import _REGISTRY
+
+            _REGISTRY.pop("fake", None)
+
+    def test_device_id_also_part_of_key(self):
+        from minitap.mobile_use.services.ocr.registry import _cache_key
+
+        a = _cache_key(OcrConfig(device="cuda", device_id=0))
+        b = _cache_key(OcrConfig(device="cuda", device_id=1))
+        assert a != b
+
+    def test_env_var_rec_batch_is_part_of_the_key(self, monkeypatch):
+        """和 device 同理：rec_batch 也有环境变量入口，所以也必须进 key。
+
+        只有 device 有这层测试时是漏的 —— 覆盖缺口和 bug 一模一样。
+        """
+        from minitap.mobile_use.services.ocr.registry import _cache_key
+
+        monkeypatch.setenv("MOBILE_USE_OCR_REC_BATCH", "serial")
+        with_serial = _cache_key(OcrConfig())
+        monkeypatch.setenv("MOBILE_USE_OCR_REC_BATCH", "resize")
+        with_resize = _cache_key(OcrConfig())
+        assert with_serial != with_resize
+
+    def test_env_var_device_is_part_of_the_key(self, monkeypatch):
+        """回归：走环境变量时 `config.device` 是 None。
+
+        如果缓存 key 直接用它，`MOBILE_USE_OCR_DEVICE=cuda` 和 `=cpu` 会算出
+        同一个 key，于是设成 cpu 之后拿到的还是上一次那个 CUDA 实例 ——
+        **没有任何报错**，只是静默跑错了后端。实测踩过。
+        """
+        from minitap.mobile_use.services.ocr.registry import _cache_key
+
+        monkeypatch.setenv("MOBILE_USE_OCR_DEVICE", "cuda")
+        with_cuda = _cache_key(OcrConfig())
+        monkeypatch.setenv("MOBILE_USE_OCR_DEVICE", "cpu")
+        with_cpu = _cache_key(OcrConfig())
+        assert with_cuda != with_cpu
+
+    def test_env_var_change_returns_a_fresh_engine(self, monkeypatch):
+        """不只是 key 不同，还要保证真能换掉实例。"""
+        clear_ocr_engine_cache()
+        seen = []
+
+        class FakeEngine:
+            name = "fake"
+
+            def __init__(self, config: OcrConfig):
+                self.requested = config.device
+
+            def recognize(self, image_base64: str) -> list[OcrText]:
+                return []
+
+        def factory(config: OcrConfig):
+            from minitap.mobile_use.services.ocr.types import resolve_device
+
+            seen.append(resolve_device(config))
+            return FakeEngine(config)
+
+        register_ocr_engine("fake", factory)
+        try:
+            monkeypatch.setenv("MOBILE_USE_OCR_DEVICE", "cuda")
+            create_ocr_engine(OcrConfig(engine="fake"))
+            monkeypatch.setenv("MOBILE_USE_OCR_DEVICE", "cpu")
+            create_ocr_engine(OcrConfig(engine="fake"))
+            assert seen == ["cuda", "cpu"]
+        finally:
+            from minitap.mobile_use.services.ocr.registry import _REGISTRY
+
+            _REGISTRY.pop("fake", None)
+
+
 class TestOcrTextModel:
     def test_bounds_reuse_the_ui_hierarchy_shape(self):
         """能直接填进 Target.bounds，不需要在工具层转形状。"""

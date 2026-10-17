@@ -251,6 +251,115 @@ Before you begin, ensure you have the following installed:
     uv sync
     ```
 
+5.  ** _(Optional)_ Enable OCR perception:**
+    ```bash
+    # CPU inference
+    uv pip install -e ".[ocr]"
+
+    # Or GPU inference (NVIDIA, CUDA 12 — see the section below)
+    uv pip install -e ".[ocr-gpu]"
+    ```
+
+    See [⚡ OCR perception & GPU backends](#-ocr-perception--gpu-backends) for details.
+
+## ⚡ OCR perception & GPU backends
+
+Text drawn by the app itself (video captions, custom widgets) has no node in the
+accessibility tree. OCR perception reads it with PaddleOCR and feeds the text —
+and its measured coordinates — to the model, so those pixels become clickable.
+
+### Choosing a backend
+
+```bash
+# CPU (default extra)
+uv pip install -e ".[ocr]"
+
+# NVIDIA GPU via the CUDA execution provider
+uv pip install -e ".[ocr-gpu]"
+
+# Windows GPU via DirectML (no CUDA toolkit needed)
+uv pip install -e ".[ocr-dml]"
+```
+
+> [!IMPORTANT]
+> These three extras are **mutually exclusive** — `onnxruntime`,
+> `onnxruntime-gpu` and `onnxruntime-directml` all provide the same
+> `onnxruntime` module and overwrite each other's files.
+
+The backend defaults to `auto`, which probes for CUDA and silently stays on CPU
+otherwise. Override it with an environment variable:
+
+```bash
+MOBILE_USE_OCR_DEVICE=cuda|cpu|dml|auto
+MOBILE_USE_OCR_REC_BATCH=serial|pad|resize   # optional, see below
+```
+
+Or in code — an explicit field always wins over the environment variable:
+
+```python
+from minitap.mobile_use.context import PerceptionConfig
+from minitap.mobile_use.services.ocr import OcrConfig
+
+perception = PerceptionConfig(
+    ocr_config=OcrConfig(
+        device="cuda",
+        device_id=0,        # which GPU, on multi-GPU machines
+        rec_batch="pad",
+    )
+)
+```
+
+> [!TIP]
+> Every knob is normalized before use: `"SERIAL"`, `"Serial"` and `" serial "` all
+> behave as `serial`, and an unrecognised value is **logged as a warning** and
+> falls back to the default rather than silently running a different mode.
+
+### Measured numbers (RTX 4060 Laptop, driver 566.26, onnxruntime-gpu 1.22)
+
+Per-screenshot OCR on a 1220x2712 capture, steady state (median of 5):
+
+| Backend | Time |
+| --- | --- |
+| CPU | 264ms |
+| CUDA (auto-selected) | 124ms |
+
+**2.14x — but only because recognition is batched.** Each `run()` has a fixed
+cost: ~6.2ms on CPU, ~40ms on CUDA (host↔device copies plus synchronization).
+The pre-existing code called `rec` once per text box — 26 calls for one screen —
+so running on a GPU *unchanged* makes it **4x slower than CPU**. Batching the
+boxes into a single call is what turns the GPU into a win.
+
+`rec_batch` controls this:
+
+- `pad` (default) — every row keeps the geometry it had per-box, right-padded
+  with black to the batch width. **Same pixel content as `serial`**, just fewer
+  calls.
+- `resize` — stretches every row to one common width. Fastest, but short boxes
+  get horizontally stretched (1.45x) and long sentences get misread.
+- `serial` — one call per box, byte-identical to the original behaviour, slowest.
+
+### CUDA on Windows
+
+`onnxruntime-gpu` **1.19–1.22** targets CUDA 12; 1.23+ requires CUDA 13 and will
+report missing `cublasLt64_13.dll`. The runtime DLLs must be reachable — either
+install the full CUDA Toolkit (they land on `PATH`) or point at extracted
+components:
+
+```bash
+set MOBILE_USE_CUDA_DLL_DIR=C:\cuda\cudart\bin;C:\cuda\cublas\bin;C:\cuda\cufft\bin;C:\venv\Lib\site-packages\nvidia\cudnn\bin
+```
+
+> [!NOTE]
+> On Windows, onnxruntime loads its provider with a native `LoadLibrary`, which
+> does **not** honour `os.add_dll_directory` — that is why the code also prepends
+> these directories to the process `PATH`.
+
+When the requested backend cannot be initialised — wrong CUDA major version,
+missing DLLs, or a `device_id` that does not exist on this machine — onnxruntime
+falls back to CPU **silently**. mobile-use therefore verifies
+`session.get_providers()` after every build and logs the backend it actually got.
+Check `engine.device`, not `config.device`.
+
 ## 👨‍💻 Usage
 
 To run mobile-use, simply pass your command as an argument.

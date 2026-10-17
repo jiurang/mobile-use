@@ -38,6 +38,26 @@ class Settings(BaseSettings):
     # A domestic key sent to the global endpoint fails with 401 "invalid api key (2049)".
     # Falls back to the global endpoint (upstream default) when unset.
     MINIMAX_BASE_URL: str | None = None
+    # `output_config.effort` —— MiniMax M3.1-Flash-Preview 的**思考深度**档位。
+    #
+    # 官方文档原文："MiniMax-M3.1-Flash-Preview additionally always thinks and
+    # supports tunable thinking depth via output_config.effort"，取值
+    # low / medium / high / xhigh / max，**默认 max**。
+    #
+    # 显式写出来而不是吃默认值，是为了让「我们跑的是哪一档」写在配置文件里、
+    # 可被 verify_llm_override.py 审计，也避免服务端默认值悄悄变动。
+    #
+    # 实测（真实 cortex prompt，n=4/档）：low 379.5 tok / 5303ms、medium 399.5 /
+    # 5569ms、high 446.0 / 7036ms、max 389.5 / **4247ms**。两列都**非单调**，
+    # max 反而最快 —— 说明这个档位在本负载上不是个有效的旋钮，别再去调它。
+    #
+    # 只对 M3.1-Flash-Preview 有意义；M2.x 会忽略，M3 不认这个字段。
+    MINIMAX_EFFORT: str | None = "max"
+    # 注意这里**没有** thinking 开关。M3.1 是 always thinks，官方明确
+    # "If type is sent it must be adaptive; disabled returns HTTP 400" ——
+    # 留一个能设成 disabled 的旋钮就是个地雷：谁设了就是每个请求 400。
+    # M2.x 那边官方写 "disabled is accepted but ignored"，同样是死开关。
+
     # DeepSeek's OpenAI-compatible endpoint (domestic platform, platform.deepseek.com).
     # /v1 is accepted too, so both spellings work; we default to the documented one.
     DEEPSEEK_BASE_URL: str | None = None
