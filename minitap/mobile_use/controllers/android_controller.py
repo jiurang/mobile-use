@@ -2,6 +2,7 @@ import asyncio
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from adbutils import AdbClient, AdbDevice
@@ -85,7 +86,9 @@ class AndroidDeviceController(MobileDeviceController):
         except Exception as e:
             return f"ADB swipe failed: {str(e)}"
 
-    async def get_screen_data(self) -> ScreenDataResponse:
+    async def get_screen_data(
+        self, on_screenshot: Callable[[str], None] | None = None
+    ) -> ScreenDataResponse:
         """Get screen data using the UIAutomator2 client"""
         try:
             logger.info("Using UIAutomator2 for screen data retrieval")
@@ -93,7 +96,13 @@ class AndroidDeviceController(MobileDeviceController):
             # HTTP to the on-device u2 agent), and this runs on the same event
             # loop as the TUI. Calling it inline freezes the UI for the whole
             # hierarchy dump + screenshot.
-            ui_data = await asyncio.to_thread(self.ui_adb_client.get_screen_data)
+            #
+            # on_screenshot 在这个工作线程里就地执行，所以里面可以直接跑
+            # CPU 密集的 OCR —— 它本来就不该阻塞事件循环，而此时 u2 正在
+            # 并发地 dump 层级树，OCR 白得。
+            ui_data = await asyncio.to_thread(
+                self.ui_adb_client.get_screen_data, on_screenshot
+            )
             return ScreenDataResponse(
                 base64=ui_data.base64,
                 elements=ui_data.elements,

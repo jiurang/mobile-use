@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from collections.abc import Callable
 from typing import Protocol
 
 from pydantic import BaseModel
@@ -137,10 +138,17 @@ class MobileDeviceController(Protocol):
         raise NotImplementedError("Subclasses must implement this method")
 
     @abstractmethod
-    async def get_screen_data(self) -> "ScreenDataResponse":
+    async def get_screen_data(
+        self, on_screenshot: "Callable[[str], None] | None" = None
+    ) -> "ScreenDataResponse":
         """
         Get screen data including screenshot (base64), UI hierarchy elements,
         screen dimensions, and platform.
+
+        Args:
+            on_screenshot: 可选回调，在截图拿到之后、层级树还在采集的窗口里
+                同步调用一次。Android 实测 `dump_hierarchy` 要 ~1.2s，OCR 只要
+                ~0.4s，把 OCR 塞进这个窗口等于白送。实现方不支持时忽略即可。
 
         Returns:
             ScreenDataResponse with base64 screenshot, elements, width, height, platform

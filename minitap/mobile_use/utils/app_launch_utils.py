@@ -3,6 +3,7 @@ Utilities for handling app locking and initial app launch logic.
 """
 
 import asyncio
+import time
 
 from minitap.mobile_use.context import AppLaunchResult, MobileUseContext
 from minitap.mobile_use.controllers.platform_specific_commands_controller import (
@@ -13,12 +14,24 @@ from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 轮询节奏（2026-10-17 实测调整）
+# --------------------------------
+# 原来启动 App 是「先无脑 sleep(1)，再每秒轮询一次」—— 最少空等 1 秒，
+# 命中之后还要按秒对齐，最坏再多等接近 1 秒。合起来每次启动白扔 1~2 秒。
+#
+# 冷启动一个 App 通常几百毫秒就到前台了，所以改成「立刻查一次，查不到就
+# 短间隔重试，逐步退避到 1s 上限」：命中得快的那部分轮询更密，等得久的那部分
+# 不会把 adb 打爆。
+POLL_INTERVAL_START = 0.15
+POLL_INTERVAL_MAX = 1.0
+POLL_BACKOFF = 1.6
+
 
 async def _poll_for_app_ready(
     ctx: MobileUseContext,
     app_package: str,
     max_poll_seconds: int = 15,
-    poll_interval: float = 1.0,
+    poll_interval: float = POLL_INTERVAL_START,
 ) -> tuple[bool, str | None]:
     """
     Poll for app to be ready after launch.
@@ -26,35 +39,46 @@ async def _poll_for_app_ready(
     Treats mCurrentFocus=null as a loading state and keeps polling.
     Only fails if we get a different (non-null) package or timeout.
 
+    先立刻查一次（不做任何前置 sleep），之后按 poll_interval 退避重查，
+    间隔从 poll_interval 涨到 POLL_INTERVAL_MAX 为止。
+
     Args:
         ctx: Mobile use context
         app_package: Expected package name
         max_poll_seconds: Maximum time to poll (default: 15s)
-        poll_interval: Time between polls (default: 1s)
+        poll_interval: 首次重试间隔，默认 POLL_INTERVAL_START
 
     Returns:
         Tuple of (success: bool, error_message: str | None)
     """
-    polls = int(max_poll_seconds / poll_interval)
+    deadline = time.monotonic() + max_poll_seconds
+    interval = poll_interval
+    elapsed = 0.0
+    polls = 0
 
-    for i in range(polls):
+    while True:
+        polls += 1
         current_package = await get_current_foreground_package_async(ctx)
 
         if current_package == app_package:
-            logger.success(f"App {app_package} is ready (took ~{i * poll_interval:.1f}s)")
+            logger.success(f"App {app_package} is ready (took ~{elapsed:.2f}s, {polls} polls)")
             return True, None
 
-        if current_package is None:
-            logger.debug(f"Poll {i + 1}/{polls}: App loading (mCurrentFocus=null)...")
-        else:
+        if current_package is not None:
             error_msg = (
                 f"Wrong app in foreground: expected '{app_package}', got '{current_package}'"
             )
             logger.warning(error_msg)
             return False, error_msg
 
-        if i < polls - 1:
-            await asyncio.sleep(poll_interval)
+        logger.debug(f"Poll {polls}: App loading (mCurrentFocus=null)...")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(interval, remaining))
+        elapsed = max_poll_seconds - remaining
+        interval = min(interval * POLL_BACKOFF, POLL_INTERVAL_MAX)
 
     current_package = await get_current_foreground_package_async(ctx)
     error_msg = (
@@ -93,11 +117,11 @@ async def launch_app_with_retries(
             logger.error(error_msg)
             if attempt == max_retries:
                 return False, error_msg
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             continue
 
-        await asyncio.sleep(1)
-
+        # 不要再无脑 sleep(1) 了：_poll_for_app_ready 进去第一件事就是查，
+        # 那一秒纯浪费。App 没起来时轮询自己会退避重试。
         success, error_msg = await _poll_for_app_ready(ctx, app_package, max_poll_seconds)
 
         if success:

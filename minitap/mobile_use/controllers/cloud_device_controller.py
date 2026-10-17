@@ -7,6 +7,7 @@ Supports both Android (via ADB forwarding with SDK-based WebSocket tunnel) and i
 import asyncio
 import re
 import shlex
+from collections.abc import Callable
 
 from adbutils import AdbClient
 from idb.common.types import HIDButtonType
@@ -172,13 +173,15 @@ class CloudAndroidController(MobileDeviceController):
         except Exception as e:
             return f"Cloud Android swipe failed: {str(e)}"
 
-    async def get_screen_data(self) -> ScreenDataResponse:
+    async def get_screen_data(
+        self, on_screenshot: Callable[[str], None] | None = None
+    ) -> ScreenDataResponse:
         """Get screen data using UIAutomator2."""
         if self._ui_client is None:
             raise RuntimeError("UIAutomator client not initialized")
 
         try:
-            ui_data = self._ui_client.get_screen_data()
+            ui_data = self._ui_client.get_screen_data(on_screenshot)
             return ScreenDataResponse(
                 base64=ui_data.base64,
                 elements=ui_data.elements,

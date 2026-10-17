@@ -26,7 +26,7 @@ from minitap.mobile_use.utils.conversations import get_screenshot_message_for_ll
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ocr_view import render_ocr_results
-from minitap.mobile_use.utils.ui_hierarchy_view import render_ui_hierarchy
+from minitap.mobile_use.utils.ui_hierarchy_view import render_hierarchy_and_labels
 
 logger = get_logger(__name__)
 
@@ -92,12 +92,24 @@ class CortexNode:
                 )
             )
 
+        # 树和 OCR 是前后两道筛子，必须共用**同一份渲染结果**：
+        # 树渲染时会把「不可操作又没文字」的外壳丢掉，而 OCR 的去重依据
+        # 只能是实际渲染出去的 label。要是拿原始 dump 的全集去判重，
+        # 一条文字就会因为「原始树里有」被从 OCR 剔掉、同时又因为
+        # 「所在节点被过滤了」不在树里 —— 两边都没有，模型直接看不见它。
+        tree_labels: set[str] = set()
         if self.ctx.perception.ui_hierarchy and state.latest_ui_hierarchy:
             # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，
             # 因为工具要拿它来解析 target。
-            messages.append(HumanMessage(content=render_ui_hierarchy(state.latest_ui_hierarchy)))
+            tree_text, tree_labels = render_hierarchy_and_labels(state.latest_ui_hierarchy)
+            if tree_text:
+                messages.append(HumanMessage(content=tree_text))
         if self.ctx.perception.ocr and state.latest_ocr_results:
-            messages.append(HumanMessage(content=render_ocr_results(state.latest_ocr_results)))
+            ocr_text = render_ocr_results(
+                state.latest_ocr_results, already_rendered=tree_labels
+            )
+            if ocr_text:
+                messages.append(HumanMessage(content=ocr_text))
         if self.ctx.perception.screenshot and state.latest_screenshot:
             controller = create_device_controller(self.ctx)
             compressed_image_base64 = controller.get_compressed_b64_screenshot(

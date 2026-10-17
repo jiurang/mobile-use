@@ -16,7 +16,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.services.ocr import get_ocr_engine
-from minitap.mobile_use.services.ocr.types import OcrText
+from minitap.mobile_use.services.ocr.types import OcrEngine, OcrText
 from minitap.mobile_use.utils.app_launch_utils import launch_app_with_retries
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
@@ -35,7 +35,31 @@ class ContextorNode:
     )
     async def __call__(self, state: State):
         device_controller = create_device_controller(self.ctx)
-        device_data = await device_controller.get_screen_data()
+
+        # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。
+        # dump_hierarchy 真机要 ~1.2s，OCR 只要 ~0.4s，截图一到位就开始，
+        # 整段推理藏进 dump 的等待窗口里，关键路径不增加。
+        ocr_box: list[list[OcrText] | None] = []
+        ocr_done = False
+
+        def _run_ocr_inline(screenshot_base64: str) -> None:
+            nonlocal ocr_done
+            try:
+                ocr_box.append(self._recognize_ocr(screenshot_base64))
+            finally:
+                ocr_done = True
+
+        try:
+            device_data = await device_controller.get_screen_data(on_screenshot=_run_ocr_inline)
+        except TypeError:
+            # 自定义控制器没跟上新签名时不能整轮挂掉，退回原来的串行路径。
+            logger.warning("Controller does not support on_screenshot; using serial path")
+            device_data = await device_controller.get_screen_data()
+
+        if not ocr_done:
+            # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
+            ocr_box.append(await self._run_ocr(device_data.base64))
+
         current_app_package = await get_current_foreground_package_async(self.ctx)
         device_date = get_device_date(self.ctx)
         agent_outcome: str | None = None
@@ -68,7 +92,7 @@ class ContextorNode:
                     "but initial launch was not successful, skipping"
                 )
 
-        ocr_results = await self._run_ocr(device_data.base64)
+        ocr_results = ocr_box[0] if ocr_box else None
 
         return await state.asanitize_update(
             ctx=self.ctx,
@@ -84,28 +108,30 @@ class ContextorNode:
             agent="contextor",
         )
 
-    async def _run_ocr(self, screenshot_base64: str | None) -> list[OcrText] | None:
-        """对刚截的图跑 OCR。
+    def _resolve_ocr_engine(self, screenshot_base64: str | None) -> OcrEngine | None:
+        """OCR 的开关 + 可用性检查。两条执行路径共用。"""
+        if not self.ctx.perception.ocr:
+            return None
+        if not screenshot_base64:
+            logger.warning("No screenshot available; skipping OCR")
+            return None
+        return get_ocr_engine(self.ctx)
+
+    def _recognize_ocr(self, screenshot_base64: str) -> list[OcrText] | None:
+        """**同步**跑 OCR。只能在已经不在事件循环上的线程里调用。
 
         复用 `get_screen_data()` 已经取到的**原分辨率**截图，不再单独截一次 ——
         OCR 的框要精确到能当点击目标用，拿压缩过的图会把框算歪。
 
         失败只降级不中断：OCR 是增强感知，层级树和截图还在。
         """
-        if not self.ctx.perception.ocr:
-            return None
-        if not screenshot_base64:
-            logger.warning("No screenshot available; skipping OCR")
-            return None
-
-        engine = get_ocr_engine(self.ctx)
+        engine = self._resolve_ocr_engine(screenshot_base64)
         if engine is None:
             return None
 
         try:
             started = time.perf_counter()
-            # CPU 推理是同步阻塞的，别卡住事件循环。
-            results = await asyncio.to_thread(engine.recognize, screenshot_base64)
+            results = engine.recognize(screenshot_base64)
             logger.info(
                 f"OCR: {len(results)} texts in "
                 f"{(time.perf_counter() - started) * 1000:.0f}ms "
@@ -115,6 +141,10 @@ class ContextorNode:
         except Exception as e:
             logger.warning(f"OCR failed, continuing without it: {type(e).__name__}: {e}")
             return None
+
+    async def _run_ocr(self, screenshot_base64: str | None) -> list[OcrText] | None:
+        """回调没生效时的兜底路径：显式丢到线程池，免得阻塞事件循环。"""
+        return await asyncio.to_thread(self._recognize_ocr, screenshot_base64 or "")
 
     async def _handle_app_lock_verification(
         self, state: State, current_app_package: str, locked_app_package: str

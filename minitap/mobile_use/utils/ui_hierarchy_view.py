@@ -36,6 +36,36 @@ iOS 与云设备客户端产出的是另一种形状（`label` / `value` / `type
 
 实测效果（Redmi 真机，4 屏，每屏 77~135 节点）：
 14,042~24,334 tokens → 1,173~2,047 tokens，即降低 91%~94%。
+
+还剩的最大一块 fat：resource-id（2026-10-17 实测）
+----------------------------------------------
+抖音搜索页（1220x2712，290 原始节点 → 渲染 116 行 / 3,372 tok）逐字段拆解：
+    id=  1,531 tok (45.4%)   出现在 113/116 行
+    box  1,293 tok (38.3%)   出现在 116/116 行
+    索引  464 tok (13.8%)
+    label 318 tok ( 9.4%)   只在 42/116 行
+    flags  84 tok ( 2.5%)
+
+`id=` 一项就占了整棵树 45%、Cortex 整个 prefill 的 18.7%。而它里面
+**约 77% 是每行重复的包名前缀**（`com.ss.android.ugc.aweme.lite:` ≈ 10 token × 113 行）。
+
+**为什么不能直接把前缀提到 header、每行只留 `id=search_input`**：
+模型会把看到的字符串原样抄进 `tap` 的 `resource_id`，而
+`AndroidController.find_element` 是 `element.get("resource-id") == resource_id`
+精确等值匹配 —— 抄短了所有基于 id 的定位全部失配。这是下面
+不变量 #2 要守住的原因，实测也确实守住了。
+
+**同样不能靠「丢掉只有 id 的节点」来省**（试过，行不通）：
+抖音那一屏有 57/116 行是「只有 id 和坐标、没有文字、也没有 C/L/F」的节点，
+按「可操作 or 有文字」过滤能省 43%，但 `tests/test_ui_hierarchy_view.py`
+里 `test_keeps_full_resource_id_verbatim` 和 `test_every_actionable_node_survives`
+明确要求这种节点必须保留 —— 因为 `input tap` 打任何坐标都有效，
+id 名字（`id/send`、`id/search_input`）本身就是「这是个可点的东西」的线索。
+要让这条路走得通，必须**同时**改 `find_element` 让它容忍尾段匹配，
+属于工具契约变更，不能顺手做。
+
+要动这一块，唯一正确的顺序是：先改 `find_element` 支持尾段匹配 + 补测试，
+再改这里的渲染。顺序反过来就是静默地弄坏所有 id 定位。
 """
 
 from __future__ import annotations
@@ -128,6 +158,16 @@ def _box_of(element: dict) -> tuple[float, float, float, float] | None:
         return None
     match = _BOUNDS_RE.match(raw.strip())
     return tuple(map(float, match.groups())) if match else None  # type: ignore[return-value]
+
+
+def _normalize_label(text: str) -> str:
+    """label 归一化：去空白 + 小写。
+
+    OCR 引擎和 uiautomator 对同一段可见文字的切分、空格、大小写经常不一致
+    （"Search" vs " search "）。要判断「OCR 这条是不是树里已经有了」，
+    必须先归一化，否则同一句话会两边都出现，白白多花 token。
+    """
+    return re.sub(r"\s+", "", text).strip().lower()
 
 
 def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
@@ -268,24 +308,49 @@ def _looks_android(elements: list[dict]) -> bool:
     return any(signature & element.keys() for element in elements if isinstance(element, dict))
 
 
-def render_ui_hierarchy(elements: list[dict] | None) -> str:
-    """把 Android 的 `elements` 渲染成 Cortex 读取的紧凑裁剪块。
+def render_hierarchy_and_labels(elements: list[dict] | None) -> tuple[str, set[str]]:
+    """渲染层级树，**同时**返回真正进入 prompt 的那些 label。
 
-    只有在元素形状不是本渲染器认识的 Android 形状时，才退回原来的 JSON dump，
-    这样那些平台保持现有行为，而不是被悄悄剥夺感知能力。
+    为什么要把 label 一起返回：`utils/ocr_view.py` 会用它做去重，把
+    「层级树里已经有的文字」从 OCR 块里剔掉。两个裁剪必须看到**同一棵**
+    渲染结果，否则会出事——
+
+        某条文字在树里有，但所在节点被判成不可操作而过滤掉了，
+        于是它既不在树的渲染里、又被当成「树里已有」从 OCR 里剔掉，
+        模型就彻底看不到这条文字了：树里没有，OCR 里也没有。
+
+    所以去重的依据只能是「实际渲染出去的 label」，不是原始 dump 的全集。
+
+    返回值第二项是归一化（小写去空白）后的 label 集合，直接给 OCR 去重用。
     """
     if not elements:
-        return ""
+        return "", set()
 
     if not _looks_android(elements):
         logger.warning(
             "UI hierarchy has no Android accessibility attributes; "
             "falling back to the raw JSON dump"
         )
-        return "Here is the UI hierarchy:\n" + json.dumps(elements, indent=2, ensure_ascii=False)
+        return "Here is the UI hierarchy:\n" + json.dumps(elements, indent=2, ensure_ascii=False), set()
 
     nodes = [node for node in (_normalize(e) for e in elements) if node is not None]
-    pruned = _prune(nodes)
+    kept = _prune(nodes)
 
-    logger.debug(f"UI hierarchy: {len(elements)} raw nodes -> {len(pruned)} rendered")
-    return f"{_HEADER}\n{_render(pruned)}" if pruned else _HEADER + "\n(none)"
+    labels = {_normalize_label(node.label) for node in kept if node.label}
+    labels.discard("")
+
+    logger.debug(
+        f"UI hierarchy: {len(elements)} raw nodes -> {len(nodes)} normalized "
+        f"-> {len(kept)} rendered (of which {len(labels)} distinct labels)"
+    )
+    text = f"{_HEADER}\n{_render(kept)}" if kept else _HEADER + "\n(none)"
+    return text, labels
+
+
+def render_ui_hierarchy(elements: list[dict] | None) -> str:
+    """把 Android 的 `elements` 渲染成 Cortex 读取的紧凑裁剪块。
+
+    只有在元素形状不是本渲染器认识的 Android 形状时，才退回原来的 JSON dump，
+    这样那些平台保持现有行为，而不是被悄悄剥夺感知能力。
+    """
+    return render_hierarchy_and_labels(elements)[0]

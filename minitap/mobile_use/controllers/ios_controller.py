@@ -5,6 +5,7 @@ import base64
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from idb.common.types import HIDButtonType
@@ -83,7 +84,9 @@ class iOSDeviceController(MobileDeviceController):
         except Exception as e:
             return f"IDB swipe failed: {str(e)}"
 
-    async def get_screen_data(self) -> ScreenDataResponse:
+    async def get_screen_data(
+        self, on_screenshot: Callable[[str], None] | None = None
+    ) -> ScreenDataResponse:
         """Get screen data (screenshot and hierarchy in parallel)."""
         try:
             # Run screenshot and hierarchy fetch in parallel
@@ -100,6 +103,12 @@ class iOSDeviceController(MobileDeviceController):
             )
 
             base64_screenshot = base64.b64encode(screenshot_bytes).decode("utf-8")
+
+            # 这里只能「事后」回调：iOS 的截图和层级树是一次 gather 拿回来的，
+            # 没有 Android 那种「dump 还在跑」的窗口可钻。所以 OCR 只是提前
+            # 起了个头，并不真的和采集重叠 —— 调用方要按「回调可能很晚」设计。
+            if on_screenshot is not None:
+                await asyncio.to_thread(on_screenshot, base64_screenshot)
 
             return ScreenDataResponse(
                 base64=base64_screenshot,

@@ -8,8 +8,10 @@ Handles Maestro blocker detection and removal before connecting.
 import base64
 import subprocess
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import uiautomator2 as u2
 from PIL.Image import Image
@@ -269,7 +271,12 @@ class UIAutomatorClient:
             PIL Image or None if capture failed
         """
         device = self._ensure_connected()
-        return device.screenshot()
+        raw = device.screenshot()
+        # uiautomator2 的类型是 `MatLike | Image | None`：只有显式指定
+        # format='pillow' 之外的取值才会回 numpy 数组。返回 ndarray 的话
+        # 后面 `_pil_to_base64` 会炸在一句莫名其妙的 AttributeError 上，
+        # 这里当场拒掉，错误信息才说人话。
+        return raw if isinstance(raw, Image) else None
 
     def get_screenshot_base64(self) -> str | None:
         """
@@ -283,28 +290,55 @@ class UIAutomatorClient:
             return None
         return _pil_to_base64(screenshot)
 
-    def get_screen_data(self) -> UIAutomatorScreenData:
+    def get_screen_data(
+        self, on_screenshot: Callable[[str], Any] | None = None
+    ) -> UIAutomatorScreenData:
         """
         Get complete screen data including screenshot and hierarchy.
 
-        Returns:
-            UIAutomatorScreenData with screenshot, hierarchy, elements, and dimensions
+        Args:
+            on_screenshot: 可选回调。截图一拿到就立刻在**采集线程里**同步调用，
+                典型用途是把 OCR 推理塞进 `dump_hierarchy` 的等待窗口里。
+                见下面的并发说明。
+
+        并发说明（2026-10-17 真机实测，Redmi Turbo 4）
+        -------------------------------------------------
+        串行时这一段是 145 + 1188 + 2 = 1335ms，其中 `dump_hierarchy` 独占 89%。
+        截图和 dump 是两个互相独立的 HTTP 请求，发给设备上 u2 agent 的不同端点，
+        实测可以真并发：5 轮零失败，重叠量恰好等于截图耗时（145ms）——
+        也就是截图被完全藏进了 dump 的窗口，分毫不占关键路径。
+
+        OCR 只能吃截图，所以在「截图完成那一刻」就跑，正好落进 dump 剩下的
+        1100ms 里。关键路径从 145+1188+2+432=1767ms 压到 1190ms。
+
+        iOS 那边早就是 `asyncio.gather` 并行了（controllers/ios_controller.py），
+        Android 这里是唯一的例外。
         """
         device = self._ensure_connected()
 
-        # Get screenshot
-        screenshot = device.screenshot()
-        if screenshot is None:
-            raise RuntimeError("Failed to capture screenshot via UIAutomator2")
+        # dump 丢进线程池，本线程同时取截图 —— 两个独立的 u2 端点，真并发。
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            dump_future = pool.submit(device.dump_hierarchy, compressed=True)
 
-        # Get hierarchy
-        hierarchy_xml = device.dump_hierarchy(compressed=True)
+            screenshot = device.screenshot()
+            if not isinstance(screenshot, Image):
+                raise RuntimeError(
+                    f"Failed to capture screenshot via UIAutomator2 (got {type(screenshot).__name__})"
+                )
+
+            screenshot_b64 = _pil_to_base64(screenshot)
+
+            # OCR 就在这里跑。dump 还在池子里跑着，两者互不等待。
+            if on_screenshot is not None:
+                on_screenshot(screenshot_b64)
+
+            hierarchy_xml = dump_future.result()
 
         # Parse XML to flat elements list
         elements = _parse_hierarchy_xml_to_elements(hierarchy_xml)
 
         return UIAutomatorScreenData(
-            base64=_pil_to_base64(screenshot),
+            base64=screenshot_b64,
             hierarchy_xml=hierarchy_xml,
             elements=elements,
             width=screenshot.width,
