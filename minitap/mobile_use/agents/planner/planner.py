@@ -1,3 +1,4 @@
+from functools import cache
 from pathlib import Path
 
 from jinja2 import Template
@@ -21,6 +22,84 @@ from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+MAX_AGENTS_THOUGHTS = 25
+
+_STATUS_LABELS = {
+    SubgoalStatus.NOT_STARTED: "TODO",
+    SubgoalStatus.PENDING: "IN PROGRESS",
+    SubgoalStatus.SUCCESS: "DONE",
+    SubgoalStatus.FAILURE: "FAILED",
+}
+
+
+@cache
+def _load_template(filename: str) -> Template:
+    return Template(Path(__file__).parent.joinpath(filename).read_text(encoding="utf-8"))
+
+
+def _format_plan(subgoals: list[Subgoal]) -> str:
+    """Render the previous plan for the prompt. IDs are omitted on purpose:
+    they are regenerated on every plan and would only be noise for the LLM."""
+    if not subgoals:
+        return "(no previous plan)"
+    lines = []
+    for subgoal in subgoals:
+        line = f"- [{_STATUS_LABELS[subgoal.status]}] {subgoal.description}"
+        if subgoal.completion_reason:
+            line += f" (reason: {subgoal.completion_reason})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _build_subgoals(output: PlannerOutput) -> list[Subgoal]:
+    """Validate and normalize the LLM output into fresh subgoals."""
+    descriptions: list[str] = []
+    seen: set[str] = set()
+    for raw in output.subgoals:
+        description = (raw.description or "").strip()
+        if not description or description.lower() in seen:
+            continue
+        seen.add(description.lower())
+        descriptions.append(description)
+
+    if not descriptions:
+        raise ValueError("Planner returned an empty plan")
+
+    used_ids: set[str] = set()
+    subgoals: list[Subgoal] = []
+    for description in descriptions:
+        subgoal_id = generate_id()
+        while subgoal_id in used_ids:
+            subgoal_id = generate_id()
+        used_ids.add(subgoal_id)
+        subgoals.append(
+            Subgoal(
+                id=subgoal_id,
+                description=description,
+                status=SubgoalStatus.NOT_STARTED,
+            )
+        )
+    return subgoals
+
+
+async def _invoke_planner(
+    llm,
+    messages: list[SystemMessage | HumanMessage],
+    ctx: MobileUseContext,
+    used_fallback: bool = False,
+) -> list[Subgoal]:
+    """Call the LLM and validate its output so that an invalid plan from the
+    main model can be retried with the fallback model."""
+    response = await invoke_llm_with_timeout_message(
+        llm.ainvoke(messages),
+        agent_name="planner",
+        task_id=ctx.trace_id,
+        used_fallback=used_fallback,
+    )
+    if response is None:
+        raise ValueError("Planner LLM returned no response")
+    return _build_subgoals(response)
+
 
 class PlannerNode:
     def __init__(self, ctx: MobileUseContext):
@@ -43,22 +122,18 @@ class PlannerNode:
         if self.ctx.video_recording_enabled:
             executor_wrappers.extend(VIDEO_RECORDING_WRAPPERS)
 
-        system_message = Template(
-            Path(__file__).parent.joinpath("planner.md").read_text(encoding="utf-8")
-        ).render(
+        system_message = _load_template("planner.md").render(
             platform=self.ctx.device.mobile_platform.value,
             executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_wrappers),
             locked_app_package=current_locked_app_package,
             current_foreground_app=current_foreground_app,
             video_recording_enabled=self.ctx.video_recording_enabled,
         )
-        human_message = Template(
-            Path(__file__).parent.joinpath("human.md").read_text(encoding="utf-8")
-        ).render(
+        human_message = _load_template("human.md").render(
             action="replan" if needs_replan else "plan",
             initial_goal=state.initial_goal,
-            previous_plan="\n".join(str(s) for s in state.subgoal_plan),
-            agent_thoughts="\n".join(state.agents_thoughts),
+            previous_plan=_format_plan(state.subgoal_plan),
+            agent_thoughts="\n".join(state.agents_thoughts[-MAX_AGENTS_THOUGHTS:]),
         )
         messages = [
             SystemMessage(content=system_message),
@@ -69,28 +144,20 @@ class PlannerNode:
         llm_fallback = get_llm(
             ctx=self.ctx, name="planner", use_fallback=True
         ).with_structured_output(PlannerOutput)
-        response: PlannerOutput = await with_fallback(
-            main_call=lambda: invoke_llm_with_timeout_message(
-                llm.ainvoke(messages),
-                agent_name="planner",
-                task_id=self.ctx.trace_id,
+        new_subgoals = await with_fallback(
+            main_call=lambda: _invoke_planner(llm, messages, self.ctx),
+            fallback_call=lambda: _invoke_planner(
+                llm_fallback, messages, self.ctx, used_fallback=True
             ),
-            fallback_call=lambda: invoke_llm_with_timeout_message(
-                llm_fallback.ainvoke(messages),
-                agent_name="planner",
-                task_id=self.ctx.trace_id,
-                used_fallback=True,
-            ),
-        )  # type: ignore
-        subgoals_plan = [
-            Subgoal(
-                id=generate_id(),
-                description=subgoal.description,
-                status=SubgoalStatus.NOT_STARTED,
-                completion_reason=None,
-            )
-            for subgoal in response.subgoals
+        )
+        # On replan, the LLM only returns the remaining steps: already completed
+        # subgoals are kept as-is so they are never executed a second time.
+        completed_subgoals = [
+            subgoal for subgoal in state.subgoal_plan if subgoal.status == SubgoalStatus.SUCCESS
         ]
+        if completed_subgoals:
+            logger.info(f"♻️ Keeping {len(completed_subgoals)} completed subgoal(s) as-is")
+        subgoals_plan = completed_subgoals + new_subgoals
         logger.info("📜 Generated plan:")
         logger.info("\n".join(str(s) for s in subgoals_plan))
 

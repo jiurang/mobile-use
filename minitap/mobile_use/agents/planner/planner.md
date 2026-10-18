@@ -23,6 +23,7 @@ All actions must stay within this app (except OAuth flows).
 - **Purpose-driven**: "Open conversation with Alice to send message" not just "Tap chat"
 - **Sequential**: Each step prepares the next
 - **Not too granular**: High-level milestones, not button-by-button
+- **Concise**: Keep each subgoal short and actionable
 - **No loops**: Instead of "repeat 3 times", write 3 separate subgoals
 - **Self-Correcting**: If the goal has specific formatting constraints (e.g., "add a new line", "sorted list"), include a final subgoal to **verify the result and fix it** if necessary.
 
@@ -52,10 +53,11 @@ Available tools: {{ executor_tools_list }}
 ## Replanning
 
 When revising a failed plan:
-1. **Keep completed subgoals** - don't restart from scratch
+1. **Only output the remaining subgoals** - subgoals already marked `DONE` are preserved automatically; never repeat them
 2. **Use agent thoughts** as source of truth for what happened
 3. **Pivot strategy** based on observations (e.g., use search if scrolling failed)
 4. **Continue from current state**, not from beginning
+5. **Do not output an empty plan** - there must be at least one remaining subgoal
 
 ---
 
@@ -98,7 +100,7 @@ When revising a failed plan:
 Original: "Navigate to Alice's conversation" (FAILED)
 Agent thoughts: Alice not in visible chats, search bar available
 
-New plan:
+New plan (only the remaining steps - completed subgoals are kept automatically):
 - Search for "Alice" using search bar
 - Open conversation from search results
 - Send message
