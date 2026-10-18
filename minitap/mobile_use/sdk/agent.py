@@ -15,7 +15,6 @@ import httpx
 from adbutils import AdbClient
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
-from limrun_api import AsyncLimrun
 from PIL import Image
 from pydantic import BaseModel
 
@@ -161,15 +160,22 @@ class Agent:
         if self._config.cloud_device_config:
             return await self._init_cloud_device()
 
-        if not which("adb") and not which("xcrun"):
-            raise ExecutableNotFoundError("cli_tools")
-
         if self._initialized:
             logger.warning("Agent is already initialized. Skipping...")
             return True
 
-        # Get first available device ID
         if not self._config.device_id or not self._config.device_platform:
+            # Only this branch needs an adb executable, and only to run
+            # `adb devices` while picking a device. When the caller pinned one —
+            # what runner-host does via builder.for_device() — the adbutils client
+            # talks to the server directly and no executable is involved. That is
+            # the APK case, where adb.exe cannot exist by construction but the
+            # device is fully reachable over `adb reverse`. Checking PATH first
+            # refused a configuration that works.
+            if not which("adb") and not which("xcrun"):
+                raise ExecutableNotFoundError("cli_tools")
+
+            # Get first available device ID
             device_id, platform, ios_device_type = get_first_device(logger=logger)
         else:
             device_id, platform = self._config.device_id, self._config.device_platform
@@ -408,6 +414,11 @@ class Agent:
             md5_hash = md5.hexdigest()
 
             logger.info(f"Created zip archive: {zip_path.name}, MD5: {md5_hash}")
+
+            # limrun_api is the cloud asset-upload client, only needed when a run
+            # actually uploads something. It is not in the APK, and this module is
+            # the SDK entry point, so it must not be a module-scope import.
+            from limrun_api import AsyncLimrun
 
             client = AsyncLimrun(api_key=api_key_value, base_url=f"{base_url}/limrun")
             try:

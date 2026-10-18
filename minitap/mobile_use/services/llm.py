@@ -9,7 +9,6 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
-from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, ValidationError
 
@@ -33,6 +32,15 @@ if TYPE_CHECKING:
     # support, so only the Gemini/Vertex providers pay for it.
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_google_vertexai import ChatVertexAI
+
+    # Same reasoning, same trap: `langchain_azure_ai` is a heavy provider tree
+    # that only the Azure provider needs, but importing it at module scope makes
+    # every other provider — and every host that merely wants to read
+    # MiniMaxChatOpenAI — fail when it is absent. An on-device APK is exactly
+    # that case. NOTE this file has no `from __future__ import annotations`, so
+    # the return annotation below must stay quoted; a bare name here evaluates at
+    # `def` time and raises NameError on import, taking the whole SDK with it.
+    from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 
 # Logger for internal messages (ex: fallback)
 llm_logger = logging.getLogger(__name__)
@@ -264,7 +272,10 @@ def get_grok_llm(model_name: str, temperature: float = 1) -> ChatOpenAI:
     return client
 
 
-def get_azure_llm(model_name: str, temperature: float = 1) -> AzureAIOpenAIApiChatModel:
+def get_azure_llm(model_name: str, temperature: float = 1) -> "AzureAIOpenAIApiChatModel":
+    # Local import on purpose: only the Azure provider should pay for this tree.
+    from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
+
     assert settings.AZURE_BASE_URL is not None
 
     api_key: str | None = None

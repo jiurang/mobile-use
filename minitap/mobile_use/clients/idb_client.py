@@ -1,16 +1,39 @@
+"""Facebook iOS idb client wrapper.
+
+``idb`` (fb-idb) is imported lazily for the same reason as Appium in
+``browserstack_client``: :mod:`minitap.mobile_use.context` reaches this module
+on every platform through the ``IosClientWrapper`` union, so an Android
+deployment used to die at ``import minitap.mobile_use.sdk`` with
+``ModuleNotFoundError: No module named 'idb'``.
+
+``from __future__ import annotations`` is required because ``self._client:
+Client | None`` is an annotation inside ``__init__`` and ``def client(self) ->
+Client`` is a return annotation; Python evaluates both at definition time
+without it.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import socket
 import subprocess
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from idb.common.types import HIDButtonType, InstalledAppInfo, InstalledArtifact, TCPAddress
-from idb.grpc.client import Client
 from pydantic import BaseModel
 
 from minitap.mobile_use.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from idb.common.types import (
+        HIDButtonType,
+        InstalledAppInfo,
+        InstalledArtifact,
+        TCPAddress,
+    )
+    from idb.grpc.client import Client
 
 
 class IOSAppInfo(BaseModel):
@@ -93,6 +116,8 @@ class IdbClientWrapper:
     """
 
     def __init__(self, udid: str, host: str | None = None, port: int | None = None):
+        from idb.common.types import TCPAddress
+
         self.udid = udid
         self._manage_companion = host is None
 

@@ -1,12 +1,29 @@
+"""WebDriverAgent (facebook-wda) client wrapper.
+
+``wda`` is imported lazily for the same reason as ``idb`` in
+:mod:`minitap.mobile_use.clients.idb_client` and Appium in
+:mod:`minitap.mobile_use.clients.browserstack_client`: the ``IosClientWrapper``
+union in :mod:`minitap.mobile_use.clients.ios_client` is reachable from
+``minitap.mobile_use.context`` on every platform, so an Android deployment used
+to fail to import the SDK at all.
+
+``from __future__ import annotations`` is required because ``self._client:
+wda.Client | None`` and ``def _ensure_session(self) -> wda.Session`` are
+annotations evaluated at definition time without it.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import os
 import signal
 import subprocess
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import wda
-from wda.exceptions import WDAError, WDARequestError
+if TYPE_CHECKING:
+    import wda
+    from wda.exceptions import WDAError, WDARequestError
 
 from minitap.mobile_use.clients.idb_client import IOSAppInfo
 from minitap.mobile_use.clients.ios_client_config import WdaClientConfig
@@ -36,6 +53,8 @@ def with_wda_client(func):
 
     @wraps(func)
     async def wrapper(self, *args, **kwargs):
+        from wda.exceptions import WDAError, WDARequestError
+
         method_name = func.__name__
         try:
             logger.debug(f"Executing WDA operation: {method_name}...")
@@ -196,6 +215,8 @@ class WdaClientWrapper:
                     return False
 
             # Step 3: Connect to WDA
+            import wda
+
             logger.info(f"Connecting to WebDriverAgent at {self.wda_url}")
             self._client = await asyncio.to_thread(wda.Client, self.wda_url)
 

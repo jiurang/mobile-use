@@ -1,12 +1,31 @@
+"""BrowserStack (Appium) iOS client.
+
+Appium and Selenium are imported lazily, not at module scope. This module is
+reached from :mod:`minitap.mobile_use.context` on *every* platform, because the
+context carries an optional ``ios_client`` slot, and ``ios_client`` names this
+wrapper in its ``IosClientWrapper`` union. An Android deployment therefore used
+to fail at ``import minitap.mobile_use.sdk`` with
+``ModuleNotFoundError: No module named 'appium'`` — a cloud iOS transport
+breaking the agent on a phone that will never talk to BrowserStack.
+
+The imports live in ``TYPE_CHECKING`` (for annotations) plus local imports inside
+the three methods that actually drive a browser. ``from __future__ import
+annotations`` is required: ``self._driver: WebDriver | None`` is an annotation
+inside ``__init__``, which Python evaluates at call time without it.
+"""
+
+from __future__ import annotations
+
 import asyncio
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from appium.options.common.base import AppiumOptions
-from appium.webdriver.webdriver import WebDriver
-from selenium.webdriver.common.actions import interaction
-from selenium.webdriver.common.actions.action_builder import ActionBuilder
-from selenium.webdriver.common.actions.pointer_input import PointerInput
+if TYPE_CHECKING:
+    from appium.options.common.base import AppiumOptions
+    from appium.webdriver.webdriver import WebDriver
+    from selenium.webdriver.common.actions import interaction
+    from selenium.webdriver.common.actions.action_builder import ActionBuilder
+    from selenium.webdriver.common.actions.pointer_input import PointerInput
 
 from minitap.mobile_use.clients.idb_client import IOSAppInfo
 from minitap.mobile_use.clients.ios_client_config import BrowserStackClientConfig
@@ -96,6 +115,9 @@ class BrowserStackClientWrapper:
             True if session created successfully, False otherwise
         """
         try:
+            from appium.options.common.base import AppiumOptions
+            from appium.webdriver.webdriver import WebDriver
+
             logger.info(
                 f"Creating BrowserStack session for {self.config.device_name} "
                 f"(iOS {self.config.platform_version})"
@@ -199,6 +221,10 @@ class BrowserStackClientWrapper:
         driver = self._ensure_driver()
 
         def perform_tap():
+            from selenium.webdriver.common.actions import interaction
+            from selenium.webdriver.common.actions.action_builder import ActionBuilder
+            from selenium.webdriver.common.actions.pointer_input import PointerInput
+
             finger = PointerInput(interaction.POINTER_TOUCH, "finger")
             actions = ActionBuilder(driver, mouse=finger)
             actions.pointer_action.move_to_location(x, y)
@@ -237,6 +263,10 @@ class BrowserStackClientWrapper:
         swipe_duration = duration or 0.5
 
         def perform_swipe():
+            from selenium.webdriver.common.actions import interaction
+            from selenium.webdriver.common.actions.action_builder import ActionBuilder
+            from selenium.webdriver.common.actions.pointer_input import PointerInput
+
             finger = PointerInput(interaction.POINTER_TOUCH, "finger")
             actions = ActionBuilder(driver, mouse=finger)
             actions.pointer_action.move_to_location(x_start, y_start)

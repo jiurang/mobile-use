@@ -1,5 +1,7 @@
 """iOS-specific device controller implementation using IDB or WDA."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import re
@@ -7,8 +9,6 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
-
-from idb.common.types import HIDButtonType
 
 from minitap.mobile_use.clients.idb_client import IdbClientWrapper, IOSAppInfo
 from minitap.mobile_use.clients.ios_client import IosClientWrapper
@@ -181,6 +181,8 @@ class iOSDeviceController(MobileDeviceController):
 
     async def press_home(self) -> bool:
         """Press the home button."""
+        from idb.common.types import HIDButtonType
+
         try:
             if self._is_idb:
                 return await self.ios_client.button(button_type=HIDButtonType.HOME)  # type: ignore[call-arg, union-attr]

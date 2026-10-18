@@ -4,12 +4,19 @@ import json
 import platform
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import uuid_utils
-from posthog import Posthog
 
 from minitap.mobile_use.config import settings
 from minitap.mobile_use.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    # posthog is only needed when telemetry is actually enabled, which the APK
+    # (MOBILE_USE_TELEMETRY_ENABLED=false) never is. It sits on the import path
+    # of services.llm, so a top-level import made every Android deployment
+    # depend on it.
+    from posthog import Posthog
 
 logger = get_logger(__name__)
 
@@ -110,7 +117,7 @@ class TelemetryService:
     def __init__(self):
         self._config = TelemetryConfig()
         self._initialized = False
-        self._client: Posthog | None = None
+        self._client: "Posthog | None" = None
         self._session_id: str | None = None
         self._session_context: dict = {}
 
@@ -143,6 +150,8 @@ class TelemetryService:
             return
 
         try:
+            from posthog import Posthog
+
             self._client = Posthog(
                 project_api_key=POSTHOG_API_KEY,
                 host=POSTHOG_HOST,

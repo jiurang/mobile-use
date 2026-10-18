@@ -4,13 +4,15 @@ Cloud device controller implementation.
 Supports both Android (via ADB forwarding with SDK-based WebSocket tunnel) and iOS (via WebSocket).
 """
 
+from __future__ import annotations
+
 import asyncio
 import re
 import shlex
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from adbutils import AdbClient
-from idb.common.types import HIDButtonType
 
 from minitap.mobile_use.clients.adb_tunnel import AdbTunnel
 from minitap.mobile_use.clients.idb_client import IOSAppInfo
@@ -24,6 +26,11 @@ from minitap.mobile_use.controllers.types import Bounds, CoordinatesSelectorRequ
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.video import DEFAULT_MAX_DURATION_SECONDS, VideoRecordingResult
+
+if TYPE_CHECKING:
+    # idb is iOS-only; CloudAndroidController in the same file needs none of it,
+    # and this module is reachable from the Android path via ios_client.
+    from idb.common.types import HIDButtonType
 
 logger = get_logger(__name__)
 
@@ -557,6 +564,8 @@ class CloudIosController:
 
     async def button(self, button_type: HIDButtonType) -> bool:
         """Press a hardware button."""
+        from idb.common.types import HIDButtonType
+
         try:
             if button_type == HIDButtonType.HOME:
                 await self.client.press_key("home")
