@@ -22,6 +22,16 @@ class Target(BaseModel):
     bounds: ElementBounds | None = Field(
         None, description="The x, y, width, and height of the element."
     )
+    ocr_index: int | None = Field(
+        None,
+        description=(
+            "The 1-based [i] of a line in the 'Text on screen (OCR)' block, used verbatim. "
+            "Resolves to that line's bounds, so it works for text the accessibility tree "
+            "cannot see (video captions, canvas/surface content, custom-drawn UI). "
+            "Do NOT confuse it with text_index/resource_id_index: those are 0-based and "
+            "index the accessibility tree, not the OCR block."
+        ),
+    )
 
     @model_validator(mode="after")
     def _default_indices(self):

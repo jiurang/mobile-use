@@ -27,7 +27,6 @@ thoughts 用的是**估算**：仓库里没有留存的历史 state，真跑一�
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -105,11 +104,15 @@ def main() -> int:
     tree_render, tree_labels = render_hierarchy_and_labels(elements)
     tree_tokens = ntok(tree_render)
 
-    # 去重前（历史行为）和去重后（当前行为）各算一次，好直接对比
-    ocr_render_before = render_ocr_results(ocr_results)
-    ocr_render = render_ocr_results(ocr_results, already_rendered=tree_labels) if ocr_results else ""
+    # OCR 不再去重：整块照渲染，[i] 就是 Target.ocr_index 的取值。
+    # tree_labels 保留只为报告「有多少条其实元素表里已经有了」。
+    ocr_render = render_ocr_results(ocr_results) if ocr_results else ""
     ocr_tokens = ntok(ocr_render) if ocr_render else 0
-    ocr_tokens_before = ntok(ocr_render_before) if ocr_render_before else 0
+    redundant = 0
+    if ocr_results and tree_labels:
+        from minitap.mobile_use.utils.ui_hierarchy_view import _normalize_label
+
+        redundant = sum(1 for t in ocr_results if _normalize_label(t.text) in tree_labels)
 
     compressed = compress_screenshot_base64(screenshot_b64)
     scaled_w, scaled_h = 640, min(1536, int(640 * height / width))
@@ -143,10 +146,10 @@ def main() -> int:
     print(f"      其中截图占比            {img_tokens / grand_total * 100:5.1f}%")
     print(f"      其中层级树占比          {tree_tokens / grand_total * 100:5.1f}%")
 
-    print(f"\n=== OCR 去重效果 ===")
-    print(f"  去重前 {ocr_tokens_before:5d} tok ({len(ocr_results or [])} 条)")
-    print(f"  去重后 {ocr_tokens:5d} tok")
-    print(f"  节省   {ocr_tokens_before - ocr_tokens:5d} tok")
+    print("\n=== OCR 块 ===")
+    print(f"  整块渲染 {ocr_tokens:5d} tok ({len(ocr_results or [])} 条，全量不去重)")
+    print(f"  其中 {redundant} 条文字在层级树里也出现过 —— 按旧逻辑会被剔掉，")
+    print("  现在保留，因为 [i] 是 Target.ocr_index 的取值，跳号会让索引对不上。")
 
     print("\n=== C. 压缩后的截图 ===")
     print(f"  原图 {width}x{height} -> 压缩 {scaled_w}x{scaled_h}")

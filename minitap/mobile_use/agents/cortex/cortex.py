@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from jinja2 import Template
@@ -34,6 +35,33 @@ logger = get_logger(__name__)
 # 取值与 contextor.MAX_AGENTS_THOUGHTS 保持一致。
 MAX_CORTEX_AGENTS_THOUGHTS = 25
 
+CORTEX_PROMPT_ENV = "MOBILE_USE_CORTEX_PROMPT"
+
+
+def load_cortex_prompt() -> str:
+    """读 cortex 的 system prompt 模板。
+
+    MOBILE_USE_CORTEX_PROMPT 可以指向另一个 .md（例如同目录的 cortex.zh.md），
+    用来做中/英文提示词的 A/B 实测 —— 同一份 context 分别渲染两种语言，
+    再各自真跑一遍，比较 token 与成功率。
+
+    不设这个变量时读的还是同目录的 cortex.md，行为与从前逐字节一致，
+    所以对生产是 no-op。路径不可读时只 warning 并回落到默认模板：
+    指针写错不该让整条任务挂掉，降级 + 上报即可。
+    """
+    override = os.getenv(CORTEX_PROMPT_ENV)
+    if override:
+        path = Path(override).expanduser()
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+            logger.warning(
+                f"[cortex] {CORTEX_PROMPT_ENV}={override!r} 不是可读文件，回落到默认 cortex.md"
+            )
+        except OSError as e:
+            logger.warning(f"[cortex] 读取 {CORTEX_PROMPT_ENV}={override!r} 失败（{e}），回落到 cortex.md")
+    return Path(__file__).parent.joinpath("cortex.md").read_text(encoding="utf-8")
+
 
 class CortexNode:
     def __init__(self, ctx: MobileUseContext):
@@ -55,9 +83,7 @@ class CortexNode:
         if self.ctx.video_recording_enabled:
             executor_wrappers.extend(VIDEO_RECORDING_WRAPPERS)
 
-        system_message = Template(
-            Path(__file__).parent.joinpath("cortex.md").read_text(encoding="utf-8")
-        ).render(
+        system_message = Template(load_cortex_prompt()).render(
             platform=self.ctx.device.mobile_platform.value,
             initial_goal=state.initial_goal,
             subgoal_plan=state.subgoal_plan,
@@ -92,22 +118,16 @@ class CortexNode:
                 )
             )
 
-        # 树和 OCR 是前后两道筛子，必须共用**同一份渲染结果**：
-        # 树渲染时会把「不可操作又没文字」的外壳丢掉，而 OCR 的去重依据
-        # 只能是实际渲染出去的 label。要是拿原始 dump 的全集去判重，
-        # 一条文字就会因为「原始树里有」被从 OCR 剔掉、同时又因为
-        # 「所在节点被过滤了」不在树里 —— 两边都没有，模型直接看不见它。
-        tree_labels: set[str] = set()
         if self.ctx.perception.ui_hierarchy and state.latest_ui_hierarchy:
             # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，
             # 因为工具要拿它来解析 target。
-            tree_text, tree_labels = render_hierarchy_and_labels(state.latest_ui_hierarchy)
+            tree_text, _ = render_hierarchy_and_labels(state.latest_ui_hierarchy)
             if tree_text:
                 messages.append(HumanMessage(content=tree_text))
         if self.ctx.perception.ocr and state.latest_ocr_results:
-            ocr_text = render_ocr_results(
-                state.latest_ocr_results, already_rendered=tree_labels
-            )
+            # 不去重：OCR 行的 [i] 是 Target.ocr_index 的取值，
+            # 剔掉任何一条都会让模型手里的行号和 results 的下标对不上。
+            ocr_text = render_ocr_results(state.latest_ocr_results)
             if ocr_text:
                 messages.append(HumanMessage(content=ocr_text))
         if self.ctx.perception.screenshot and state.latest_screenshot:
@@ -167,7 +187,14 @@ class CortexNode:
                 "structured_decisions": response.decisions,
                 "complete_subgoals_by_ids": response.complete_subgoals_by_ids,
                 "latest_ui_hierarchy": None,
-                "latest_ocr_results": None,
+                # latest_ocr_results 故意不清空：渲染给模型的 [i] 就是
+                # Target.ocr_index 的取值，executor 工具执行时需要同一份
+                # results 才能把索引还原成 bounds。图序是
+                # contextor -> cortex -> executor -> executor_tools -> ... -> contextor，
+                # 所以 executor_tools 跑的时候这份感知数据正是当屏的，
+                # 下一次 contextor 会整体覆盖它。
+                # latest_ui_hierarchy 仍然清空 —— 它没有索引契约，
+                # 工具侧走 controller.get_ui_elements() 现取即可。
                 "latest_screenshot": None,
                 "focused_app_info": None,
                 "device_date": None,

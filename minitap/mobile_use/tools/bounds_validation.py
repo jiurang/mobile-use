@@ -261,16 +261,25 @@ async def coordinates_look_like_hierarchy_derived(
     ctx: MobileUseContext,
     target: Target,
     min_iou: float = MIN_IOU,
+    ocr_texts: list[OcrText] | None = None,
 ) -> tuple[bool, str | None]:
     """异步包装：实时 dump 层级树后做校验。
 
     为什么必须实时 dump
     ------------------
-    不能用 `state.latest_ui_hierarchy`：`cortex.py:153` 在 cortex 返回时就把该字段
+    不能用 `state.latest_ui_hierarchy`：`cortex.py` 在 cortex 返回时就把该字段
     置为 None，executor 工具执行时 state 里已经没有层级树了。
     `UnifiedMobileController.get_ui_elements()` 是现成的实时取数路径
-    （`tap_element` 本来就用它）。OCR 同理：`latest_ocr_results` 也在 cortex 返回时
-    清空，所以这里现截现识。
+    （`tap_element` 本来就用它）。
+
+    `ocr_texts` 由调用方按需传入
+    ---------------------------
+    和层级树不同，**OCR 结果是可以从 state 里拿到的**：cortex 渲染用的
+    `latest_ocr_results` 被特意保留着（`Target.ocr_index` 就靠它还原）。
+    传进来就省掉一次截屏 + 约 380ms 推理，而且校验用的是**模型当时看到的
+    同一份**结果 —— 现截现识的话，画面已经变了的话会用另一份数据判合法坐标，
+    把本来没问题的一次点击拒掉。
+    不传（None）则退回惰性 OCR，行为与改造前完全一致。
 
     OCR 是惰性的
     ------------
@@ -300,10 +309,12 @@ async def coordinates_look_like_hierarchy_derived(
     if verdict[0]:
         return verdict
 
-    if not ctx.perception.ocr:
-        return verdict
+    effective_ocr = ocr_texts
+    if effective_ocr is None:
+        if not ctx.perception.ocr:
+            return verdict
+        effective_ocr = await _recognize_ocr(ctx)
 
-    ocr_texts = await _recognize_ocr(ctx)
     return coordinates_look_like_hierarchy_derived_from_elements(
-        target, elements, ocr_texts, min_iou
+        target, elements, effective_ocr, min_iou
     )

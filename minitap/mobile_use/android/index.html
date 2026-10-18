@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>mobile-use · android</title>
+<style>
+  :root {
+    --bg:            #0d1117;
+    --bg-raised:     #151b23;
+    --bg-inset:      #0a0e14;
+    --line:          #242c37;
+    --line-soft:     #1c232d;
+
+    --fg:            #d7dde5;
+    --fg-dim:        #8b97a6;
+    --fg-faint:      #5d6875;
+
+    --accent:        #4ec9a8;
+    --accent-dim:    #2f7a63;
+    --info:          #6ba8f5;
+    --warn:          #e3b341;
+    --danger:        #f0655f;
+
+    --radius-sm: 4px;
+    --radius:    7px;
+    --radius-lg: 11px;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .45);
+    --shadow:    0 4px 14px rgba(0, 0, 0, .42);
+    --shadow-lg: 0 12px 34px rgba(0, 0, 0, .5);
+
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --step-1: 4px;
+    --step-2: 8px;
+    --step-3: 12px;
+    --step-4: 16px;
+    --step-5: 24px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------------------------------------------------------------- header */
+  .bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: var(--step-4);
+    padding: var(--step-3) var(--step-4);
+    background: linear-gradient(180deg, var(--bg-raised), #11161d);
+    border-bottom: 1px solid var(--line);
+    box-shadow: var(--shadow-sm);
+    padding-top: max(var(--step-3), env(safe-area-inset-top));
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: var(--step-2);
+    font-weight: 600;
+    letter-spacing: .02em;
+    white-space: nowrap;
+  }
+
+  .brand .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--fg-faint);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, .04);
+  }
+  .brand .dot.on  { background: var(--accent); box-shadow: 0 0 0 3px rgba(78, 201, 168, .16); }
+  .brand .dot.run { background: var(--warn);   box-shadow: 0 0 0 3px rgba(227, 179, 65, .18); animation: pulse 1.4s ease-in-out infinite; }
+  .brand .dot.err { background: var(--danger); box-shadow: 0 0 0 3px rgba(240, 101, 95, .18); }
+
+  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+
+  .meta {
+    display: flex;
+    gap: var(--step-2);
+    flex-wrap: wrap;
+    margin-left: auto;
+    justify-content: flex-end;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--step-1);
+    padding: 3px var(--step-2);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--bg-inset);
+    font-size: 12px;
+    color: var(--fg-dim);
+    white-space: nowrap;
+  }
+  .chip b { color: var(--fg); font-weight: 600; }
+  .chip .k { color: var(--fg-faint); }
+
+  /* ------------------------------------------------------------------ main */
+  main {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 310px;
+    min-height: 0;
+  }
+
+  .transcript {
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--step-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--step-3);
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+
+  .panel {
+    border: 1px solid var(--line-soft);
+    border-radius: var(--radius);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+
+  .panel > h2 {
+    margin: 0;
+    padding: var(--step-2) var(--step-3);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    background: var(--bg-inset);
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .msg { padding: var(--step-3); }
+  .msg .label {
+    font-size: 11.5px;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    margin-bottom: var(--step-1);
+  }
+  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg.user   { border-left: 2px solid var(--info); }
+  .msg.result { border-left: 2px solid var(--accent); }
+  .msg.error  { border-left: 2px solid var(--danger); }
+  .msg.error .body { color: var(--danger); }
+  .msg .meta-line { font-size: 12px; color: var(--fg-faint); margin-top: var(--step-2); }
+
+  .empty {
+    margin: auto;
+    text-align: center;
+    color: var(--fg-faint);
+    font-size: 13px;
+  }
+
+  /* --------------------------------------------------------------- timeline */
+  aside {
+    border-left: 1px solid var(--line);
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-inset);
+  }
+
+  .steps {
+    list-style: none;
+    margin: 0;
+    padding: var(--step-2) var(--step-3);
+    overflow-y: auto;
+    flex: 1 1 auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+
+  .steps li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--step-2);
+    padding: 3px 0;
+    font-size: 12.5px;
+    color: var(--fg-dim);
+    border-left: 2px solid transparent;
+    padding-left: var(--step-2);
+  }
+  .steps li.act  { border-left-color: var(--warn); color: var(--fg); }
+  .steps li.done { border-left-color: var(--accent-dim); }
+  .steps li.bad  { border-left-color: var(--danger); color: var(--danger); }
+  .steps .t { color: var(--fg-faint); margin-left: auto; white-space: nowrap; font-size: 11.5px; }
+
+  /* --------------------------------------------------------------- composer */
+  .composer {
+    flex: 0 0 auto;
+    display: flex;
+    gap: var(--step-2);
+    padding: var(--step-3) var(--step-4);
+    padding-bottom: max(var(--step-3), env(safe-area-inset-bottom));
+    background: linear-gradient(180deg, #11161d, var(--bg-raised));
+    border-top: 1px solid var(--line);
+    box-shadow: var(--shadow);
+  }
+
+  input[type="text"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 10px var(--step-3);
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg-inset);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5);
+    outline: none;
+  }
+  input[type="text"]:focus {
+    border-color: var(--accent-dim);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5), 0 0 0 3px rgba(78, 201, 168, .12);
+  }
+
+  button {
+    font: inherit;
+    padding: 10px var(--step-4);
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: filter .12s ease, opacity .12s ease;
+    white-space: nowrap;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+
+  #send {
+    background: linear-gradient(180deg, #56d6b3, var(--accent));
+    color: #06231b;
+    font-weight: 600;
+    box-shadow: var(--shadow-sm);
+  }
+  #send:not(:disabled):hover { filter: brightness(1.08); }
+
+  #stop {
+    background: transparent;
+    color: var(--danger);
+    border-color: #4a2b2b;
+  }
+  #stop:not(:disabled):hover { background: rgba(240, 101, 95, .1); }
+
+  /* ------------------------------------------------------------ narrow / ui */
+  @media (max-width: 860px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 40%); }
+    aside { border-left: none; border-top: 1px solid var(--line); }
+    .meta { width: 100%; margin-left: 0; justify-content: flex-start; }
+    .bar { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand"><span class="dot" id="conn"></span><span>mobile-use</span><span style="color:var(--fg-faint)">/</span><span id="platform" style="color:var(--fg-dim)">android</span></div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<main>
+  <section class="transcript" id="transcript">
+    <div class="empty" id="empty">输入一个目标，agent 会在本机上驱动这台设备。</div>
+  </section>
+
+  <aside>
+    <div class="panel" style="border:none;border-radius:0;box-shadow:none;display:flex;flex-direction:column;height:100%">
+      <h2>运行步骤</h2>
+      <ol class="steps" id="steps"></ol>
+    </div>
+  </aside>
+</main>
+
+<form class="composer" id="composer" autocomplete="off">
+  <input type="text" id="goal" placeholder="例如：打开设置，告诉我当前电量" />
+  <button type="submit" id="send">运行</button>
+  <button type="button" id="stop" disabled>停止</button>
+</form>
+
+<script>
+(function () {
+  "use strict";
+
+  var transcript = document.getElementById("transcript");
+  var stepsEl    = document.getElementById("steps");
+  var emptyEl    = document.getElementById("empty");
+  var goalEl     = document.getElementById("goal");
+  var sendEl     = document.getElementById("send");
+  var stopEl     = document.getElementById("stop");
+  var metaEl     = document.getElementById("meta");
+  var connEl     = document.getElementById("conn");
+  var platformEl = document.getElementById("platform");
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function clearEmpty() {
+    if (emptyEl && emptyEl.parentNode) emptyEl.parentNode.removeChild(emptyEl);
+  }
+
+  function addMessage(kind, label, body, extra) {
+    clearEmpty();
+    var wrap = el("div", "panel msg " + kind);
+    wrap.appendChild(el("div", "label", label));
+    wrap.appendChild(el("div", "body", body));
+    if (extra) wrap.appendChild(el("div", "meta-line", extra));
+    transcript.appendChild(wrap);
+    transcript.scrollTop = transcript.scrollHeight;
+    return wrap;
+  }
+
+  var openNodes = {};   // node name -> <li>, so node_end can close it in place
+  var lastThought = null;
+
+  function fmtMs(ms) {
+    if (ms == null) return "";
+    return ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
+  }
+
+  function pushStep(text, cls) {
+    var li = el("li", cls || "", text);
+    stepsEl.appendChild(li);
+    while (stepsEl.children.length > 300) stepsEl.removeChild(stepsEl.firstChild);
+    stepsEl.scrollTop = stepsEl.scrollHeight;
+    return li;
+  }
+
+  function closeStep(name, cls, ms) {
+    var li = openNodes[name];
+    if (!li) return;
+    delete openNodes[name];
+    li.className = cls || "done";
+    li.textContent = name;
+    if (ms != null) li.appendChild(el("span", "t", fmtMs(ms)));
+  }
+
+  // ------------------------------------------------------------- rendering
+  function renderState(s) {
+    var running = s.running;
+    sendEl.disabled = running;
+    stopEl.disabled = !running;
+    connEl.className = "dot " + (s.error ? "err" : running ? "run" : "on");
+
+    if (s.device && s.device.platform) {
+      platformEl.textContent = s.device.platform + " · " + s.device.id;
+    }
+
+    var chips = [];
+    if (s.models && s.models.length) {
+      var m = s.models[0];
+      chips.push(["model", m.provider + "/" + m.model]);
+    }
+    if (s.device && s.device.width) {
+      chips.push(["screen", s.device.width + "×" + s.device.height]);
+    }
+    var t = s.tokens || {};
+    chips.push(["tokens", t.reported ? (t["in"] + "↓ " + t.out + "↑") : "n/a"]);
+    if (s.active_goal) chips.push(["running", s.active_goal.slice(0, 28)]);
+
+    metaEl.textContent = "";
+    chips.forEach(function (pair) {
+      var c = el("span", "chip");
+      c.appendChild(el("span", "k", pair[0]));
+      c.appendChild(el("b", null, pair[1]));
+      metaEl.appendChild(c);
+    });
+
+    (s.runs || []).forEach(function (r) {
+      if (r.state === "done" && !r._shown) {
+        r._shown = true;
+        addMessage("result", "result · " + r.seconds + "s", r.result || "");
+      }
+      if (r.state === "error" && !r._shown) {
+        r._shown = true;
+        addMessage("error", "error", r.error || "");
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- events
+  function handleEvent(e) {
+    switch (e.type) {
+      case "state":
+        renderState(e);
+        break;
+      case "goal_accepted":
+        addMessage("user", "goal", e.detail);
+        break;
+      case "node_start":
+        openNodes[e.title] = pushStep(e.title, "act");
+        break;
+      case "node_end":
+        closeStep(e.title, "done", e.ms);
+        break;
+      case "action_start":
+        openNodes["act:" + e.title] = pushStep(e.title + (e.detail ? " " + e.detail : ""), "act");
+        break;
+      case "action_end":
+        closeStep("act:" + e.title, e.ok === false ? "bad" : "done", e.ms);
+        break;
+      case "thought":
+        if (e.title && e.title !== lastThought) {
+          lastThought = e.title;
+          pushStep(e.title.length > 70 ? e.title.slice(0, 70) + "…" : e.title, "");
+        }
+        break;
+      case "result":
+        lastThought = null;
+        break;
+      case "error":
+        addMessage("error", "error", e.title + (e.detail ? " — " + e.detail : ""));
+        break;
+      default:
+        break;
+    }
+  }
+
+  function connect() {
+    var es = new EventSource("/api/events");
+    es.onmessage = function (m) {
+      try { handleEvent(JSON.parse(m.data)); } catch (err) { /* ignore a partial frame */ }
+    };
+    es.onerror = function () { connEl.className = "dot err"; };
+    es.onopen = function () { connEl.className = "dot on"; };
+  }
+
+  // --------------------------------------------------------------- actions
+  document.getElementById("composer").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var goal = goalEl.value.trim();
+    if (!goal) return;
+    goalEl.value = "";
+    fetch("/api/goal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ goal: goal })
+    }).then(function (r) { return r.json(); }).then(function (r) {
+      if (!r.ok) addMessage("error", "rejected", r.error || "submit failed");
+    });
+  });
+
+  stopEl.addEventListener("click", function () {
+    fetch("/api/stop", { method: "POST" });
+  });
+
+  goalEl.focus();
+  fetch("/api/state").then(function (r) { return r.json(); }).then(renderState).catch(function () {});
+  connect();
+})();
+</script>
+</body>
+</html>

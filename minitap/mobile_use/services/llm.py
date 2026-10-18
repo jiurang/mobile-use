@@ -3,15 +3,13 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Any, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_vertexai import ChatVertexAI
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, ValidationError
 
@@ -27,6 +25,14 @@ from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.utils.llm_usage import extract_usage
 from minitap.mobile_use.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    # Imported for typing only. The Google SDKs are imported inside the
+    # factories below: their dependency tree (google-aiplatform -> numexpr,
+    # bottleneck, shapely) is native-heavy and unavailable on some platforms we
+    # support, so only the Gemini/Vertex providers pay for it.
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_google_vertexai import ChatVertexAI
 
 # Logger for internal messages (ex: fallback)
 llm_logger = logging.getLogger(__name__)
@@ -176,8 +182,10 @@ def get_minitap_llm(
 def get_google_llm(
     model_name: str = "gemini-2.5-pro",
     temperature: float = 0.7,
-) -> ChatGoogleGenerativeAI:
+) -> "ChatGoogleGenerativeAI":  # quoted: import is TYPE_CHECKING-only, see line 29
     assert settings.GOOGLE_API_KEY is not None
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
     client = ChatGoogleGenerativeAI(
         model=model_name,
         max_tokens=None,
@@ -191,7 +199,9 @@ def get_google_llm(
 def get_vertex_llm(
     model_name: str = "gemini-2.5-pro",
     temperature: float = 0.7,
-) -> ChatVertexAI:
+) -> "ChatVertexAI":  # quoted: import is TYPE_CHECKING-only, see line 29
+    from langchain_google_vertexai import ChatVertexAI
+
     client = ChatVertexAI(
         model_name=model_name,
         max_tokens=None,

@@ -2,8 +2,6 @@ from pathlib import Path
 
 from jinja2 import Template
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_vertexai.chat_models import ChatVertexAI
 
 from minitap.mobile_use.agents.cortex.dispatcher import dispatch_decisions
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
@@ -20,6 +18,36 @@ from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _google_llm_types() -> tuple[type, ...]:
+    """Chat-model types that reject ``parallel_tool_calls``.
+
+    Imported through a helper rather than at module scope because the Google
+    SDKs drag in a large, partly-native dependency tree (``google-aiplatform``
+    pulls numexpr, bottleneck, shapely) that is not installable on every
+    platform this project runs on -- Android/Termux is the concrete case. Only
+    the Gemini and Vertex providers need them, so an install without them must
+    still import and run the other providers. A missing SDK simply means no
+    type here can ever be matched.
+    """
+    types: list[type] = []
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        types.append(ChatGoogleGenerativeAI)
+    except ImportError:
+        pass
+    try:
+        from langchain_google_vertexai.chat_models import ChatVertexAI
+
+        types.append(ChatVertexAI)
+    except ImportError:
+        pass
+    return tuple(types)
+
+
+_GOOGLE_LLM_TYPES = _google_llm_types()
 
 
 class ExecutorNode:
@@ -113,7 +141,7 @@ class ExecutorNode:
         }
 
         # ChatGoogleGenerativeAI does not support the "parallel_tool_calls" keyword
-        if not isinstance(llm, ChatGoogleGenerativeAI | ChatVertexAI):
+        if not isinstance(llm, _GOOGLE_LLM_TYPES):
             llm_bind_tools_kwargs["parallel_tool_calls"] = True
 
         llm = llm.bind_tools(**llm_bind_tools_kwargs)

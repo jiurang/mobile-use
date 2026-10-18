@@ -4,9 +4,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-# Mock the problematic langgraph import at module level
-sys.modules["langgraph.prebuilt.chat_agent_executor"] = Mock()
-sys.modules["minitap.mobile_use.graph.state"] = Mock()
+# Mock the problematic langgraph import at module level.
+# import 完立刻还回去 —— 留在 sys.modules 里会污染同一 pytest 进程内后续
+# 收集的模块（把 minitap.mobile_use.graph.state 变成假的，别的测试文件
+# import 到 State 时会拿到 Mock）。
+_STUBBED = ("langgraph.prebuilt.chat_agent_executor", "minitap.mobile_use.graph.state")
+_saved_modules = {name: sys.modules.get(name) for name in _STUBBED}
+for _name in _STUBBED:
+    sys.modules[_name] = Mock()
 
 from minitap.mobile_use.context import DeviceContext, DevicePlatform, MobileUseContext  # noqa: E402
 from minitap.mobile_use.tools.types import Target  # noqa: E402
@@ -17,6 +22,13 @@ from minitap.mobile_use.tools.utils import (  # noqa: E402
     move_cursor_to_end_if_bounds,
 )
 from minitap.mobile_use.utils.ui_hierarchy import ElementBounds  # noqa: E402
+
+for _name in reversed(_STUBBED):
+    _original = _saved_modules[_name]
+    if _original is not None:
+        sys.modules[_name] = _original
+    else:
+        sys.modules.pop(_name, None)
 
 
 @pytest.fixture

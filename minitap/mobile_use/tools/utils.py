@@ -264,7 +264,9 @@ def has_valid_selectors(target: Target) -> bool:
     has_coordinates = target.bounds is not None
     has_resource_id = target.resource_id is not None and target.resource_id != ""
     has_text = target.text is not None and target.text != ""
-    return has_coordinates or has_resource_id or has_text
+    # ocr_index 单独就能定位：它会还原成 bounds，OCR 行本身就是一个合法坐标来源
+    has_ocr_index = target.ocr_index is not None
+    return has_coordinates or has_resource_id or has_text or has_ocr_index
 
 
 class IdSelectorRequest(BaseModel):
