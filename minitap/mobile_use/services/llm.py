@@ -47,6 +47,11 @@ llm_logger = logging.getLogger(__name__)
 # Logger for user messages
 user_messages_logger = get_logger(__name__)
 
+# Upper bound on a single model request. See get_minimax_llm for the failure this
+# exists to prevent; measured latency on a real phone is seconds, so this is
+# deliberately far above normal and only bites on a hung connection.
+LLM_REQUEST_TIMEOUT_SECONDS = 180.0
+
 
 async def invoke_llm_with_timeout_message[T](
     llm_call: Coroutine[Any, Any, T],
@@ -230,7 +235,12 @@ def get_anthropic_llm(
         temperature=temperature,
         max_tokens=8192,  # type: ignore[call-arg]  # field aliased to max_tokens_to_sample
         max_retries=2,
-        timeout=None,
+        # Was None, i.e. "never give up" — see get_minimax_llm for why an
+        # unbounded request timeout is never the safe default. The field is
+        # `default_request_timeout` on ChatAnthropic (alias "timeout"); passing
+        # `request_timeout` here is silently ignored, which is how this stayed
+        # broken the first time.
+        default_request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         stop=None,
     )
     return client
@@ -538,6 +548,16 @@ def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) ->
         api_key=settings.MINIMAX_API_KEY,
         temperature=clamped_temperature,
         base_url=settings.MINIMAX_BASE_URL or "https://api.minimax.io/v1",
+        # A bounded request timeout, because the default is not one. With
+        # `request_timeout` unset the OpenAI SDK waits 600s and langchain retries
+        # twice, so a single hung connection parks the whole agent for 30
+        # minutes with only "Waiting for LLM call response..." printed — there
+        # is no error, no retry limit, no way back. Reproduced on a phone over
+        # USB: the LLM call at 22:23:59 had still produced nothing at 22:36.
+        # Measured normal latency is seconds, so 180s is generous; one retry
+        # covers a single dropped connection without compounding a real outage.
+        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=1,
         # 显式传而不是 **dict 解包：解包会让类型检查器把整个 dict 当成
         # **kwargs 逐个参数校验，一堆误报。空的时候给 None（不发这个字段）。
         extra_body=extra_body or None,
