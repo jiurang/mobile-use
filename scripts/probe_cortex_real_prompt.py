@@ -60,15 +60,9 @@ def build_messages() -> tuple[list, dict]:
     compressed = compress_screenshot_base64(_pil_to_base64(shot))
 
     md = (ROOT / "minitap/mobile_use/agents/cortex/cortex.md").read_text(encoding="utf-8")
+    # cortex.md 自 v2 起整段静态：目标 / 计划 / feedback 全部走 messages，不再入模板。
     system = Template(md).render(
         platform="android",
-        initial_goal="打开设置，点进 WLAN，告诉我当前连接的 Wi-Fi 名称，然后返回桌面",
-        subgoal_plan="[Subgoal(id='s1', description='打开设置'), "
-                     "Subgoal(id='s2', description='进入 WLAN'), "
-                     "Subgoal(id='s3', description='读出 Wi-Fi 名称'), "
-                     "Subgoal(id='s4', description='返回桌面')]",
-        current_subgoal="Subgoal(id='s2', description='进入 WLAN')",
-        executor_feedback="[ToolMessage(content='Tapped WLAN successfully.')]",
         executor_tools_list="back, open_link, tap, long_press_on, swipe_percentages, "
                             "swipe_coordinates, focus_and_input_text, erase_one_char, "
                             "launch_app, stop_app, focus_and_clear_text, press_key, "
@@ -77,13 +71,29 @@ def build_messages() -> tuple[list, dict]:
         perception={"ui_hierarchy": True, "screenshot": True, "ocr": True},
     )
 
+    # 与 cortex.py 的分层一致：恒定 → 只追加 → 每轮变。
     messages = [
         SystemMessage(content=system),
-        HumanMessage(content="Here are my device info:\nRedmi Turbo 4\n"),
+        HumanMessage(
+            content="\n".join(
+                [
+                    "Here are my device info:",
+                    "Device ID: 89R8ZXNBGQIRJRLF",
+                    "Initial goal: 打开设置，点进 WLAN，告诉我当前连接的 Wi-Fi 名称，然后返回桌面",
+                    "Subgoal plan (append-only history; the last PLAN section is the active one):",
+                    "PLAN v1:\n- [ID:s1] 打开设置\n- [ID:s2] 进入 WLAN\n"
+                    "- [ID:s3] 读出 Wi-Fi 名称\n- [ID:s4] 返回桌面",
+                ]
+            )
+        ),
         HumanMessage(
             content="Agent thoughts history (newest last):\n"
             "Decisions reason: 已启动设置，正在进入 WLAN 页面。"
         ),
+        HumanMessage(
+            content="Subgoal status: [s1] done | [s2] active | [s3] pending | [s4] pending"
+        ),
+        HumanMessage(content="Executor feedback:\n[ToolMessage(content='Tapped WLAN successfully.')]"),
         HumanMessage(content=tree_text),
         get_screenshot_message_for_llm(compressed),
     ]

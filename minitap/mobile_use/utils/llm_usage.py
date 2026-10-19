@@ -14,11 +14,57 @@ TUI 的 `tui/events.py` 里本来就有一份成熟实现，覆盖 langchain 各
 
 另外还要能拆开 ``LLMResult``：``on_llm_end`` 拿到的是 LLMResult 而不是 AIMessage，
 真正的字段在 ``result.generations[0][0].message`` 上，不拆就永远读不到。
+
+捕获槽（为什么需要它）
+--------------------
+结构化输出路径（``with_structured_output``）返回的是 pydantic 对象，原始 AIMessage
+落不到调用方手里，于是 ``extract_usage`` 永远读不到 usage —— telemetry 里 cortex /
+planner / orchestrator 的 token 恒为 0。这里加一个 ContextVar 捕获槽：调用方开槽，
+客户端在拿到原始响应时把消息塞进来，调用方再统一取用。
 """
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
+
+# 本次 LLM 调用的捕获槽。异步任务会复制上下文，但复制的是**引用**，
+# 所以槽里的 list 是同一个对象，跨 create_task 追加是可见的。
+_capture_sink: ContextVar[list[Any] | None] = ContextVar("llm_usage_capture", default=None)
+
+
+def open_capture() -> list[Any]:
+    """开一个捕获槽并返回可写的 list。返回空 list 表示本次没捕获到原始响应。"""
+    sink: list[Any] = []
+    _capture_sink.set(sink)
+    return sink
+
+
+def close_capture() -> None:
+    """关掉当前捕获槽。必须在 finally 里调用，否则会漏到下一次调用。"""
+    _capture_sink.set(None)
+
+
+def record_raw_response(response: Any) -> None:
+    """把 provider 的原始响应塞进当前捕获槽；没有开槽就静默丢弃。
+
+    这个函数会被每条 LLM 调用路径调到，**不能让它自己抛错影响主流程**。
+    """
+    sink = _capture_sink.get()
+    if sink is None:
+        return
+    try:
+        sink.append(response)
+    except Exception:  # noqa: BLE001 - 埋点永远不能把任务带崩
+        pass
+
+
+def first_captured(sink: list[Any]) -> Any:
+    """取捕获槽里第一条可解析出 usage 的原始响应，取不到返回 None。"""
+    for response in sink:
+        if extract_usage(response) is not None:
+            return response
+    return None
 
 
 def _int(value: Any) -> int:

@@ -25,6 +25,7 @@ from minitap.mobile_use.services.ocr.types import (
     OcrConfig,
     OcrEngine,
     resolve_device,
+    resolve_engine,
     resolve_rec_batch,
 )
 from minitap.mobile_use.utils.logger import get_logger
@@ -59,7 +60,7 @@ def _cache_key(config: OcrConfig) -> tuple:
     # key 还要覆盖全部会影响这个实例行为的字段。漏一个就等于「改配置没反应
     # 但也不报错」，是最难查的一类。
     return (
-        config.engine,
+        resolve_engine(config),
         str(config.model_dir) if config.model_dir else None,
         resolve_device(config),
         config.device_id,
@@ -76,11 +77,12 @@ def _cache_key(config: OcrConfig) -> tuple:
 def create_ocr_engine(config: OcrConfig | None = None) -> OcrEngine:
     """按配置造一个引擎实例（带缓存）。"""
     config = config or OcrConfig()
+    engine_name = resolve_engine(config)
 
-    factory = _REGISTRY.get(config.engine)
+    factory = _REGISTRY.get(engine_name)
     if factory is None:
         known = ", ".join(available_ocr_engines()) or "(空)"
-        raise ValueError(f"未知的 OCR 引擎 '{config.engine}'。已注册：{known}")
+        raise ValueError(f"未知的 OCR 引擎 '{engine_name}'。已注册：{known}")
 
     key = _cache_key(config)
     cached = _CACHE.get(key)

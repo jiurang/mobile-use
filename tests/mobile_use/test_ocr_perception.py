@@ -778,13 +778,16 @@ class TestCacheKeyCoversEveryField:
         from minitap.mobile_use.services.ocr import types as ocr_types
 
         found = set(re.findall(r"config\.(\w+)", inspect.getsource(_cache_key)))
-        for name in ("resolve_device", "resolve_rec_batch"):
-            found |= set(
-                re.findall(
-                    r"config\.(\w+)",
-                    inspect.getsource(getattr(ocr_types, name)),
-                )
-            )
+        # 自动发现所有 resolve_* 辅助函数，而不是硬编码名单 —— resolve_engine
+        # 是后加的，硬编码过一次就会在它下一次被漏掉时静默失去保护。
+        for name, fn in vars(ocr_types).items():
+            if not name.startswith("resolve_") or not callable(fn):
+                continue
+            try:
+                found |= set(re.findall(r"config\.(\w+)", inspect.getsource(fn)))
+            except (OSError, TypeError):
+                # C 扩展/内建对象没有源码，跳过即可（真 resolve_* 都是纯 Python）。
+                continue
         return found
 
     def test_no_field_is_missing_from_the_cache_key(self):

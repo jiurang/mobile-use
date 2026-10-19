@@ -33,6 +33,15 @@ class State(BaseModel):
     # orchestrator related keys
     subgoal_plan: Annotated[list[Subgoal], "The current plan, made of subgoals"]
 
+    # planner related keys（计划日志）
+    # 计划本身会被 replan 换掉（completed + new），直接把它渲染给 cortex 会让提示词
+    # 从被改写那一行起整段失效。日志只追加：每生成一版计划追加一段，旧段永不改动。
+    subgoal_plan_log: Annotated[
+        str,
+        "Append-only log of every generated plan; the last PLAN section is the active one",
+    ] = ""
+    plan_version: Annotated[int, "How many plans have been generated so far"] = 0
+
     # contextor related keys
     latest_ui_hierarchy: Annotated[
         list[dict] | None, "Latest UI hierarchy of the device", take_last

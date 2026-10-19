@@ -173,39 +173,63 @@ def validate_vertex_ai_credentials():
 
 
 class LLM(BaseModel):
+    """一个 LLM 接入点。
+
+    ``provider`` + ``model`` 是必填的。下面三个字段是**运行期下发**的可选接入参数,
+    留空表示「沿用今天的行为」:密钥读 ``settings``,端点读 ``settings``,温度用各 agent
+    调用点的硬编码值。
+
+    为什么需要这三个字段:manager 侧管理渠道之后,要把 key / 端点 / 温度随任务一起下发到
+    runner(apk 里跑的就是这份代码)。在它们存在之前,这三样只能来自 ``settings`` ——
+    一个导入时读 env 的模块级单例,任何一次调用都改不了它,于是「换渠道」必须改文件重启。
+    """
+
     provider: LLMProvider
     model: str
+    base_url: str | None = None
+    api_key: SecretStr | None = None
+    temperature: float | None = None
+
+    def _has_api_key(self, attr: str) -> bool:
+        """本次解析有没有可用密钥:配置里带了,或者 settings 里有。"""
+        if self.api_key:
+            return True
+        return bool(getattr(settings, attr, None))
 
     def validate_provider(self, name: str):
+        # 只校验「能不能拿到密钥」,不校验密钥是哪来的 —— 配置自带是新增的合法来源,
+        # 不能因为 settings 里没有就判它无效。
         match self.provider:
             case "azure":
-                if not settings.AZURE_BASE_URL:
+                # 不校验密钥:azure 允许完全不带 key,走 DefaultAzureCredential
+                # (见 get_azure_llm)。加这条校验会打断那类现有部署。
+                if not (self.base_url or settings.AZURE_BASE_URL):
                     raise Exception(f"{name} requires AZURE_BASE_URL in .env")
             case "openai":
-                if not settings.OPENAI_API_KEY:
+                if not self._has_api_key("OPENAI_API_KEY"):
                     raise Exception(f"{name} requires OPENAI_API_KEY in .env")
             case "google":
-                if not settings.GOOGLE_API_KEY:
+                if not self._has_api_key("GOOGLE_API_KEY"):
                     raise Exception(f"{name} requires GOOGLE_API_KEY in .env")
             case "vertexai":
                 validate_vertex_ai_credentials()
             case "openrouter":
-                if not settings.OPEN_ROUTER_API_KEY:
+                if not self._has_api_key("OPEN_ROUTER_API_KEY"):
                     raise Exception(f"{name} requires OPEN_ROUTER_API_KEY in .env")
             case "xai":
-                if not settings.XAI_API_KEY:
+                if not self._has_api_key("XAI_API_KEY"):
                     raise Exception(f"{name} requires XAI_API_KEY in .env")
             case "minitap":
-                if not settings.MINITAP_API_KEY:
+                if not self._has_api_key("MINITAP_API_KEY"):
                     raise Exception(f"{name} requires MINITAP_API_KEY in .env")
             case "anthropic":
-                if not settings.ANTHROPIC_API_KEY:
+                if not self._has_api_key("ANTHROPIC_API_KEY"):
                     raise Exception(f"{name} requires ANTHROPIC_API_KEY in .env")
             case "minimax":
-                if not settings.MINIMAX_API_KEY:
+                if not self._has_api_key("MINIMAX_API_KEY"):
                     raise Exception(f"{name} requires MINIMAX_API_KEY in .env")
             case "deepseek":
-                if not settings.DEEPSEEK_API_KEY:
+                if not self._has_api_key("DEEPSEEK_API_KEY"):
                     raise Exception(f"{name} requires DEEPSEEK_API_KEY in .env")
 
     def __str__(self):

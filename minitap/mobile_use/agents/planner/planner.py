@@ -5,7 +5,11 @@ from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from minitap.mobile_use.agents.planner.types import PlannerOutput, Subgoal, SubgoalStatus
-from minitap.mobile_use.agents.planner.utils import generate_id, one_of_them_is_failure
+from minitap.mobile_use.agents.planner.utils import (
+    generate_id,
+    one_of_them_is_failure,
+    render_plan_skeleton,
+)
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.platform_specific_commands_controller import (
     get_current_foreground_package_async,
@@ -101,6 +105,20 @@ async def _invoke_planner(
     return _build_subgoals(response)
 
 
+def _append_plan_section(
+    previous_log: str, version: int, is_replan: bool, subgoals: list[Subgoal]
+) -> str:
+    """把这一版计划追加到计划日志末尾。**不改动之前任何一段。**
+
+    改写旧段会击穿 cortex 提示词的前缀（见 doc/cortex提示词组成v2.md Q2）：
+    replan 时旧表会在中部被改写、新子目标的 ID 还是随机生成的，改一处等于
+    后面全部作废。只追加则天然单调。
+    """
+    header = f"PLAN v{version}" + (" (replan)" if is_replan else "")
+    section = f"{header}:\n{render_plan_skeleton(subgoals)}"
+    return f"{previous_log}\n\n{section}" if previous_log else section
+
+
 class PlannerNode:
     def __init__(self, ctx: MobileUseContext):
         self.ctx = ctx
@@ -168,6 +186,14 @@ class PlannerNode:
             ctx=self.ctx,
             update={
                 "subgoal_plan": subgoals_plan,
+                # 计划日志只追加：v1、v2……旧段永不改动，cortex 渲染的就是它。
+                "plan_version": state.plan_version + 1,
+                "subgoal_plan_log": _append_plan_section(
+                    previous_log=state.subgoal_plan_log,
+                    version=state.plan_version + 1,
+                    is_replan=needs_replan,
+                    subgoals=new_subgoals,
+                ),
             },
             agent="planner",
         )

@@ -46,6 +46,26 @@ def _normalize(raw: str | None, allowed: tuple[str, ...], fallback: str, field: 
     return fallback
 
 
+def resolve_engine(config: OcrConfig) -> str:
+    """按 配置 -> 环境变量 -> paddle_onnx 的顺序定下引擎名。
+
+    和 :func:`resolve_device` / :func:`resolve_rec_batch` 同一套优先级。
+    runner-apk 就是靠 ``MOBILE_USE_OCR_ENGINE=mlkit`` 切到 ML Kit 的 ——
+    感知配置（``runner_host.models.PerceptionConfig``）只有三个 bool 开关，
+    契约里没有"引擎"这个概念，所以环境变量是唯一的注入点，不改协议就能换引擎。
+
+    这里**不校验**取值是否合法：合法值由运行时注册表决定（PC 上没有 ``mlkit``，
+    校验会误报），未知名由 ``registry.create_ocr_engine`` 报错并列出已注册项，
+    那条错误信息比这里硬编码的列表准确。
+    """
+    import os
+
+    raw = config.engine
+    if raw is None:
+        raw = os.getenv("MOBILE_USE_OCR_ENGINE")
+    return (raw or "").strip() or "paddle_onnx"
+
+
 def resolve_device(config: OcrConfig) -> str:
     """按 配置 -> 环境变量 -> auto 的顺序定下后端名。
 
@@ -95,9 +115,13 @@ class OcrConfig(BaseModel):
     即可，不需要改调用方。
     """
 
-    engine: str = Field(
-        default="paddle_onnx",
-        description="引擎名，对应 registry 里注册的 key（见 available_ocr_engines）",
+    engine: str | None = Field(
+        default=None,
+        description=(
+            "引擎名，对应 registry 里注册的 key（见 available_ocr_engines）。"
+            "None 时读 MOBILE_USE_OCR_ENGINE 环境变量，再退回 paddle_onnx —— "
+            "走 resolve_engine() 拿最终生效值，不要直接读这个字段。"
+        ),
     )
     model_dir: Path | None = Field(
         default=None,

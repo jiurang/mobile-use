@@ -15,7 +15,7 @@ from langchain_core.messages import (
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from minitap.mobile_use.agents.cortex.types import CortexOutput
-from minitap.mobile_use.agents.planner.utils import get_current_subgoal
+from minitap.mobile_use.agents.planner.utils import render_subgoal_status
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.controller_factory import create_device_controller
@@ -35,14 +35,20 @@ from minitap.mobile_use.utils.ui_hierarchy_view import render_hierarchy_and_labe
 
 logger = get_logger(__name__)
 
-# state.py:113 的 reducer 只增不减，而 cortex 每轮全量重发，所以这里要自己封顶。
-# 取值与 contextor.MAX_AGENTS_THOUGHTS 保持一致。
-MAX_CORTEX_AGENTS_THOUGHTS = 25
+# 推理历史**只追加、不截断**。
+#
+# state.py 的 reducer 本来就只增不减（`old + named_thoughts`）；这里之前套了一个
+# `[-25:]` 滑窗来封顶 token，代价是历史每轮整体左移 —— 提示词前缀每轮都会变，
+# 前缀缓存永远命中不了。两件事互斥，取「前缀单调」这一条：缓存命中的部分按
+# cache-read 计价，长任务里比滑窗更省。
+#
+# 后果是 token 随轮次线性增长（长任务里 thoughts 可占 cortex 上下文一半以上）。
+# 要压这块成本，杠杆不在截断，而在别处：工具 schema 结构手术、截图降分辨率，
+# 见 doc/token-context-analysis.md 五·一 / 5.3。
+CORTEX_PROMPT_ENV = "MOBILE_USE_CORTEX_PROMPT"
 
 # 模型偶尔会用这些占位串表示“没有内容”，统一当作 None 处理。
 EMPTY_STRING_TOKENS = frozenset({"{}", "[]", "null", "None", ""})
-
-CORTEX_PROMPT_ENV = "MOBILE_USE_CORTEX_PROMPT"
 
 
 @cache
@@ -153,37 +159,68 @@ class CortexNode:
         if self.ctx.video_recording_enabled:
             executor_wrappers.extend(VIDEO_RECORDING_WRAPPERS)
 
+        # system prompt 整段静态：不再接 initial_goal / 计划 / feedback 这类每轮
+        # 变化的值。它因此是一个整体可复用的前缀，不会被任何单轮字段击穿。
         system_message = _compile_template(load_cortex_prompt()).render(
             platform=self.ctx.device.mobile_platform.value,
-            initial_goal=state.initial_goal,
-            subgoal_plan="\n".join(str(subgoal) for subgoal in state.subgoal_plan),
-            current_subgoal=get_current_subgoal(state.subgoal_plan),
-            executor_feedback=executor_feedback,
             executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_wrappers),
             locked_app_package=current_locked_app_package,
             perception=self.ctx.perception,
         )
-        device_info_lines = ["Here are my device info:", self.ctx.device.to_str()]
-        if state.device_date:
-            device_info_lines.append(f"Device date: {state.device_date}")
-        if state.focused_app_info:
-            device_info_lines.append(f"Focused app info: {state.focused_app_info}")
-        messages = [
+
+        # 消息按「首次变化时刻」从早到晚排序：恒定 → 只追加 → 每轮变。
+        # 越靠前的块越稳定，能被前缀缓存覆盖的公共前缀就越长。
+        messages: list[BaseMessage] = [
             SystemMessage(content=system_message),
-            HumanMessage(content="\n".join(device_info_lines)),
+            # 任务内恒定 / 只追加：设备基本信息、目标、计划日志（骨架，最后一版为
+            # 当前计划）。子目标本身（ID + 描述）就在这里 —— 两次 replan 之间逐字节
+            # 不变，replan 时也只是**尾部追加**一段，所以这块永远只追加，不会击穿
+            # 后面的 thoughts。会变的完成情况不放在这里，见 thoughts 之后的索引。
+            HumanMessage(
+                content="\n".join(
+                    [
+                        "Here are my device info:",
+                        self.ctx.device.to_str().rstrip(),
+                        f"Initial goal: {state.initial_goal}",
+                        "Subgoal plan (append-only history; "
+                        "the last PLAN section is the active one):",
+                        state.subgoal_plan_log or "(no plan)",
+                    ]
+                )
+            ),
         ]
+
         # 这些 thought 绝不能塞成 assistant 回合。state.py:113 给每条加了 "[role] "
         # 前缀，模型会把它们当成 few-shot 照抄，于是无视 tool_choice 改用纯文本回答，
         # _parse() 再把这段中文当 JSON 解析 -> pydantic json_invalid -> 整个 goal 挂掉。
         # 压成单个 user 回合后，MiniMax-M3 的 tool_calls 实测恢复 2/2。
         # 见 v/probe_cortex_toolcall_ab.py、v/probe_cortex_history_len.py。
-        thoughts = state.agents_thoughts[-MAX_CORTEX_AGENTS_THOUGHTS:]
+        thoughts = state.agents_thoughts
         if thoughts:
             messages.append(
                 HumanMessage(
                     content="Agent thoughts history (newest last):\n" + "\n".join(thoughts)
                 )
             )
+
+        # 完成情况是**索引**、且排在 thoughts 之后：它每轮都可能变（子目标完成 /
+        # 推进 / replan），但按**计划序**排列、在固定槽位上原地替换，不会有新行插到
+        # 行中间。放在 thoughts 后面，它怎么变都不会碰到 thoughts 那段唯一增长的前缀。
+        # 固定成一条消息（无子目标时也发，值填 none），条数漂移本身也是前缀的一部分。
+        messages.append(
+            HumanMessage(content="Subgoal status: " + render_subgoal_status(state.subgoal_plan))
+        )
+
+        # 以下都是每轮必变的内容，必须排在最后。executor feedback 过去长在
+        # system prompt 里，等于每轮把整段 system prompt 的缓存打掉。
+        messages.append(HumanMessage(content="Executor feedback:\n" + executor_feedback))
+        device_state_lines = []
+        if state.device_date:
+            device_state_lines.append(f"Device date: {state.device_date}")
+        if state.focused_app_info:
+            device_state_lines.append(f"Focused app info: {state.focused_app_info}")
+        if device_state_lines:
+            messages.append(HumanMessage(content="\n".join(device_state_lines)))
 
         if self.ctx.perception.ui_hierarchy and state.latest_ui_hierarchy:
             # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，

@@ -1,8 +1,11 @@
 import asyncio
+import functools
+import inspect
 import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from langchain_anthropic import ChatAnthropic
@@ -22,7 +25,13 @@ from minitap.mobile_use.config import (
 )
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.telemetry import telemetry
-from minitap.mobile_use.utils.llm_usage import extract_usage
+from minitap.mobile_use.utils.llm_usage import (
+    close_capture,
+    extract_usage,
+    first_captured,
+    open_capture,
+    record_raw_response,
+)
 from minitap.mobile_use.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -53,6 +62,35 @@ user_messages_logger = get_logger(__name__)
 LLM_REQUEST_TIMEOUT_SECONDS = 180.0
 
 
+@dataclass(frozen=True)
+class ProviderOverride:
+    """运行期下发的接入参数。字段为 ``None`` 表示「没下发,走 settings」。
+
+    这是 manager 侧「渠道」下发过来的 key / 端点在这里的落点。每个 provider 工厂都按
+    「override 优先、settings 兜底」解析,于是没下发渠道的部署行为与之前逐字节一致 ——
+    这是这条路径能被安全打开的前提。
+    """
+
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+
+    def key_or(self, attr: str) -> SecretStr | None:
+        return self.api_key or getattr(settings, attr, None)
+
+    def url_or(self, attr: str, default: str | None = None) -> str | None:
+        return self.base_url or getattr(settings, attr, None) or default
+
+
+def _warn_base_url_ignored(provider: str) -> None:
+    """这个 provider 的客户端没有端点参数,渠道下发的端点用不上。
+
+    明确报出来而不是静默丢弃 —— 「配置改了没反应」是这类问题里最难查的一种。
+    """
+    llm_logger.warning(
+        f"渠道下发了 base_url,但 provider={provider} 的客户端不支持自定义端点,已忽略"
+    )
+
+
 async def invoke_llm_with_timeout_message[T](
     llm_call: Coroutine[Any, Any, T],
     timeout_seconds: int = 10,
@@ -78,22 +116,31 @@ async def invoke_llm_with_timeout_message[T](
         The result of the LLM call.
     """
     started_at = time.perf_counter()
-    llm_task = asyncio.create_task(llm_call)
-    waiter_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
+    # 捕获槽必须在 create_task **之前**开：任务复制的是创建那一刻的上下文，
+    # 开晚了子任务里就看不到槽，原始响应也就塞不进来。
+    sink = open_capture()
+    try:
+        llm_task = asyncio.create_task(llm_call)
+        waiter_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
 
-    done, _ = await asyncio.wait({llm_task, waiter_task}, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            {llm_task, waiter_task}, return_when=asyncio.FIRST_COMPLETED
+        )
 
-    if llm_task in done:
-        # The LLM call has finished before the timeout, cancel the timer
-        waiter_task.cancel()
-        result = llm_task.result()
-    else:
-        # The timeout has been reached, display the message and wait for the call to finish
-        user_messages_logger.info("Waiting for LLM call response...")
-        result = await llm_task
+        if llm_task in done:
+            # The LLM call has finished before the timeout, cancel the timer
+            waiter_task.cancel()
+            result = llm_task.result()
+        else:
+            # The timeout has been reached, display the message and wait for the call to finish
+            user_messages_logger.info("Waiting for LLM call response...")
+            result = await llm_task
+    finally:
+        close_capture()
 
     _record_usage(
         result,
+        raw_response=first_captured(sink),
         agent_name=agent_name,
         task_id=task_id,
         duration_seconds=time.perf_counter() - started_at,
@@ -105,6 +152,7 @@ async def invoke_llm_with_timeout_message[T](
 def _record_usage(
     result: Any,
     *,
+    raw_response: Any,
     agent_name: str | None,
     task_id: str | None,
     duration_seconds: float,
@@ -112,19 +160,20 @@ def _record_usage(
 ) -> None:
     """记录 token 用量。任何异常都不允许影响主流程。
 
-    注意 usage 必须从**原始响应**上取：cortex / planner 等用的是
-    `with_structured_output`，返回的是 pydantic 对象而不是 AIMessage，
-    那种情况下读不到 usage，只能记 0 —— 这是已知限制，不影响趋势分析。
+    usage 必须从**原始响应**上取。cortex / planner / orchestrator 走的是
+    `with_structured_output`，返回 pydantic 对象，usage 落不到 result 上；
+    原始 AIMessage 由客户端侧（generate/agenerate 包装）塞进捕获槽，这里优先用它。
+    两个都读不到才记 0 —— 那说明 provider 根本没回报 usage，不是我们丢的。
     """
     if not agent_name:
         return
     try:
-        usage = extract_usage(result)
+        usage = extract_usage(raw_response) or extract_usage(result)
         input_tokens, output_tokens = usage if usage else (0, 0)
         telemetry.capture_llm_usage(
             task_id=task_id or "unknown",
             agent=agent_name,
-            model=_extract_model_name(result),
+            model=_extract_model_name(raw_response) or _extract_model_name(result),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             duration_seconds=duration_seconds,
@@ -148,6 +197,59 @@ def _extract_model_name(result: Any) -> str | None:
     return None
 
 
+def _capture_from_llm_result(result: Any) -> None:
+    """把 LLMResult 里的第一条 AIMessage 交给捕获槽。读不到就静默跳过。"""
+    try:
+        record_raw_response(result.generations[0][0].message)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+
+def _wrap_generate(original: Any) -> Any:
+    if inspect.iscoroutinefunction(original):
+
+        @functools.wraps(original)
+        async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = await original(self, *args, **kwargs)
+            _capture_from_llm_result(result)
+            return result
+
+    else:
+
+        @functools.wraps(original)
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            result = original(self, *args, **kwargs)
+            _capture_from_llm_result(result)
+            return result
+
+    wrapper._usage_capture_wrapped = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+_usage_capture_installed = False
+
+
+def _install_usage_capture() -> None:
+    """给客户端类的 generate / agenerate 包一层，把原始响应塞进捕获槽。
+
+    为什么非要在**类上**打，而不是给实例挂回调：结构化输出路径返回 pydantic
+    对象，原始 AIMessage 落不到调用方手里；而 langchain callback 在这条路径上
+    实测不触发（见 doc/prompt-i18n-ab.md 四·2）。同步 invoke 走 generate、
+    异步 ainvoke 走 agenerate，**只补一个会漏**（同一份文档里踩过）。
+    MiniMax / DeepSeek 的客户端是 ChatOpenAI 的子类，包基类即可覆盖。
+    """
+    global _usage_capture_installed
+    if _usage_capture_installed:
+        return
+    for cls in (ChatOpenAI, ChatAnthropic):
+        for name in ("generate", "agenerate"):
+            original = getattr(cls, name, None)
+            if original is None or getattr(original, "_usage_capture_wrapped", False):
+                continue
+            setattr(cls, name, _wrap_generate(original))
+    _usage_capture_installed = True
+
+
 def _build_custom_headers(agent_name: str | None = None) -> dict[str, str]:
     """Build custom headers for LLM API calls."""
     headers: dict[str, str] = {}
@@ -165,9 +267,13 @@ def get_minitap_llm(
     max_retries: int | None = None,
     api_key: str | None = None,
     agent_name: str | None = None,
+    override: ProviderOverride | None = None,
 ) -> ChatOpenAI:
+    override = override or ProviderOverride()
     if api_key:
         effective_api_key = SecretStr(api_key)
+    elif override.api_key:
+        effective_api_key = override.api_key
     elif settings.MINITAP_API_KEY:
         effective_api_key = settings.MINITAP_API_KEY
     else:
@@ -183,7 +289,7 @@ def get_minitap_llm(
         temperature=temperature,
         max_retries=max_retries,
         api_key=effective_api_key,
-        base_url=settings.MINITAP_API_BASE_URL,
+        base_url=override.url_or("MINITAP_API_BASE_URL"),
         default_query={
             "sessionId": trace_id,
         },
@@ -195,15 +301,20 @@ def get_minitap_llm(
 def get_google_llm(
     model_name: str = "gemini-2.5-pro",
     temperature: float = 0.7,
+    override: ProviderOverride | None = None,
 ) -> "ChatGoogleGenerativeAI":  # quoted: import is TYPE_CHECKING-only, see line 29
-    assert settings.GOOGLE_API_KEY is not None
+    override = override or ProviderOverride()
+    if override.base_url:
+        _warn_base_url_ignored("google")
+    api_key = override.key_or("GOOGLE_API_KEY")
+    assert api_key is not None
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     client = ChatGoogleGenerativeAI(
         model=model_name,
         max_tokens=None,
         temperature=temperature,
-        api_key=settings.GOOGLE_API_KEY,
+        api_key=api_key,
         max_retries=2,
     )
     return client
@@ -212,7 +323,15 @@ def get_google_llm(
 def get_vertex_llm(
     model_name: str = "gemini-2.5-pro",
     temperature: float = 0.7,
+    override: ProviderOverride | None = None,
 ) -> "ChatVertexAI":  # quoted: import is TYPE_CHECKING-only, see line 29
+    # Vertex 只认 ADC + project,没有端点和密钥两个旋钮。渠道下发了也用不上,
+    # 但要报出来 —— 静默丢弃会变成「配置改了没反应」。
+    override = override or ProviderOverride()
+    if override.api_key:
+        _warn_base_url_ignored("vertexai (api_key)")
+    if override.base_url:
+        _warn_base_url_ignored("vertexai (base_url)")
     from langchain_google_vertexai import ChatVertexAI
 
     client = ChatVertexAI(
@@ -224,14 +343,44 @@ def get_vertex_llm(
     return client
 
 
+class AnthropicCacheControlChat(ChatAnthropic):
+    """给 Anthropic 打**显式** cache_control 断点。
+
+    Anthropic 与 OpenAI 兼容端点的缓存机制不同：前者必须打断点才缓存，
+    后者自动做前缀缓存。断点加在 system 块上 —— 那是整段静态、且超过
+    Anthropic 1024 token 最小可缓存长度的稳定前缀（cortex.md 渲染后约 1.5k token）。
+
+    更细的断点（例如把计划/进度块也标上）需要调用方知道自己消息分层的边界，
+    这里不做 —— 猜测出来的断点一旦落在会变的那一块上，等于没有。
+    """
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:  # type: ignore[override]
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        system = payload.get("system")
+        if isinstance(system, str) and system:
+            payload["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
+        elif isinstance(system, list) and system and isinstance(system[-1], dict):
+            system[-1]["cache_control"] = {"type": "ephemeral"}
+        return payload
+
+
 def get_anthropic_llm(
     model_name: str = "claude-sonnet-4-6",
     temperature: float = 1,
+    override: ProviderOverride | None = None,
 ) -> ChatAnthropic:
-    assert settings.ANTHROPIC_API_KEY is not None
-    client = ChatAnthropic(
+    override = override or ProviderOverride()
+    api_key = override.key_or("ANTHROPIC_API_KEY")
+    assert api_key is not None
+    client = AnthropicCacheControlChat(
         model_name=model_name,
-        api_key=settings.ANTHROPIC_API_KEY,
+        api_key=api_key,
+        # `anthropic_api_url` 是 ChatAnthropic 的端点字段名(不是 `base_url`,
+        # 见 langchain_anthropic/chat_models.py:946)。这里只认渠道下发的值 ——
+        # Settings 里没有 ANTHROPIC_BASE_URL 这个键,不要凭空发明一个。
+        anthropic_api_url=override.base_url,
         temperature=temperature,
         max_tokens=8192,  # type: ignore[call-arg]  # field aliased to max_tokens_to_sample
         max_retries=2,
@@ -249,53 +398,75 @@ def get_anthropic_llm(
 def get_openai_llm(
     model_name: str = "o3",
     temperature: float = 1,
+    override: ProviderOverride | None = None,
 ) -> ChatOpenAI:
-    assert settings.OPENAI_API_KEY is not None
+    override = override or ProviderOverride()
+    api_key = override.key_or("OPENAI_API_KEY")
+    assert api_key is not None
     client = ChatOpenAI(
         model=model_name,
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL,
+        api_key=api_key,
+        base_url=override.url_or("OPENAI_BASE_URL"),
         temperature=temperature,
     )
     return client
 
 
-def get_openrouter_llm(model_name: str, temperature: float = 1):
-    assert settings.OPEN_ROUTER_API_KEY is not None
+def get_openrouter_llm(
+    model_name: str,
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+):
+    override = override or ProviderOverride()
+    api_key = override.key_or("OPEN_ROUTER_API_KEY")
+    assert api_key is not None
     client = ChatOpenAI(
         model=model_name,
         temperature=temperature,
-        api_key=settings.OPEN_ROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        base_url=override.url_or("OPEN_ROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     )
     return client
 
 
-def get_grok_llm(model_name: str, temperature: float = 1) -> ChatOpenAI:
-    assert settings.XAI_API_KEY is not None
+def get_grok_llm(
+    model_name: str,
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+) -> ChatOpenAI:
+    override = override or ProviderOverride()
+    api_key = override.key_or("XAI_API_KEY")
+    assert api_key is not None
     client = ChatOpenAI(
         model=model_name,
-        api_key=settings.XAI_API_KEY,
+        api_key=api_key,
         temperature=temperature,
-        base_url="https://api.x.ai/v1",
+        base_url=override.url_or("XAI_BASE_URL", "https://api.x.ai/v1"),
     )
     return client
 
 
-def get_azure_llm(model_name: str, temperature: float = 1) -> "AzureAIOpenAIApiChatModel":
+def get_azure_llm(
+    model_name: str,
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+) -> "AzureAIOpenAIApiChatModel":
     # Local import on purpose: only the Azure provider should pay for this tree.
     from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 
-    assert settings.AZURE_BASE_URL is not None
+    override = override or ProviderOverride()
+    endpoint = override.url_or("AZURE_BASE_URL")
+    assert endpoint is not None
 
     api_key: str | None = None
-    if settings.AZURE_API_KEY:
-        api_key = settings.AZURE_API_KEY.get_secret_value()
+    key = override.key_or("AZURE_API_KEY")
+    if key:
+        api_key = key.get_secret_value()
 
     if api_key:
         client = AzureAIOpenAIApiChatModel(
             model=model_name,
-            endpoint=settings.AZURE_BASE_URL,
+            endpoint=endpoint,
             credential=api_key,
             temperature=temperature,
         )
@@ -304,7 +475,7 @@ def get_azure_llm(model_name: str, temperature: float = 1) -> "AzureAIOpenAIApiC
 
         client = AzureAIOpenAIApiChatModel(
             model=model_name,
-            project_endpoint=settings.AZURE_BASE_URL,
+            project_endpoint=endpoint,
             credential=DefaultAzureCredential(),
             temperature=temperature,
         )
@@ -520,7 +691,11 @@ def resolve_minimax_effort() -> str | None:
     return None
 
 
-def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) -> ChatOpenAI:
+def get_minimax_llm(
+    model_name: str = "MiniMax-M2.7",
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+) -> ChatOpenAI:
     """构造 MiniMax 客户端。
 
     下发 ``output_config.effort``（默认 ``max``）。M3.1-Flash-Preview **关不掉**思考
@@ -535,7 +710,9 @@ def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) ->
     剥不掉 -> 没有 tool_calls -> "returned no parseable CortexOutput" -> 整个
     goal 崩。M3.1 的思考走独立字段，16 次 ``content`` 里 0 次混入 <think>。
     """
-    assert settings.MINIMAX_API_KEY is not None
+    override = override or ProviderOverride()
+    api_key = override.key_or("MINIMAX_API_KEY")
+    assert api_key is not None
     clamped_temperature = max(0.0, min(1.0, temperature))
 
     extra_body: dict[str, Any] = {}
@@ -545,9 +722,9 @@ def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) ->
 
     client = MiniMaxChatOpenAI(
         model=model_name,
-        api_key=settings.MINIMAX_API_KEY,
+        api_key=api_key,
         temperature=clamped_temperature,
-        base_url=settings.MINIMAX_BASE_URL or "https://api.minimax.io/v1",
+        base_url=override.url_or("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
         # A bounded request timeout, because the default is not one. With
         # `request_timeout` unset the OpenAI SDK waits 600s and langchain retries
         # twice, so a single hung connection parks the whole agent for 30
@@ -596,7 +773,11 @@ class DeepSeekChatOpenAI(ChatOpenAI):
         )
 
 
-def get_deepseek_llm(model_name: str = "deepseek-flash", temperature: float = 1) -> ChatOpenAI:
+def get_deepseek_llm(
+    model_name: str = "deepseek-flash",
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+) -> ChatOpenAI:
     """DeepSeek on its domestic platform (https://api.deepseek.com).
 
     Two upstream behaviours worth knowing about:
@@ -610,7 +791,9 @@ def get_deepseek_llm(model_name: str = "deepseek-flash", temperature: float = 1)
       they only apply in non-thinking mode. They are accepted either way, so
       there is nothing to clamp here.
     """
-    assert settings.DEEPSEEK_API_KEY is not None
+    override = override or ProviderOverride()
+    api_key = override.key_or("DEEPSEEK_API_KEY")
+    assert api_key is not None
     extra_kwargs: dict[str, Any] = {}
     if settings.DEEPSEEK_THINKING is not None:
         extra_kwargs["extra_body"] = {
@@ -618,9 +801,9 @@ def get_deepseek_llm(model_name: str = "deepseek-flash", temperature: float = 1)
         }
     client = DeepSeekChatOpenAI(
         model=model_name,
-        api_key=settings.DEEPSEEK_API_KEY,
+        api_key=api_key,
         temperature=temperature,
-        base_url=settings.DEEPSEEK_BASE_URL or "https://api.deepseek.com",
+        base_url=override.url_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         **extra_kwargs,
     )
     return client
@@ -664,6 +847,8 @@ def get_llm(
     use_fallback: bool = False,
     temperature: float = 1,
 ) -> BaseChatModel:
+    # 所有 agent 都从这里拿客户端，所以 usage 捕获的补丁也在这里装一次（幂等）。
+    _install_usage_capture()
     llm = (
         ctx.llm_config.get_utils(name)  # type: ignore
         if is_utils
@@ -674,30 +859,39 @@ def get_llm(
             llm = llm.fallback
         else:
             raise ValueError("LLM has no fallback!")
+
+    # 渠道下发的接入参数。没下发时 llm.base_url / api_key 都是 None,
+    # ProviderOverride 就是空的,工厂照样落回 settings —— 行为与改动前一致。
+    override = ProviderOverride(api_key=llm.api_key, base_url=llm.base_url)
+    # 温度同理:渠道给了就用渠道的,没给就用各 agent 调用点的硬编码值
+    # (hopper=0 / video_analyzer=0.2 / 其余 1)。
+    effective_temperature = llm.temperature if llm.temperature is not None else temperature
+
     if llm.provider == "anthropic":
-        return get_anthropic_llm(llm.model, temperature)
+        return get_anthropic_llm(llm.model, effective_temperature, override)
     elif llm.provider == "openai":
-        return get_openai_llm(llm.model, temperature)
+        return get_openai_llm(llm.model, effective_temperature, override)
     elif llm.provider == "google":
-        return get_google_llm(llm.model, temperature)
+        return get_google_llm(llm.model, effective_temperature, override)
     elif llm.provider == "vertexai":
-        return get_vertex_llm(llm.model, temperature)
+        return get_vertex_llm(llm.model, effective_temperature, override)
     elif llm.provider == "openrouter":
-        return get_openrouter_llm(llm.model, temperature)
+        return get_openrouter_llm(llm.model, effective_temperature, override)
     elif llm.provider == "xai":
-        return get_grok_llm(llm.model, temperature)
+        return get_grok_llm(llm.model, effective_temperature, override)
     elif llm.provider == "azure":
-        return get_azure_llm(llm.model, temperature)
+        return get_azure_llm(llm.model, effective_temperature, override)
     elif llm.provider == "minimax":
-        return get_minimax_llm(llm.model, temperature)
+        return get_minimax_llm(llm.model, effective_temperature, override)
     elif llm.provider == "deepseek":
-        return get_deepseek_llm(llm.model, temperature)
+        return get_deepseek_llm(llm.model, effective_temperature, override)
     elif llm.provider == "minitap":
         return get_minitap_llm(
             trace_id=ctx.trace_id,
             model=llm.model,
-            temperature=temperature,
+            temperature=effective_temperature,
             agent_name=name,
+            override=override,
         )
     else:
         raise ValueError(f"Unsupported provider: {llm.provider}")

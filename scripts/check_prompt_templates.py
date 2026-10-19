@@ -44,24 +44,17 @@ def _perception_variants() -> list[_Perception]:
 # 每个模板一条：渲染时调用方真实提供的变量。
 # 键是相对 AGENTS_DIR 的路径，值是基础变量表。
 TEMPLATE_VARS: dict[str, dict[str, object]] = {
-    # cortex.py:86
+    # cortex.py:164 —— 整段静态：目标/计划/feedback 已移到 messages，不再入模板。
     "cortex/cortex.md": {
         "platform": "android",
-        "initial_goal": "打开快手赚钱",
-        "subgoal_plan": ["subgoal-0"],
-        "current_subgoal": "subgoal-0",
-        "executor_feedback": "None.",
         "executor_tools_list": "tools",
         "locked_app_package": "com.ss.android.ugc.aweme",
         "perception": _Perception(),
     },
-    # 同上，load_cortex_prompt() 可以把模板换成 cortex.zh.md（提示词 A/B）
+    # 同上，load_cortex_prompt() 可以把模板换成 cortex.zh.md（提示词 A/B）；
+    # zh 与 en 结构保持逐块对应，变量也一致。
     "cortex/cortex.zh.md": {
         "platform": "android",
-        "initial_goal": "打开快手赚钱",
-        "subgoal_plan": ["subgoal-0"],
-        "current_subgoal": "subgoal-0",
-        "executor_feedback": "None.",
         "executor_tools_list": "tools",
         "locked_app_package": "com.ss.android.ugc.aweme",
         "perception": _Perception(),
