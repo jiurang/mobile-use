@@ -18,6 +18,7 @@ from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.thoughts_compaction import render_thoughts_history
 
 logger = get_logger(__name__)
 
@@ -67,7 +68,14 @@ class OrchestratorNode:
             initial_goal=state.initial_goal,
             subgoal_plan="\n".join(str(s) for s in state.subgoal_plan),
             subgoals_to_examine="\n".join(str(s) for s in subgoals_to_examine),
-            agent_thoughts="\n".join(state.agents_thoughts),
+            # 同样压缩：orchestrator 每次调用都带全量 thoughts，是仅次于 cortex
+            # 的第二大消费方（实测 122 轮任务里占 thoughts 总成本的 13%）。
+            # 压缩规则与 cortex 完全一致（同一个 render_thoughts_history），
+            # 所以两个 agent 看到的摘要形态相同，不会出现口径分裂。
+            agent_thoughts=render_thoughts_history(
+                state.agents_thoughts,
+                enabled=self.ctx.perception.thoughts_compaction,
+            ),
         )
         messages = [
             SystemMessage(content=system_message),

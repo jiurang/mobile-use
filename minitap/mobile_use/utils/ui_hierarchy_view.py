@@ -269,21 +269,25 @@ def _prune(nodes: list[_Node]) -> list[_Node]:
     return pruned
 
 
-def _render(nodes: list[_Node]) -> str:
+def _render(rows: list[dict]) -> str:
     lines = []
-    for index, node in enumerate(nodes, 1):
+    for index, row in enumerate(rows, 1):
         parts: list[str] = []
-        if node.label:
-            parts.append(json.dumps(node.label, ensure_ascii=False))
-        if node.rid:
-            parts.append(f"id={node.rid}")
-        if node.cls:
-            parts.append(node.cls)
-        if node.box:
-            x1, y1, x2, y2 = node.box
-            parts.append(f"({int(x1)},{int(y1)},{int(x2 - x1)}x{int(y2 - y1)})")
-        if node.flags:
-            parts.append(node.flags)
+        label = row.get("label") or ""
+        if label:
+            parts.append(json.dumps(label, ensure_ascii=False))
+        rid = row.get("resource_id") or ""
+        if rid:
+            parts.append(f"id={rid}")
+        cls = row.get("class_name") or ""
+        if cls:
+            parts.append(cls)
+        box = row.get("bounds")
+        if box:
+            parts.append(f"({box['x']},{box['y']},{box['width']}x{box['height']})")
+        flags = row.get("flags") or ""
+        if flags:
+            parts.append(flags)
         lines.append(f"[{index}] " + " ".join(parts))
     return "\n".join(lines)
 
@@ -308,6 +312,54 @@ def _looks_android(elements: list[dict]) -> bool:
     return any(signature & element.keys() for element in elements if isinstance(element, dict))
 
 
+def _node_to_dict(node: _Node) -> dict:
+    """`_Node` → 可序列化的 dict（bounds 用 x,y,width,height）。
+
+    坐标取整方式和 `_render` 原来的写法一致（`int()` 截断），所以
+    `normalize_hierarchy()` 渲染出来的块和改造前**逐字节相同**。
+    """
+    box = None
+    if node.box:
+        x1, y1, x2, y2 = node.box
+        box = {
+            "x": int(x1),
+            "y": int(y1),
+            "width": int(x2 - x1),
+            "height": int(y2 - y1),
+        }
+    return {
+        "label": node.label,
+        "resource_id": node.rid,
+        "class_name": node.cls,
+        "bounds": box,
+        "flags": node.flags,
+    }
+
+
+def normalize_hierarchy(elements: list[dict] | None) -> list[dict] | None:
+    """归一化 + 裁剪层级树，返回可复用的节点列表。
+
+    这是 `render_hierarchy_and_labels` 的内核，单独暴露出来是为了让
+    `utils/screen_elements.py` 能**基于同一份裁剪结果**建统一索引表 ——
+    渲染给模型的那张表和执行时反解用的那张表必须出自同一次裁剪，
+    否则行号会对不上。
+
+    返回 `None` 表示「形状不认识」（iOS / 云设备），调用方要退回原来的
+    原始 JSON dump —— 这一步不能猜，猜错就是静默剥夺别的平台的感知能力。
+
+    每个节点形如::
+
+        {"label": str, "resource_id": str, "class_name": str,
+         "bounds": {"x","y","width","height"} | None, "flags": str}
+    """
+    if not elements:
+        return []
+    if not _looks_android(elements):
+        return None
+    nodes = [node for node in (_normalize(e) for e in elements) if node is not None]
+    return [_node_to_dict(node) for node in _prune(nodes)]
+
+
 def render_hierarchy_and_labels(elements: list[dict] | None) -> tuple[str, set[str]]:
     """渲染层级树，**同时**返回真正进入 prompt 的那些 label。
 
@@ -326,24 +378,24 @@ def render_hierarchy_and_labels(elements: list[dict] | None) -> tuple[str, set[s
     if not elements:
         return "", set()
 
-    if not _looks_android(elements):
+    rows = normalize_hierarchy(elements)
+    if rows is None:
         logger.warning(
             "UI hierarchy has no Android accessibility attributes; "
             "falling back to the raw JSON dump"
         )
-        return "Here is the UI hierarchy:\n" + json.dumps(elements, indent=2, ensure_ascii=False), set()
+        return "Here is the UI hierarchy:\n" + json.dumps(
+            elements, indent=2, ensure_ascii=False
+        ), set()
 
-    nodes = [node for node in (_normalize(e) for e in elements) if node is not None]
-    kept = _prune(nodes)
-
-    labels = {_normalize_label(node.label) for node in kept if node.label}
+    labels = {_normalize_label(row["label"]) for row in rows if row["label"]}
     labels.discard("")
 
     logger.debug(
-        f"UI hierarchy: {len(elements)} raw nodes -> {len(nodes)} normalized "
-        f"-> {len(kept)} rendered (of which {len(labels)} distinct labels)"
+        f"UI hierarchy: {len(elements)} raw nodes -> {len(rows)} rendered "
+        f"(of which {len(labels)} distinct labels)"
     )
-    text = f"{_HEADER}\n{_render(kept)}" if kept else _HEADER + "\n(none)"
+    text = f"{_HEADER}\n{_render(rows)}" if rows else _HEADER + "\n(none)"
     return text, labels
 
 

@@ -14,14 +14,20 @@ ML Kit 是 Google 维护的 Android 原生 OCR，AAR 直接链进 APK，零 NDK 
 
 与 PaddleOCR 的行为差异
 --------------------
-1. **置信度语义不同。** ML Kit 的 ``Text.Element.getConfidence()`` 在部分情况下返回
+1. **置信度语义不同。** ML Kit 的 ``Text.Line.getConfidence()`` 在部分情况下返回
    ``0``（表示"没给"而不是"非常不可信"）。这里把 ``0`` 当作**未知**处理、回填成
-   ``1.0``，否则 ``config.rec_min_score``（默认 0.6）会把这些结果全滤成空数组 ——
-   而且滤掉的是本来正确的文字。用非 0 的分数则照常参与 ``rec_min_score`` 和
-   ``max_texts`` 的按分截断，与 PC 端 paddle_onnx 的行为对齐。
-2. **没有旋转多边形框。** ML Kit 给的是 ``Element.getBoundingBox()``（轴对齐矩形）
+   ``1.0``，否则分数过滤会把这些结果全滤成空数组 ——
+   而且滤掉的是本来正确的文字。用非 0 的分数则照常参与分数过滤和
+   ``max_texts`` 的按分截断。**过滤门槛另有自己的地板**（``MLKIT_MIN_SCORE``），
+   因为 ML Kit 的分数量纲比 Paddle 的 rec 分数低一档 —— 见该常量的注释。
+2. **没有旋转多边形框。** ML Kit 给的是 ``Line.getBoundingBox()``（轴对齐矩形）
    和 4 个 ``cornerPoints``；这里用 ``boundingBox`` 填 ``OcrText.bounds``，
    因为 ``OcrText`` 本来就只存轴对齐的 :class:`ElementBounds`。
+3. **粒度对齐。** Java 侧 ``MlKitOcr.java`` 取的是 **Line（行）级**，
+   不是 Element（词素）级 —— Element 会把中文一行切碎（``上午06:30`` →
+   ``|上午``，数字整个丢），真机实测碎片率 42% 对 PaddleOCR 的 28%。
+   行级与 PaddleOCR 的「det 出文本行框 → rec 整行」语义一致，下游的文本块
+   渲染和 OCR 框 IoU 校验都按行设计。
 
 本模块在 PC 上不可用：``from java import jclass`` 只存在于 Chaquopy 运行时。
 构造时抛 :class:`OcrDependenciesMissing`，由 ``registry.get_ocr_engine``
@@ -46,6 +52,33 @@ DEFAULT_TIMEOUT_MS = 10_000
 
 #: ML Kit 拿不到分数时的占位值。见模块 docstring 的差异 1。
 _UNKNOWN_SCORE = 1.0
+
+#: ML Kit 行级置信度的地板。
+#:
+#: **Paddle 的 rec 分数和 ML Kit 的行级置信度不是一个量纲。** 同一屏真机实测
+#: （MIUI 闹钟页）：Paddle 对读对的文字给 0.9+，而 ML Kit 的行级置信度对同样
+#: 的小字只给 0.39~0.50。拿通用的 ``rec_min_score``（默认 0.5）去比 ML Kit 的
+#: 分数，等于**用 Paddle 的尺子量 ML Kit 的尺子**。
+#:
+#: 真机实测代价（20 行里被丢掉 5 行）：
+#:
+#: ==========================  ======  ==================================
+#: 被丢掉的内容                分数    是不是真内容
+#: ==========================  ======  ==================================
+#: ``闹钟``                    0.50    是（底部标签页）
+#: ``|每天``                   0.49    是（第二条闹钟的重复标签）
+#: ``法定工作日|执饭``          0.39    是（09:40 那条闹钟的重复标签）
+#: ``|秒表``                   0.41    是（底部标签页）
+#: ``O``                       0.21    否，真垃圾
+#: ==========================  ======  ==================================
+#:
+#: 四条真内容被丢掉、只留下那条垃圾 —— 这不是「过滤噪声」，是**把信息藏起来**。
+#: 所以 ML Kit 用自己的地板 0.3：低于它的基本是噪声；高于它的即便分数低也留着，
+#: 宁可让模型看到一条带噪声前缀的短文本，也不要让它看不到这行字。
+#:
+#: 用户把 ``rec_min_score`` 配得更低时照用户来（取更严的那个）；配得更高时不生效，
+#: 因为那只会把 ML Kit 自己的量纲再放大一次。
+MLKIT_MIN_SCORE = 0.3
 
 
 class MlKitOcrEngine:
@@ -86,6 +119,10 @@ class MlKitOcrEngine:
 
         results: list[OcrText] = []
         unknown_scores = 0
+        dropped_by_score: list[str] = []
+        # ML Kit 的分数量纲与 Paddle 不同，用自己的地板（见 MLKIT_MIN_SCORE）。
+        # 用户配得更低时照用户来 —— 取更严的那个。
+        threshold = min(self._config.rec_min_score, MLKIT_MIN_SCORE)
         for item in payload:
             text = (item.get("text") or "").strip()
             if not text:
@@ -97,7 +134,11 @@ class MlKitOcrEngine:
                 # 0 在 ML Kit 里表示"没给分数"，不是"完全不可信"。
                 unknown_scores += 1
                 score = _UNKNOWN_SCORE
-            if score < self._config.rec_min_score:
+            if score < threshold:
+                # 丢掉的行要**说出来**。静默丢弃是这类问题最难查的形态：
+                # 引擎明明读到了（Java 侧日志有行数），prompt 里却没有，
+                # 两边对不上账时会误判成"识别少"。
+                dropped_by_score.append(f"{text[:30]!r}@{score:.2f}")
                 continue
             w = max(1, int(item.get("w", 0)))
             h = max(1, int(item.get("h", 0)))
@@ -118,6 +159,13 @@ class MlKitOcrEngine:
             logger.debug(
                 f"ML Kit returned no confidence for {unknown_scores}/{len(payload)} texts; "
                 "treated them as 1.0 so rec_min_score does not discard correct text"
+            )
+        if dropped_by_score:
+            logger.warning(
+                f"ML Kit OCR dropped {len(dropped_by_score)}/{len(payload)} texts below "
+                f"score {threshold} (rec_min_score={self._config.rec_min_score}, "
+                f"ML Kit floor={MLKIT_MIN_SCORE}): "
+                f"{'; '.join(dropped_by_score[:10])}"
             )
 
         # 按分数截断，与 paddle_onnx 一致；同分时保持 ML Kit 的阅读顺序稳定。

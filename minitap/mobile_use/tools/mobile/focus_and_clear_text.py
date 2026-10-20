@@ -14,7 +14,13 @@ from minitap.mobile_use.controllers.unified_controller import UnifiedMobileContr
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
-from minitap.mobile_use.tools.utils import focus_element_if_needed, move_cursor_to_end_if_bounds
+from minitap.mobile_use.tools.utils import (
+    check_failure_breaker,
+    focus_element_if_needed,
+    move_cursor_to_end_if_bounds,
+    record_target_failure,
+    resolve_target,
+)
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ui_hierarchy import (
     find_element_by_resource_id,
@@ -262,8 +268,47 @@ def get_focus_and_clear_text_tool(ctx: MobileUseContext) -> BaseTool:
             agent_thought: The thought of the agent.
             target: The target text field to clear.
         """
+        # 把 index / ocr_index 解析成具体的元素。索引优先于模型自己抄的字段 ——
+        # 它指向的是模型当时看到的那一行，id 和坐标都是代码给的。
+        target, index_error = resolve_target(state=state, target=target)
+        if index_error:
+            logger.warning(f"Clear target could not be resolved: {index_error}")
+
+        # 熔断：同一个目标连着失败过就别再试了（见 tap 里的同一段说明）。
+        breaker = check_failure_breaker(state=state, target=target)
+        if breaker:
+            logger.warning(f"Clear blocked by failure breaker: {breaker}")
+            agent_outcome = focus_and_clear_text_wrapper.on_failure_fn(breaker)
+            tool_message = ToolMessage(
+                tool_call_id=tool_call_id,
+                content=agent_outcome,
+                additional_kwargs={"error": breaker},
+                status="error",
+            )
+            return Command(
+                update=await state.asanitize_update(
+                    ctx=ctx,
+                    update={
+                        "agents_thoughts": [agent_thought, agent_outcome],
+                        EXECUTOR_MESSAGES_KEY: [tool_message],
+                        "failed_targets": record_target_failure(
+                            state=state, target=target, reason=breaker[:200]
+                        ),
+                    },
+                    agent="executor",
+                ),
+            )
+
         clearer = TextClearer(ctx, state)
         result = await clearer.clear_input_text(target=target)
+        if index_error and not result.success:
+            result = result.model_copy(
+                update={
+                    "error_message": f"{result.error_message} ({index_error})"
+                    if result.error_message
+                    else index_error
+                }
+            )
 
         agent_outcome = (
             focus_and_clear_text_wrapper.on_failure_fn(result.error_message)
@@ -286,6 +331,15 @@ def get_focus_and_clear_text_tool(ctx: MobileUseContext) -> BaseTool:
                 update={
                     "agents_thoughts": [agent_thought, agent_outcome],
                     EXECUTOR_MESSAGES_KEY: [tool_message],
+                    "failed_targets": (
+                        []
+                        if result.success
+                        else record_target_failure(
+                            state=state,
+                            target=target,
+                            reason=str(result.error_message or "clear failed")[:200],
+                        )
+                    ),
                 },
                 agent="executor",
             ),

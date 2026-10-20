@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import time
 from typing import Any, override
 
 from langchain_core.messages import AnyMessage, ToolCall, ToolMessage
@@ -14,6 +15,49 @@ from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 会**改变屏幕**的工具。只有这些工具之后才需要等屏幕沉降（见
+# `PerceptionConfig.settle_delay_ms`）：等笔记、读笔记、刻意等待都不算。
+#
+# `wait_for_delay` 不在列表里：等待本身就是在给屏幕时间，额外再等一遍是双倍。
+DEVICE_CHANGING_TOOLS = frozenset(
+    {
+        "tap",
+        "long_press_on",
+        "swipe",
+        "swipe_coordinates",
+        "swipe_percentages",
+        "press_key",
+        "back",
+        "launch_app",
+        "stop_app",
+        "open_link",
+        "focus_and_input_text",
+        "focus_and_clear_text",
+        "erase_one_char",
+    }
+)
+
+
+def _stamp_action(output: Any, tool_name: str) -> None:
+    """给「动过屏幕」的工具结果打上动作时刻。
+
+    打时间戳这件事放在这里，而不是 13 个工具文件里各写一遍：工具们各有各的
+    返回形状（Command / ToolMessage / 列表），在**执行完工具之后**统一处理，
+    才是唯一能保证「每个动屏动作都被记到」的位置。
+    """
+    if tool_name not in DEVICE_CHANGING_TOOLS:
+        return
+
+    now = time.time()
+    candidates = output if isinstance(output, list) else [output]
+    stamped = False
+    for item in candidates:
+        if isinstance(item, Command) and isinstance(item.update, dict):
+            item.update["last_action_at"] = now
+            stamped = True
+    if not stamped:
+        logger.debug(f"[executor] {tool_name} 未产生 state update，动作时刻没记上")
 
 
 class ExecutorToolNode(ToolNode):
@@ -103,6 +147,9 @@ class ExecutorToolNode(ToolNode):
                         message=f"Unexpected tool output type: {type(output)}",
                     )
                     failed = True
+                else:
+                    # 动过屏幕的动作要记时刻：contextor 靠它决定「要不要先等屏幕沉降」
+                    _stamp_action(output, call["name"])
 
             call_without_state = copy.deepcopy(call)
             if "args" in call_without_state and "state" in call_without_state["args"]:

@@ -76,7 +76,7 @@ IsReplan = bool
 
 
 class PerceptionConfig(BaseModel):
-    """三条感知通道的开关。三个默认全开。
+    """三条感知通道的开关 + 感知前的沉降等待。三个通道默认全开。
 
     关掉任何一条都是**纯粹减少**该通道带来的信息与开销，不会改变另外两条的
     行为：
@@ -92,6 +92,38 @@ class PerceptionConfig(BaseModel):
     ui_hierarchy: bool = True
     ocr: bool = True
     ocr_config: OcrConfig = Field(default_factory=OcrConfig)
+
+    # 动作之后的**沉降等待下限**（毫秒）。
+    #
+    # 含义不是「每轮固定等这么久」，而是「距离上一次动过屏幕的动作，
+    # 至少要过这么久才允许再抓一次屏幕」。没动过屏幕就不等。
+    #
+    # 为什么要它（2026-10-20 真机实测，Redmi Turbo 4）：
+    # 上滑换视频后，交互控件（like 按钮、评论区这些）是**延迟挂载**的 ——
+    # 实测新页面的 like 类 resource-id 在动作后 2.0s / 2.5s 才出现在层级树里。
+    # 抓早了会拿到一棵「控件还没挂上」的树，看起来像「这个按钮不存在」。
+    #
+    # 为什么默认 3s 而不是实测的 1~2s：控件挂载时间随 App 和机型浮动，
+    # 宁可多等 1s，也不要因为差 300ms 就抓了个半成品。
+    #
+    # 它是**下限**不是固定延迟：真机实测决策延迟中位 19.2s，所以绝大多数轮次
+    # 根本不会触发它（时间早就够了），它只在「动作后立刻就要再抓」的快路径上
+    # 起作用。配 0 就是关掉这个下限。
+    settle_delay_ms: int = Field(default=3000, ge=0)
+
+    # 是否压缩发给 LLM 的 thoughts 历史。
+    #
+    # 关掉 = 回到压缩前的行为（逐条原样重发）。这是回退开关，也是 A/B 的
+    # 对照组开关 —— 压缩必须能一键退回，否则线上出问题没法归因。
+    #
+    # 为什么默认开（2026-10-20 真机归档实测，exec 212，122 条真实 thoughts）：
+    # thoughts 是 cortex prompt 里唯一随轮次线性增长的段，末轮占整个 prompt
+    # 的 65%。压缩后末轮 prompt 降 40.3%、全链路 token 降 34.2%，且因为
+    # 压缩是**位置无关**的（前缀字节不变），前缀缓存命中率仍有 91.1%
+    # （基线 93.5%），满价重算反而比基线低 9.2%。
+    #
+    # 详见 doc/thoughts-compaction-plan.md。
+    thoughts_compaction: bool = True
 
 
 class MobileUseContext(BaseModel):

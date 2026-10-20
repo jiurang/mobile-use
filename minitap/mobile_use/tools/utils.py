@@ -12,7 +12,16 @@ from minitap.mobile_use.controllers.types import (
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.types import Target
+from minitap.mobile_use.utils.failed_targets import (
+    FailedTarget,
+    breaker_reason,
+    describe,
+    make_key,
+    record_failure,
+)
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.ocr_view import resolve_ocr_index
+from minitap.mobile_use.utils.screen_elements import ScreenElement, resolve_screen_index
 from minitap.mobile_use.utils.ui_hierarchy import (
     ElementBounds,
     Point,
@@ -23,6 +32,52 @@ from minitap.mobile_use.utils.ui_hierarchy import (
 )
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 失败账本：让「目标已经不在屏上了」这件事进到模型下一轮的上下文里，
+# 并在同一个目标连着失败时直接熔断（见 utils/failed_targets.py 的说明）。
+# ---------------------------------------------------------------------------
+
+
+def target_key(target: Target) -> str:
+    """给一个 target 算账本键：索引 + 元素身份。"""
+    return make_key(
+        index=target.index,
+        resource_id=target.resource_id,
+        label=target.text or None,
+    )
+
+
+def target_label(target: Target) -> str:
+    """给人看的目标描述。"""
+    return describe(target.index, target.resource_id, target.text)
+
+
+def check_failure_breaker(state: State, target: Target) -> str | None:
+    """这个目标是不是已经连着失败到阈值了？是就返回拒绝理由（None = 放行）。
+
+    熔断的理由不是「怕重复干活」，而是**重复点一个已经不在屏上的元素**：
+    它必然失败，而且每次都要白花一次 1.2s 的 live dump。模型如果一直在同一个
+    目标上打转，这层能把它顶回去，让它去重读屏幕、换一个现在还在的元素。
+    """
+    return breaker_reason(state.failed_targets, target_key(target))
+
+
+def record_target_failure(
+    state: State,
+    target: Target,
+    reason: str,
+) -> list[FailedTarget]:
+    """记一次失败，返回新的账本。"""
+    return record_failure(
+        state.failed_targets,
+        key=target_key(target),
+        index=target.index,
+        resource_id=target.resource_id,
+        label=target.text,
+        reason=reason,
+    )
 
 
 def find_element_by_text(
@@ -110,6 +165,12 @@ async def move_cursor_to_end_if_bounds(
     """
     Best-effort move of the text cursor near the end of the input by tapping the
     bottom-right area of the focused element (if bounds are available).
+
+    兜底链：resource_id → bounds → text。
+    每一级查不到都要**继续往下走**，不能直接返回 —— 尤其 resource_id 这一级：
+    executor 跑的时候 `state.latest_ui_hierarchy` 已经被 cortex 清空了
+    （工具侧走 controller 现取），所以按 id 查必然查不到。直接 return 的话，
+    后面那条真正管用的坐标分支永远走不到，「把光标移到末尾」就是死的。
     """
     if target.resource_id:
         if not elt:
@@ -118,17 +179,13 @@ async def move_cursor_to_end_if_bounds(
                 resource_id=target.resource_id,
                 index=target.resource_id_index,
             )
-        if not elt:
-            return None
-
-        bounds = get_bounds_for_element(elt)
-        if not bounds:
-            return elt
-
-        logger.debug("Tapping near the end of the input to move the cursor")
-        await tap_bottom_right_of_element(bounds=bounds, ctx=ctx)
-        logger.debug(f"Tapped end of input {target.resource_id}")
-        return elt
+        if elt:
+            bounds = get_bounds_for_element(elt)
+            if bounds:
+                logger.debug("Tapping near the end of the input to move the cursor")
+                await tap_bottom_right_of_element(bounds=bounds, ctx=ctx)
+                logger.debug(f"Tapped end of input {target.resource_id}")
+                return elt
 
     if target.bounds:
         await tap_bottom_right_of_element(target.bounds, ctx=ctx)
@@ -264,9 +321,83 @@ def has_valid_selectors(target: Target) -> bool:
     has_coordinates = target.bounds is not None
     has_resource_id = target.resource_id is not None and target.resource_id != ""
     has_text = target.text is not None and target.text != ""
-    # ocr_index 单独就能定位：它会还原成 bounds，OCR 行本身就是一个合法坐标来源
+    # index / ocr_index 单独就能定位：它们还原成一个带 bounds 的具体元素
+    has_index = target.index is not None
     has_ocr_index = target.ocr_index is not None
-    return has_coordinates or has_resource_id or has_text or has_ocr_index
+    return has_coordinates or has_resource_id or has_text or has_index or has_ocr_index
+
+
+def _apply_element(target: Target, element: ScreenElement) -> Target:
+    """把元素表里的一行填进 target 的兜底字段。
+
+    **索引优先于模型自己抄的字段**：索引指向的是模型当时看到的那一行，
+    坐标和 id 都是代码给的，不会抄错。
+    """
+    updates: dict = {"bounds": element.bounds}
+    if element.resource_id:
+        updates["resource_id"] = element.resource_id
+        if target.resource_id_index is None:
+            updates["resource_id_index"] = 0
+    # UI 行的可见文字放在 label 里，OCR 行的放在 text 里 —— 两个都能当文本定位。
+    visible_text = element.text or element.label
+    if visible_text:
+        updates["text"] = visible_text
+        if target.text_index is None:
+            updates["text_index"] = 0
+    return target.model_copy(update=updates)
+
+
+def resolve_target(state: State, target: Target) -> tuple[Target, str | None]:
+    """把 `target.index` / `target.ocr_index` 解析成具体的元素。
+
+    返回 `(解析后的 target, 错误信息)`。错误信息非空表示「模型给的索引用不了」，
+    调用方**必须**把它回给模型 —— 绝不能静默退化成「点别的地方」。
+
+    两条路径
+    --------
+    1. **有屏幕元素表**（Android，层级树能归一化）：`index` 和 `ocr_index`
+       都索引这张表，**同一个编号空间**。UI 行和 OCR 行都在里面。
+    2. **没有元素表**（iOS / 云设备，层级树形状不认识）：只有 `ocr_index`，
+       它索引 `latest_ocr_results`，这是改造前的行为，保持不变。
+    """
+    elements = state.latest_screen_elements or []
+
+    if target.index is not None:
+        element = resolve_screen_index(elements, target.index)
+        if element is None:
+            return target, (
+                f"index={target.index} is not a row in the screen element table"
+                + (f" (the table had {len(elements)} rows)" if elements else " (no table)")
+            )
+        return _apply_element(target, element), None
+
+    if target.ocr_index is not None:
+        if elements:
+            # 元素表世界：ocr_index 就是 index 的别名（一个编号空间）。
+            element = resolve_screen_index(elements, target.ocr_index)
+            if element is None:
+                return target, (
+                    f"ocr_index={target.ocr_index} is not a row in the screen element table"
+                    f" (the table had {len(elements)} rows)"
+                )
+            return _apply_element(target, element), None
+        # 老世界：没有元素表，ocr_index 索引的是 latest_ocr_results。
+        # 报错文案要跟改造前逐字一致 —— `tests/mobile_use/test_tap_ocr_index.py`
+        # 守着这些字样，模型也是靠它们知道索引错在哪。
+        ocr_results = state.latest_ocr_results
+        ocr_hit = resolve_ocr_index(ocr_results, target.ocr_index)
+        if ocr_hit is None:
+            if not ocr_results:
+                return target, "no OCR results available for this screen"
+            available = len(ocr_results)
+            return target, (
+                f"out of range; the OCR block had {available} line(s), "
+                f"valid range is 1..{available}"
+            )
+        # 连文本一起填上：工具回显时要用，模型才知道索引点到了什么。
+        return target.model_copy(update={"bounds": ocr_hit.bounds, "text": ocr_hit.text}), None
+
+    return target, None
 
 
 class IdSelectorRequest(BaseModel):

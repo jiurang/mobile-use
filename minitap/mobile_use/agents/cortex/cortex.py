@@ -29,9 +29,19 @@ from minitap.mobile_use.tools.index import (
 )
 from minitap.mobile_use.utils.conversations import get_screenshot_message_for_llm
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
+from minitap.mobile_use.utils.failed_targets import render_failures
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ocr_view import render_ocr_results
-from minitap.mobile_use.utils.ui_hierarchy_view import render_hierarchy_and_labels
+from minitap.mobile_use.utils.screen_elements import (
+    ScreenElement,
+    build_screen_elements,
+    render_screen_elements,
+)
+from minitap.mobile_use.utils.thoughts_compaction import render_thoughts_history
+from minitap.mobile_use.utils.ui_hierarchy_view import (
+    normalize_hierarchy,
+    render_hierarchy_and_labels,
+)
 
 logger = get_logger(__name__)
 
@@ -195,13 +205,25 @@ class CortexNode:
         # _parse() 再把这段中文当 JSON 解析 -> pydantic json_invalid -> 整个 goal 挂掉。
         # 压成单个 user 回合后，MiniMax-M3 的 tool_calls 实测恢复 2/2。
         # 见 v/probe_cortex_toolcall_ab.py、v/probe_cortex_history_len.py。
+        #
+        # 压缩：只压发给 LLM 的这份，state 里的原文不动（trace / TUI / steps_count /
+        # outputter 都要全量）。压的是 cortex 的散文，executor 工具结果和
+        # orchestrator 里程碑是**事实**，逐字保留。
+        #
+        # 关键：压缩是**位置无关**的（每条按同一条规则渲染），所以已经发出去的
+        # 字节永不改变 -> 追加语义保留 -> 前缀缓存不因压缩而击穿。
+        # 见 utils/thoughts_compaction.py 与 doc/thoughts-compaction-plan.md。
         thoughts = state.agents_thoughts
         if thoughts:
-            messages.append(
-                HumanMessage(
-                    content="Agent thoughts history (newest last):\n" + "\n".join(thoughts)
+            compaction_enabled = self.ctx.perception.thoughts_compaction
+            body = render_thoughts_history(thoughts, enabled=compaction_enabled)
+            header = "Agent thoughts history (newest last):"
+            if compaction_enabled:
+                header += (
+                    "\n(Older cortex reasoning is compressed to its first and last "
+                    "sentence. Executor results and subgoal milestones are verbatim.)"
                 )
-            )
+            messages.append(HumanMessage(content=header + "\n" + body))
 
         # 完成情况是**索引**、且排在 thoughts 之后：它每轮都可能变（子目标完成 /
         # 推进 / replan），但按**计划序**排列、在固定槽位上原地替换，不会有新行插到
@@ -210,6 +232,15 @@ class CortexNode:
         messages.append(
             HumanMessage(content="Subgoal status: " + render_subgoal_status(state.subgoal_plan))
         )
+
+        # 已失败的目标：模型下一轮最需要知道的一件事。
+        #
+        # 真机实测里，模型看到「目标不在屏上了」会误诊成「索引指错人了」，
+        # 然后在同一个目标上反复打转。这条把事实摆出来：这些目标已经没了，
+        # 别再用，换一个现在还在的元素。
+        failed_line = render_failures(state.failed_targets)
+        if failed_line:
+            messages.append(HumanMessage(content=failed_line))
 
         # 以下都是每轮必变的内容，必须排在最后。executor feedback 过去长在
         # system prompt 里，等于每轮把整段 system prompt 的缓存打掉。
@@ -222,18 +253,36 @@ class CortexNode:
         if device_state_lines:
             messages.append(HumanMessage(content="\n".join(device_state_lines)))
 
+        # ---- 感知块 ----
+        # Android 形状下，层级树和 OCR 合成**一张**带统一索引的表：
+        # 一个编号空间，模型报编号、代码反解，不再抄 id 和坐标。
+        # 层级树形状不认识时（iOS / 云设备）保持改造前的行为：原始 dump + 独立 OCR 块。
+        screen_elements: list[ScreenElement] = []
+        tree_rows: list[dict] | None = None
         if self.ctx.perception.ui_hierarchy and state.latest_ui_hierarchy:
-            # 这里只为省 token 做展示层裁剪；state.latest_ui_hierarchy 本身保持完整，
-            # 因为工具要拿它来解析 target。
-            tree_text, _ = render_hierarchy_and_labels(state.latest_ui_hierarchy)
-            if tree_text:
-                messages.append(HumanMessage(content=tree_text))
-        if self.ctx.perception.ocr and state.latest_ocr_results:
-            # 不去重：OCR 行的 [i] 是 Target.ocr_index 的取值，
-            # 剔掉任何一条都会让模型手里的行号和 results 的下标对不上。
-            ocr_text = render_ocr_results(state.latest_ocr_results)
-            if ocr_text:
-                messages.append(HumanMessage(content=ocr_text))
+            tree_rows = normalize_hierarchy(state.latest_ui_hierarchy)
+
+        if tree_rows is None:
+            if self.ctx.perception.ui_hierarchy and state.latest_ui_hierarchy:
+                legacy_tree_text, _ = render_hierarchy_and_labels(state.latest_ui_hierarchy)
+                if legacy_tree_text:
+                    messages.append(HumanMessage(content=legacy_tree_text))
+            if self.ctx.perception.ocr and state.latest_ocr_results:
+                # 不去重：OCR 行的 [i] 是 Target.ocr_index 的取值，
+                # 剔掉任何一条都会让模型手里的行号和 results 的下标对不上。
+                legacy_ocr_text = render_ocr_results(state.latest_ocr_results)
+                if legacy_ocr_text:
+                    messages.append(HumanMessage(content=legacy_ocr_text))
+        else:
+            screen_elements = build_screen_elements(
+                tree_rows=tree_rows,
+                ocr_results=(state.latest_ocr_results if self.ctx.perception.ocr else None),
+                foreground_package=state.focused_app_info,
+            )
+            screen_text = render_screen_elements(screen_elements)
+            if screen_text:
+                messages.append(HumanMessage(content=screen_text))
+
         if self.ctx.perception.screenshot and state.latest_screenshot:
             controller = create_device_controller(self.ctx)
             # 压缩是同步 PIL 操作，放到线程里避免阻塞事件循环。
@@ -286,6 +335,11 @@ class CortexNode:
             # 下一次 contextor 会整体覆盖它。
             # latest_ui_hierarchy 仍然清空 —— 它没有索引契约，
             # 工具侧走 controller.get_ui_elements() 现取即可。
+            # latest_screen_elements 同样不清空，而且理由更强：它**就是**
+            # 索引契约本身。Target.index 要还原成「模型当时看到的那一行」，
+            # 只有这一次裁剪的结果算数 —— 执行时重新 dump 再重新编号是不行的，
+            # 屏可能已经变了，编号会和模型看到的不一致。
+            "latest_screen_elements": screen_elements,
             "latest_screenshot": None,
             "focused_app_info": None,
             "device_date": None,

@@ -4,8 +4,8 @@ You read the current state of the {{ platform }} device and turn it into structu
 
 ## Rules (read first)
 
-1. **Read agent thoughts first.** Before any decision, review what worked, what failed, and where plan and reality disagree.
-2. **Never repeat a failed action.** Understand why it failed, then try what a human would do differently.
+1. **Read agent thoughts first.** Before any decision, review what worked, what failed, and where plan and reality disagree. Older cortex reasoning is compressed to its first and last sentence; executor results and subgoal milestones are verbatim. If a detail you need is not in the history, act on the current screen instead of guessing.
+2. **Never repeat a failed action.** Understand why it failed, then try what a human would do differently. If the executor says the element is **no longer on the screen**, the screen moved on (a page was left, a video finished) — re-read the screen and pick an element that is on it *now*. Do not report the same target again.
 3. **Isolate unpredictable actions.** `back`, `launch_app`, `stop_app`, `open_link` and navigation taps change the screen unpredictably. If your decision includes one, it must be the only action in that turn; wait for the new screen.
 4. **Complete goals only on observed evidence.** Never mark a goal done before executor feedback confirms success.
 5. **Data fidelity over helpfulness.** For any data task, transcribe content exactly as-is unless told otherwise.
@@ -14,7 +14,7 @@ You read the current state of the {{ platform }} device and turn it into structu
 
 Three channels; use only the enabled ones. They cover each other's blind spots:
 
-- **UI elements** — find by id, text or bounds. Blind to color, images, obscured elements and canvas text.
+- **UI elements** — find by index, id, text or bounds. Blind to color, images, obscured elements and canvas text.
 - **Screenshot** — overall picture and visual cues. No precise coordinates.
 - **OCR** — text the element tree misses. Boxes only, no resource-id.
 
@@ -28,48 +28,51 @@ Current channels:
 No element list and no screenshot: you have no visual perception. Say so in Decisions Reason instead of guessing.
 {% endif %}
 
-The element list is pruned: a missing element means nothing to act on, not nothing on screen.
+The screen element list is pruned: a missing element means nothing to act on, not nothing on screen.
 
 ## Element targeting
 
-One UI element per row: `[i] "text" id=... Type (x,y,WxH) flags`
+Everything addressable on this screen, one per row: `[i] "text" id=... Type (x,y,WxH) flags`
 
 ```
-[7] "Search" id=com.app:id/search_input EditText (91,2446,1038x137) F
+[7] "Search" id=search_input EditText (91,2446,1038x137) F
+[8] "热门" (160,128,96x128) C
 ```
 
-- `resource_id`: the full value after `id=`
+One table, one numbering. The leading `[i]` counts **every** row, whether it came
+from the element tree or from OCR text; rows without `id=` are OCR text.
+
+- `index`: the leading `[i]`, 1-based, used verbatim. **This alone is enough** — the tool looks the row up and taps it, so you never have to copy an id or coordinates.
+- `id=`: the tail of the resource-id (the package is omitted). It is only shown when the row has no text, or when the same text appears on several rows — then it tells them apart. It is a hint, not a selector.
 - `bounds`: `(x,y,WxH)` → `x`, `y`, `width`, `height`
 - `text`: the quoted text
 - `resource_id_index` / `text_index`: index among the same id / same text, 0-based
 - Flags: `C` clickable, `L` long-press, `F` focus, `K` checkbox, `S` selected, `R` scrollable (use its bounds for swipes)
 
 {% if perception.ocr %}
-OCR rows:
-
-- `ocr_index`: the leading `[i]`, 1-based, used verbatim
-- `text`: the quoted text
-- `bounds`: `(x,y,WxH)`
-- Trailing number is confidence; below ~0.8, check first
-- No resource-id: use `null` or omit
+OCR text lives in the same table under the same numbering. Those rows have no `id=`
+and no flags; the trailing number is the confidence — below ~0.8, check first.
 {% endif %}
 
-Fill in the target with every field you can observe:
+Fill in the target. `index` alone is enough and is the most reliable — prefer it.
+Fill the other fields only when you can actually observe them; they are the
+fallback for when an index cannot be used.
+
+**An index belongs to one screen.** The list is rebuilt and re-numbered every
+round, so `[48]` from the previous round may be a completely different element
+now. Always take the index from the list in *this* round. When a target is
+reported as gone, re-read the list and choose a different row — do not reuse
+the old number, and do not re-report a target that already failed.
 
 ```json
 {
   "target": {
-    "resource_id": "com.app:id/button",
-    "resource_id_index": 0,
-    "bounds": {"x": 100, "y": 200, "width": 50, "height": 50},
-    "text": "Submit",
-    "text_index": 0,
-    "ocr_index": 3
+    "index": 7
   }
 }
 ```
 
-Fallback order: id → bounds → text. On tap failure: "Out of bounds" means stale bounds; "No element found" means the screen changed. Adjust, don't retry blindly.
+Fallback order: index → id → bounds → text. On tap failure: "Out of bounds" means stale bounds; "no longer on the screen" means the screen changed underneath you — re-read it and pick something that is on it now.
 
 ## Tools
 
@@ -120,7 +123,7 @@ Form filling: before concluding a field is missing, scroll through the whole for
 **Output:**
 ```
 complete_subgoals_by_ids: ["subgoal-4-type-message"]
-Structured Decisions: "[{\"action\": \"tap\", \"target\": {\"resource_id\": \"com.whatsapp:id/send\", \"resource_id_index\": 0, \"bounds\": {\"x\": 950, \"y\": 1800, \"width\": 100, \"height\": 100}}}]"
+Structured Decisions: "[{\"action\": \"tap\", \"target\": {\"index\": 12}}]"
 Decisions Reason: Agent thoughts confirm typing succeeded. Completing typing subgoal based on observed evidence. Now tapping send with full target info.
 Goals Completion Reason: Executor feedback confirmed "Hello!" was entered successfully.
 ```

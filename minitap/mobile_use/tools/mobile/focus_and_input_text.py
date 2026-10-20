@@ -15,7 +15,13 @@ from minitap.mobile_use.controllers.controller_factory import create_device_cont
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
-from minitap.mobile_use.tools.utils import focus_element_if_needed, move_cursor_to_end_if_bounds
+from minitap.mobile_use.tools.utils import (
+    check_failure_breaker,
+    focus_element_if_needed,
+    move_cursor_to_end_if_bounds,
+    record_target_failure,
+    resolve_target,
+)
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ui_hierarchy import find_element_by_resource_id, get_element_text
 
@@ -61,9 +67,17 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
             text: The text to type.
             target: The target of the text input (if available).
         """
-        focus_method = await focus_element_if_needed(ctx=ctx, target=target)
-        if not focus_method:
-            error_message = "Failed to focus the text input element before typing."
+        # 把 index / ocr_index 解析成具体的元素。索引优先于模型自己抄的字段 ——
+        # 它指向的是模型当时看到的那一行，id 和坐标都是代码给的。
+        target, index_error = resolve_target(state=state, target=target)
+        if index_error:
+            logger.warning(f"Input target could not be resolved: {index_error}")
+
+        # 熔断：同一个目标连着失败过就别再试了（见 tap 里的同一段说明）。
+        breaker = check_failure_breaker(state=state, target=target)
+        if breaker:
+            logger.warning(f"Input blocked by failure breaker: {breaker}")
+            error_message = breaker
             tool_message = ToolMessage(
                 tool_call_id=tool_call_id,
                 content=focus_and_input_text_wrapper.on_failure_fn(text, error_message),
@@ -76,6 +90,34 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                     update={
                         "agents_thoughts": [agent_thought, error_message],
                         EXECUTOR_MESSAGES_KEY: [tool_message],
+                        "failed_targets": record_target_failure(
+                            state=state, target=target, reason=breaker[:200]
+                        ),
+                    },
+                    agent="executor",
+                ),
+            )
+
+        focus_method = await focus_element_if_needed(ctx=ctx, target=target)
+        if not focus_method:
+            error_message = "Failed to focus the text input element before typing."
+            if index_error:
+                error_message = f"{error_message} ({index_error})"
+            tool_message = ToolMessage(
+                tool_call_id=tool_call_id,
+                content=focus_and_input_text_wrapper.on_failure_fn(text, error_message),
+                additional_kwargs={"error": error_message},
+                status="error",
+            )
+            return Command(
+                update=await state.asanitize_update(
+                    ctx=ctx,
+                    update={
+                        "agents_thoughts": [agent_thought, error_message],
+                        EXECUTOR_MESSAGES_KEY: [tool_message],
+                        "failed_targets": record_target_failure(
+                            state=state, target=target, reason=error_message[:200]
+                        ),
                     },
                     agent="executor",
                 ),
@@ -123,6 +165,15 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                 update={
                     "agents_thoughts": [agent_thought, agent_outcome],
                     EXECUTOR_MESSAGES_KEY: [tool_message],
+                    "failed_targets": (
+                        []
+                        if result.ok
+                        else record_target_failure(
+                            state=state,
+                            target=target,
+                            reason=str(result.error or "input failed")[:200],
+                        )
+                    ),
                 },
                 agent="executor",
             ),

@@ -8,8 +8,10 @@ from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.ocr.types import OcrText
+from minitap.mobile_use.utils.failed_targets import FailedTarget
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.recorder import record_interaction
+from minitap.mobile_use.utils.screen_elements import ScreenElement
 
 logger = get_logger(__name__)
 
@@ -54,6 +56,40 @@ class State(BaseModel):
     latest_screenshot: Annotated[str | None, "Latest screenshot base64 of the device", take_last]
     focused_app_info: Annotated[str | None, "Focused app info", take_last]
     device_date: Annotated[str | None, "Date of the device", take_last]
+
+    # 屏幕元素表：UI 层级树 + OCR 文本合并后的统一索引表。
+    #
+    # 为什么它必须活到 executor：`Target.index` 要还原成「模型当时看到的那
+    # 个元素」，而索引只在**那一次裁剪**上成立。执行时重新 dump 再重新编号
+    # 是不行的 —— 屏可能已经变了，编号会和模型看到的不一致。
+    # 所以这张表和 `latest_ocr_results` 一样，cortex 不清空它。
+    latest_screen_elements: Annotated[
+        list[ScreenElement] | None,
+        "Screen element table (UI tree + OCR, one shared 1-based index)",
+        take_last,
+    ] = None
+
+    # 上一次「动过屏幕」的动作发生在什么时候（epoch 秒）。
+    #
+    # contextor 用它算「距离上一个动作多久了」：不够久就先等一等再抓屏。
+    # 真机实测换页后新控件要 1~2s 才挂上，抓早了会拿到一棵控件没挂全的树。
+    # 只有真的动过屏幕的动作才记时间 —— 记笔记之类的动作不记。
+    last_action_at: Annotated[
+        float | None,
+        "Epoch seconds when the last screen-changing action was dispatched",
+        take_last,
+    ] = None
+
+    # 连续失败的目标账本（见 utils/failed_targets.py）。
+    #
+    # 它同时是**熔断器**和**提示词素材**：连着失败同一目标到阈值后，工具
+    # 不再执行它（避免原地打转、也避免点了别的东西）；下一轮提示词里会把
+    # 这些目标列出来，告诉模型「这些已经不在屏上了，不要再用」。
+    failed_targets: Annotated[
+        list[FailedTarget],
+        "Consecutive failed targets (the last one may be blocking further attempts)",
+        take_last,
+    ] = []
 
     # cortex related keys
     structured_decisions: Annotated[

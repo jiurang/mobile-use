@@ -8,7 +8,7 @@ real graph so that any such drift fails here when langgraph is bumped.
 
 import asyncio
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
@@ -27,6 +27,8 @@ class _State(TypedDict):
     executor_messages: Annotated[list, add_messages]
     agents_thoughts: Annotated[list[str], operator.add]
     marker: str
+    # NotRequired：工具注入的是整份 state，缺这个键时不能算 schema 错误
+    last_action_at: NotRequired[float]
 
 
 def _command(tool_call_id: str, ok: bool, thought: str) -> Command:
@@ -136,3 +138,61 @@ def test_tool_returning_a_list_with_a_failure_aborts_the_rest():
         ("c1", "error", "boom"),
         ("c2", "error", "Aborted: a previous tool call failed!"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# 动过屏幕的动作要记下时刻（感知前的沉降等待靠它）
+# ---------------------------------------------------------------------------
+
+
+@tool
+async def tap(
+    agent_thought: str,
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    state: Annotated[_State, InjectedState],
+) -> Command:
+    """A screen-changing tool."""
+    return _command(tool_call_id, True, agent_thought)
+
+
+@tool
+async def save_note(
+    agent_thought: str,
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    state: Annotated[_State, InjectedState],
+) -> Command:
+    """A bookkeeping tool: it does not touch the screen."""
+    return _command(tool_call_id, True, agent_thought)
+
+
+def _run_stamp(tool_calls: list[dict]) -> dict:
+    graph = StateGraph(_State)
+    graph.add_node(
+        "executor_tools",
+        ExecutorToolNode(tools=[tap, save_note], messages_key=KEY),
+    )
+    graph.add_edge(START, "executor_tools")
+    graph.add_edge("executor_tools", END)
+    app = graph.compile()
+    return asyncio.run(
+        app.ainvoke(
+            {
+                KEY: [AIMessage(content="", tool_calls=tool_calls)],
+                "agents_thoughts": [],
+                "marker": "STATE",
+            }
+        )
+    )
+
+
+def test_a_screen_changing_tool_stamps_the_action_time():
+    """tap 之后必须留下动作时刻，否则感知前的沉降等待无从判断。"""
+    out = _run_stamp([_call("tap", 1)])
+    assert out.get("last_action_at") is not None
+    assert out["last_action_at"] > 0
+
+
+def test_a_bookkeeping_tool_does_not_stamp_the_action_time():
+    """记笔记不动屏幕 —— 记了会让感知白等一次。"""
+    out = _run_stamp([_call("save_note", 1)])
+    assert out.get("last_action_at") is None

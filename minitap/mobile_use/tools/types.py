@@ -8,6 +8,15 @@ class Target(BaseModel):
     A comprehensive locator for a UI element, supporting a fallback mechanism.
     """
 
+    index: int | None = Field(
+        None,
+        description=(
+            "The 1-based [i] of a row in the 'Screen elements' block, used verbatim. "
+            "One numbering covers both the element tree and the OCR text, so an "
+            "index alone identifies the element - the model never has to copy a "
+            "resource-id or coordinates."
+        ),
+    )
     resource_id: str | None = Field(None, description="The resource-id of the element.")
     resource_id_index: int | None = Field(
         None,
@@ -25,9 +34,9 @@ class Target(BaseModel):
     ocr_index: int | None = Field(
         None,
         description=(
-            "The 1-based [i] of a line in the 'Text on screen (OCR)' block, used verbatim. "
-            "Resolves to that line's bounds, so it works for text the accessibility tree "
-            "cannot see (video captions, canvas/surface content, custom-drawn UI). "
+            "Legacy: the 1-based [i] of a line in the 'Text on screen (OCR)' block. "
+            "When a screen element table is present it is an alias of `index`; "
+            "otherwise it indexes the OCR results directly. "
             "Do NOT confuse it with text_index/resource_id_index: those are 0-based and "
             "index the accessibility tree, not the OCR block."
         ),

@@ -250,6 +250,34 @@ class TestMoveCursorToEndIfBounds:
 
         assert result is None
 
+    @patch("minitap.mobile_use.tools.utils.tap")
+    @patch("minitap.mobile_use.tools.utils.find_element_by_resource_id")
+    def test_move_cursor_falls_through_to_bounds_when_id_lookup_fails(
+        self, mock_find_element, mock_tap, mock_context, mock_state
+    ):
+        """按 id 查不到时必须**继续走坐标分支**，不能直接放弃。
+
+        executor 跑的时候 `state.latest_ui_hierarchy` 已经被 cortex 清空了，
+        所以按 resource_id 查必然查不到。以前这里直接 return None，
+        「把光标移到末尾」就死了 —— 索引寻址更是每次都带着 resource_id，
+        一定会踩到这条。
+        """
+        mock_find_element.return_value = None
+
+        target = Target(
+            resource_id="com.example:id/text_input",
+            resource_id_index=0,
+            text=None,
+            text_index=None,
+            bounds=ElementBounds(x=100, y=200, width=300, height=50),
+        )
+        result = asyncio.run(
+            move_cursor_to_end_if_bounds(ctx=mock_context, state=mock_state, target=target)
+        )
+
+        assert mock_tap.called
+        assert result is None
+
 
 class TestFocusElementIfNeeded:
     """Test cases for focus_element_if_needed function."""

@@ -36,6 +36,16 @@ class ContextorNode:
     async def __call__(self, state: State):
         device_controller = create_device_controller(self.ctx)
 
+        # ---- 屏幕沉降等待（动作后至少等这么久才抓屏）----
+        #
+        # 上滑换页之后，交互控件是**延迟挂载**的：实测新页面的 like 类
+        # resource-id 在动作后 2.0s / 2.5s 才出现在层级树里。抓早了会拿到
+        # 一棵「控件还没挂上」的树，看起来像「这个按钮不存在」。
+        #
+        # 它是**下限**不是固定延迟：距离上一个动屏动作已经够久时（真机实测
+        # 决策延迟中位 19.2s，绝大多数轮次都属于这种情况）一个字都不等。
+        await self._wait_for_settle(state)
+
         # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。
         # dump_hierarchy 真机要 ~1.2s，OCR 只要 ~0.4s，截图一到位就开始，
         # 整段推理藏进 dump 的等待窗口里，关键路径不增加。
@@ -107,6 +117,27 @@ class ContextorNode:
             },
             agent="contextor",
         )
+
+    async def _wait_for_settle(self, state: State) -> float:
+        """抓屏之前，等屏幕沉降到配置的下限。
+
+        返回实际等待的秒数（0 表示没等）。
+        """
+        delay_ms = self.ctx.perception.settle_delay_ms
+        if delay_ms <= 0 or state.last_action_at is None:
+            return 0.0
+
+        elapsed = time.time() - state.last_action_at
+        remaining = delay_ms / 1000.0 - elapsed
+        if remaining <= 0:
+            return 0.0
+
+        logger.info(
+            f"Waiting {remaining:.1f}s for the screen to settle "
+            f"(last action was {elapsed:.1f}s ago, floor is {delay_ms}ms)"
+        )
+        await asyncio.sleep(remaining)
+        return remaining
 
     def _resolve_ocr_engine(self, screenshot_base64: str | None) -> OcrEngine | None:
         """OCR 的开关 + 可用性检查。两条执行路径共用。"""

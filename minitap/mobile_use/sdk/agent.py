@@ -1217,6 +1217,7 @@ class Agent:
             subgoal_plan=[],
             latest_ui_hierarchy=None,
             latest_ocr_results=None,
+            latest_screen_elements=None,
             latest_screenshot=None,
             focused_app_info=None,
             device_date=None,

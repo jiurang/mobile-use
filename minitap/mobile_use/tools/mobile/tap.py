@@ -12,11 +12,19 @@ from minitap.mobile_use.controllers.unified_controller import UnifiedMobileContr
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.ocr.types import OcrText
 from minitap.mobile_use.tools.bounds_validation import coordinates_look_like_hierarchy_derived
+from minitap.mobile_use.tools.live_target import resolve_live_bounds_by_id
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
-from minitap.mobile_use.tools.utils import has_valid_selectors, validate_coordinates_bounds
+from minitap.mobile_use.tools.utils import (
+    check_failure_breaker,
+    has_valid_selectors,
+    record_target_failure,
+    resolve_target,
+    target_label,
+    validate_coordinates_bounds,
+)
+from minitap.mobile_use.utils.failed_targets import FailedTarget
 from minitap.mobile_use.utils.logger import get_logger
-from minitap.mobile_use.utils.ocr_view import resolve_ocr_index
 
 logger = get_logger(__name__)
 
@@ -41,38 +49,41 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
         attempts: list[dict] = []
         success = False
         successful_selector: str | None = None
+        blocked = False
 
         controller = UnifiedMobileController(ctx)
 
-        # 0. Reduce ocr_index to concrete bounds BEFORE anything else.
+        # 0. 把 index / ocr_index 解析成具体的元素 BEFORE anything else.
         #
-        # `ocr_index` is the 1-based [i] printed in the OCR block, so it resolves
-        # against the very list the model was shown (state.latest_ocr_results is
-        # deliberately kept alive by cortex for exactly this). A resolved OCR box is
-        # a legitimate coordinate source, so it enters the same chain as an
-        # explicit bounds below and goes through the same validation.
+        # 索引优先于模型自己抄的坐标 —— 它指向的是模型当时看到的那一行，
+        # 坐标和 id 都是代码给的，不会抄错（实测手抄的坐标有 16.8% 直接越界）。
+        # 解析不了就把原因记进 attempts，让模型知道是索引错了，
+        # 而不是让工具在别的地方乱点一下。
         ocr_texts: list[OcrText] | None = state.latest_ocr_results or None
-        ocr_hit: OcrText | None = None
-        if target.ocr_index is not None:
-            ocr_hit = resolve_ocr_index(ocr_texts, target.ocr_index)
-            if ocr_hit is None:
-                # Out of range / no OCR data. Never silently tap something else:
-                # say exactly why the index could not be used and keep going with
-                # whatever else the target carries.
-                available = len(ocr_texts) if ocr_texts else 0
-                attempts.append(
-                    {
-                        "selector": f"ocr_index={target.ocr_index}",
-                        "error": (
-                            "no OCR results available for this screen"
-                            if not ocr_texts
-                            else f"out of range; the OCR block had {available} line(s), "
-                            f"valid range is 1..{available}"
-                        ),
-                    }
-                )
-            else:
-                target = target.model_copy(update={"bounds": ocr_hit.bounds})
+        target, index_error = resolve_target(state=state, target=target)
+        if index_error:
+            logger.warning(f"Tap target could not be resolved: {index_error}")
+            attempts.append(
+                {
+                    "selector": (
+                        f"index={target.index}"
+                        if target.index is not None
+                        else f"ocr_index={target.ocr_index}"
+                    ),
+                    "error": index_error,
+                }
+            )
+
+        # 0.5 熔断：同一个目标已经连着失败过，就别再点它了。
+        #
+        # 真机实测里点击失败几乎全是「目标已经不在屏上了」。模型此时如果
+        # 继续报同一个目标，注定再失败一次，还要白花一次 1.2s 的 live dump。
+        # 这里直接顶回去，并要求它重读屏幕、换一个现在还在的元素。
+        breaker = check_failure_breaker(state=state, target=target)
+        if breaker:
+            logger.warning(f"Tap blocked by failure breaker: {breaker}")
+            blocked = True
+            attempts.append({"selector": target_label(target), "error": breaker})
 
         # Validate target has at least one selector
         if not has_valid_selectors(target):
@@ -81,19 +92,63 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                     "selector": "none",
                     "error": (
                         "No valid selector provided "
-                        "(need bounds, resource_id, text, or ocr_index)"
+                        "(need index, bounds, resource_id, text, or ocr_index)"
                     ),
                 }
             )
 
-        # 1. Try with COORDINATES FIRST (visual approach)
-        if not success and target.bounds:
+        # 1. 有 resource_id → 按**身份**在当屏重新定位它，再点它的当前位置。
+        #
+        #    这一步取代了「坐标 + IoU 门限」。门限当初防的是「模型从缩放后的
+        #    截图上目测坐标」，那个前提已经不存在了：截图通道在所有实际运行里
+        #    都是关的，模型现在只报索引、坐标由代码给，一个字都不用抄。
+        #
+        #    按身份找没有门限就没有误伤；屏变了（元素移动、动画）也无所谓 ——
+        #    找的是同一个元素的**新位置**，而不是拿旧坐标去赌。
+        if not success and not blocked and target.resource_id:
+            live_bounds, why = await resolve_live_bounds_by_id(
+                ctx=ctx,
+                resource_id=target.resource_id,
+                index=target.resource_id_index or 0,
+                hint=target.bounds,
+            )
+            if live_bounds is None:
+                logger.warning(f"Target is not on the current screen: {why}")
+                attempts.append({"selector": f"resource_id={target.resource_id}", "error": why})
+            else:
+                center = live_bounds.get_center()
+                selector_info = (
+                    f"resource_id='{target.resource_id}' -> coordinates ({center.x}, {center.y})"
+                )
+                try:
+                    logger.info(f"Attempting tap with {selector_info}")
+                    result = await controller.tap_at(x=center.x, y=center.y)
+                    if result.error is None:
+                        success = True
+                        successful_selector = selector_info
+                    else:
+                        logger.warning(f"Tap with {selector_info} failed: {result.error}")
+                        attempts.append({"selector": selector_info, "error": result.error})
+                except Exception as e:
+                    logger.warning(f"Exception during tap with {selector_info}: {e}")
+                    attempts.append({"selector": selector_info, "error": str(e)})
+
+        # 2. 没有 resource_id（OCR 行，实测只占模型点击的 4%）但有坐标 → 位置校验。
+        #
+        #    OCR 文本**不在层级树里**（它就是「树里没有的可见文字」），没有 id
+        #    可查，只能靠几何判据确认「这一小块地方现在还是那段文字」。
+        #    也不能改成按文本重匹配：OCR 的**内容会变**（点赞数在跳、时钟在走），
+        #    位置比内容稳。
+        if not success and not blocked and target.bounds and not target.resource_id:
             center = target.bounds.get_center()
-            if ocr_hit is not None:
+            if target.index is not None:
                 # Echo what actually got tapped so the agent can see the mapping
                 # instead of trusting an opaque index.
+                selector_info = f"index={target.index} coordinates ({center.x}, {center.y})"
+            elif target.ocr_index is not None:
+                # 回显命中的文本，模型能看见索引到底点到了什么
                 selector_info = (
-                    f"ocr_index={target.ocr_index} text='{ocr_hit.text}' "
+                    f"ocr_index={target.ocr_index} text='{target.text}' "
                     f"coordinates ({center.x}, {center.y})"
                 )
             else:
@@ -116,7 +171,18 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                 )
                 if not derived_ok:
                     logger.warning(f"Coordinates rejected: {derived_reason}")
-                    attempts.append({"selector": selector_info, "error": derived_reason})
+                    reason = derived_reason
+                    if target.index is not None:
+                        # 索引指向的是「模型看到的那一行」。校验不过，说明那一行的
+                        # 坐标和**当屏**对不上 —— 屏变了（动画/跳转/列表刷新），
+                        # 或者那一行的坐标本来就不可信。这两件事模型必须知道，
+                        # 否则它只会把同一个索引原样再报一遍。
+                        reason = (
+                            f"{derived_reason} (this target came from screen element "
+                            f"index {target.index}; the screen may have changed since "
+                            f"it was read — re-read the screen and use a fresh index)"
+                        )
+                    attempts.append({"selector": selector_info, "error": reason})
                 else:
                     try:
                         center_point = target.bounds.get_center()
@@ -133,28 +199,9 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                         logger.warning(f"Exception during tap with {selector_info}: {e}")
                         attempts.append({"selector": selector_info, "error": str(e)})
 
-        # 2. If coordinates failed or weren't provided, try with resource_id
-        if not success and target.resource_id:
-            selector_info = f"resource_id='{target.resource_id}' (index={target.resource_id_index})"
-            try:
-                logger.info(f"Attempting tap with {selector_info}")
-                result = await controller.tap_element(
-                    resource_id=target.resource_id,
-                    index=target.resource_id_index or 0,
-                )
-                if result.error is None:
-                    success = True
-                    successful_selector = selector_info
-                else:
-                    error_msg = result.error
-                    logger.warning(f"Tap with {selector_info} failed: {error_msg}")
-                    attempts.append({"selector": selector_info, "error": error_msg})
-            except Exception as e:
-                logger.warning(f"Exception during tap with {selector_info}: {e}")
-                attempts.append({"selector": selector_info, "error": str(e)})
-
-        # 3. If resource_id failed or wasn't provided, try with text (last resort)
-        if not success and target.text:
+        # 3. If the element wasn't found by id and there's no usable geometry,
+        #    try with text (last resort)
+        if not success and not blocked and target.text:
             selector_info = f"text='{target.text}' (index={target.text_index})"
             try:
                 logger.info(f"Attempting tap with {selector_info}")
@@ -176,10 +223,17 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
         # Build result message
         if success:
             agent_outcome = tap_wrapper.on_success_fn(successful_selector)
+            # 成功即清账：模型已经换了目标，「连续失败」这件事到此为止。
+            failed_targets: list[FailedTarget] = []
         else:
             # Build detailed failure message with all attempts
             failure_details = "; ".join([f"{a['selector']}: {a['error']}" for a in attempts])
             agent_outcome = tap_wrapper.on_failure_fn(failure_details)
+            failed_targets = record_target_failure(
+                state=state,
+                target=target,
+                reason=failure_details[:200],
+            )
 
         tool_message = ToolMessage(
             tool_call_id=tool_call_id,
@@ -193,6 +247,7 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                 update={
                     "agents_thoughts": [agent_thought, agent_outcome],
                     EXECUTOR_MESSAGES_KEY: [tool_message],
+                    "failed_targets": failed_targets,
                 },
                 agent="executor",
             ),
