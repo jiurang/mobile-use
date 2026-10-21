@@ -144,9 +144,36 @@ async def _invoke_cortex(
         and response.decisions_reason is None
         and response.goals_completion_reason is None
         and not response.complete_subgoals_by_ids
+        # 「我要图」也是一个**合法**的应答：它没有决策，但它要的是**再问一次**，
+        # 不是错误。少了这个判断，on_demand 模式下模型每次要图都会在这里抛
+        # "empty response"，整轮失败、agent 白烧步数（真机实测 51 步没跑完）。
+        and not response.need_screenshot
     ):
         raise ValueError("Cortex LLM returned an empty response")
     return response
+
+
+def should_request_screenshot(
+    response: CortexOutput,
+    *,
+    on_demand: bool,
+    has_screenshot: bool,
+) -> bool:
+    """模型说「看不清」时，要不要补一张图、同一轮再问一次。
+
+    三个条件缺一不可：
+
+    - `on_demand` —— 只有按需模式才有这个流程（每轮都带图的老模式不需要）。
+    - `has_screenshot` —— 手上得有图可补；contextor 没抓到就补不了。
+    - `not response.decisions` —— **模型已经给出动作就别补图**。它既然能给出
+      动作，说明它其实判得出来（或者决定先动手），这时候塞一张图只会打乱
+      它的判断，还多花一次调用。
+
+    单独抽成纯函数是为了能单测 —— 这条分支是 ③ 的全部行为。
+    """
+    return bool(
+        on_demand and has_screenshot and response.need_screenshot and not response.decisions
+    )
 
 
 class CortexNode:
@@ -182,19 +209,13 @@ class CortexNode:
         # 越靠前的块越稳定，能被前缀缓存覆盖的公共前缀就越长。
         messages: list[BaseMessage] = [
             SystemMessage(content=system_message),
-            # 任务内恒定 / 只追加：设备基本信息、目标、计划日志（骨架，最后一版为
-            # 当前计划）。子目标本身（ID + 描述）就在这里 —— 两次 replan 之间逐字节
-            # 不变，replan 时也只是**尾部追加**一段，所以这块永远只追加，不会击穿
-            # 后面的 thoughts。会变的完成情况不放在这里，见 thoughts 之后的索引。
+            # 任务内恒定：设备基本信息、目标。这块逐字节不变，永远是前缀的一部分。
             HumanMessage(
                 content="\n".join(
                     [
                         "Here are my device info:",
                         self.ctx.device.to_str().rstrip(),
                         f"Initial goal: {state.initial_goal}",
-                        "Subgoal plan (append-only history; "
-                        "the last PLAN section is the active one):",
-                        state.subgoal_plan_log or "(no plan)",
                     ]
                 )
             ),
@@ -225,6 +246,33 @@ class CortexNode:
                 )
             messages.append(HumanMessage(content=header + "\n" + body))
 
+        # 计划日志（子目标的 ID + 描述）排在 thoughts **之后**。
+        #
+        # 为什么不能放在 thoughts 前面
+        # --------------------------
+        # 计划日志是**只追加**的：replan 时尾部追加一段 "PLAN vN"，旧段一字不改。
+        # 但「只追加」不等于「不击穿」—— 只要它排在 thoughts 前面，追加点之后的
+        # 全部重算，而 thoughts 恰恰在它后面。
+        #
+        # 实测（2026-10-21，MiniMax M3.1-Flash 真 API，122 条 thoughts）：
+        #   计划日志在 thoughts 前 -> replan 当轮 cached 2,329，满价重算 8,261
+        #   计划日志在 thoughts 后 -> replan 当轮 cached 10,411，满价重算 183
+        # 一次 replan 差 8,078 token，而这个差随 thoughts 变长而变大。
+        #
+        # 挪到 thoughts 之后的代价：thoughts 每轮增长，断点落在 thoughts 末尾，
+        # 于是「计划日志 + 尾部块」每轮要满价重算一次（约 150 + 500 token）。
+        # 摊到一次 replan 上（省 8,000+）是划算的，而且 replan 越多越划算。
+        #
+        # 语义没变：内容与之前逐字相同，只是从 head 块里拆出来独立成一条消息，
+        # 「最后一段 PLAN 是当前计划」这句话依然成立。
+        messages.append(
+            HumanMessage(
+                content="Subgoal plan (append-only history; "
+                "the last PLAN section is the active one):\n"
+                + (state.subgoal_plan_log or "(no plan)")
+            )
+        )
+
         # 完成情况是**索引**、且排在 thoughts 之后：它每轮都可能变（子目标完成 /
         # 推进 / replan），但按**计划序**排列、在固定槽位上原地替换，不会有新行插到
         # 行中间。放在 thoughts 后面，它怎么变都不会碰到 thoughts 那段唯一增长的前缀。
@@ -250,6 +298,17 @@ class CortexNode:
             device_state_lines.append(f"Device date: {state.device_date}")
         if state.focused_app_info:
             device_state_lines.append(f"Focused app info: {state.focused_app_info}")
+        if state.screen_state == "off":
+            # 屏幕灭着的时候，截图是全黑的、元素表里只剩 systemui 的残留 ——
+            # 模型看到的是「屏上什么都没有」。不告诉它，它就会在黑屏上反复
+            # 尝试（2026-10-21 真机实测：30 分钟息屏超时让一个任务从 30 步涨到
+            # 51 步还没跑完）。
+            device_state_lines.append(
+                "Screen is OFF (the device is asleep). The screenshot is black and the "
+                "element list only holds systemui leftovers, so there is nothing to "
+                "act on. Call wake_screen FIRST, then read the screen again on the "
+                "next turn."
+            )
         if device_state_lines:
             messages.append(HumanMessage(content="\n".join(device_state_lines)))
 
@@ -283,13 +342,29 @@ class CortexNode:
             if screen_text:
                 messages.append(HumanMessage(content=screen_text))
 
-        if self.ctx.perception.screenshot and state.latest_screenshot:
+        perception = self.ctx.perception
+        # 截图通道三态：True=每轮都带 / False=不带 / "on_demand"=模型要才给。
+        on_demand_screenshot = perception.screenshot == "on_demand"
+        always_screenshot = perception.screenshot is True
+
+        async def append_screenshot() -> None:
+            """把当前屏幕的截图追加到 messages 末尾。
+
+            用的是 `state.latest_screenshot` —— 那是 contextor 刚抓的当屏截图。
+            cortex 决策时 executor 还没动过屏幕，所以它就是**当前**画面，
+            不用重抓（重抓会多花一次 adb 往返，还可能拿到不同帧）。
+            """
+            if not state.latest_screenshot:
+                return
             controller = create_device_controller(self.ctx)
             # 压缩是同步 PIL 操作，放到线程里避免阻塞事件循环。
             compressed_image_base64 = await asyncio.to_thread(
                 controller.get_compressed_b64_screenshot, state.latest_screenshot
             )
             messages.append(get_screenshot_message_for_llm(compressed_image_base64))
+
+        if always_screenshot:
+            await append_screenshot()
 
         llm = get_llm(ctx=self.ctx, name="cortex", temperature=1).with_structured_output(
             CortexOutput
@@ -298,12 +373,29 @@ class CortexNode:
             ctx=self.ctx, name="cortex", use_fallback=True, temperature=1
         ).with_structured_output(CortexOutput)
         known_subgoal_ids = {subgoal.id for subgoal in state.subgoal_plan}
-        response: CortexOutput = await with_fallback(
-            main_call=lambda: _invoke_cortex(llm, messages, self.ctx, known_subgoal_ids),
-            fallback_call=lambda: _invoke_cortex(
-                llm_fallback, messages, self.ctx, known_subgoal_ids, used_fallback=True
-            ),
-        )
+
+        async def ask_cortex() -> CortexOutput:
+            return await with_fallback(
+                main_call=lambda: _invoke_cortex(llm, messages, self.ctx, known_subgoal_ids),
+                fallback_call=lambda: _invoke_cortex(
+                    llm_fallback, messages, self.ctx, known_subgoal_ids, used_fallback=True
+                ),
+            )
+
+        response: CortexOutput = await ask_cortex()
+
+        # 按需取图：模型说「元素表和 OCR 不够用」→ 补一张图，**同一轮**再问一次。
+        #
+        # 为什么要同一轮：多一轮往返意味着多一次完整的 LLM 调用（prompt 更大、
+        # 还要重算一次），比每轮都带图更贵。同一轮内补图只有真正需要图的那
+        # 少数轮次才多花这一次。
+        if should_request_screenshot(
+            response,
+            on_demand=on_demand_screenshot,
+            has_screenshot=bool(state.latest_screenshot),
+        ):
+            await append_screenshot()
+            response = await ask_cortex()
 
         valid_subgoal_ids = response.complete_subgoals_by_ids
 

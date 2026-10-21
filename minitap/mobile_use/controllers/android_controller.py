@@ -203,6 +203,55 @@ class AndroidDeviceController(MobileDeviceController):
             logger.error(f"Failed to press home: {e}")
             return False
 
+    async def get_screen_power_state(self) -> str:
+        """读屏幕的电源状态。
+
+        返回 ``"on"`` / ``"off"`` / ``"unknown"``。
+
+        判据是 ``dumpsys power`` 的 ``mWakefulness``：屏幕亮着是 ``Awake``，
+        息屏（自动超时或按了电源键）是 ``Asleep``。真机实测（Redmi Turbo 4 /
+        Android 16）：
+
+            亮屏  -> mWakefulness=Awake
+            熄屏  -> mWakefulness=Asleep
+            KEYCODE_WAKEUP 之后 -> mWakefulness=Awake
+
+        **为什么需要它**：屏幕一黑，uiautomator 的层级树是**空的**、截图是全黑，
+        agent 于是看不到任何东西，会在黑屏上反复尝试、原地打转（2026-10-21
+        真机实测：30 分钟息屏超时让一个任务从 30 步涨到 51 步还没跑完）。
+        有了这个状态，harness 就能告诉模型「屏幕是灭的，先唤醒」。
+        """
+        try:
+            raw = await asyncio.to_thread(self.device.shell, "dumpsys power")
+        except Exception as e:
+            logger.warning(f"Failed to read screen power state: {e}")
+            return "unknown"
+        out = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        if "mWakefulness=Awake" in out:
+            return "on"
+        if "mWakefulness=Asleep" in out or "mWakefulness=Dozing" in out:
+            return "off"
+        return "unknown"
+
+    async def wake_up(self) -> bool:
+        """唤醒屏幕并尝试划掉锁屏。
+
+        两步都是必要的：
+
+        - ``KEYCODE_WAKEUP`` 把屏幕点亮（息屏时普通的 tap/swipe 是**没用的** ——
+          事件发给了一个没显示的屏幕）。
+        - ``wm dismiss-keyguard`` 划掉无密码锁屏。**有 PIN 的话划不掉**，
+          这时只能靠人解锁 —— 返回 True 但屏幕可能还是锁着的，所以调用方
+          还要再读一次状态确认。
+        """
+        try:
+            await asyncio.to_thread(self.device.shell, "input keyevent 224")  # KEYCODE_WAKEUP
+            await asyncio.to_thread(self.device.shell, "wm dismiss-keyguard")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to wake up the screen: {e}")
+            return False
+
     async def press_enter(self) -> bool:
         try:
             self.device.shell("input keyevent 66")

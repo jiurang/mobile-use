@@ -59,12 +59,45 @@ class ContextorNode:
             finally:
                 ocr_done = True
 
+        # ---- 屏幕是不是灭的 ----
+        #
+        # 息屏时 uiautomator **仍然**会返回元素 —— 2026-10-21 真机实测
+        # （Redmi Turbo 4 / Android 16）熄屏后拿到的是 **19 个 systemui 残留**
+        # （通知面板容器、状态栏、keyguard 容器……），截图才是全黑的。
+        #
+        # 「层级树为空 ⇒ 屏幕灭了」这个判据因此**永远不会触发** —— 它是被实测
+        # 证伪的，不是推断错的。唤醒功能等于没接上。所以这里改成**无条件**读
+        # 电源状态（`dumpsys power` 的 `mWakefulness`），那是系统的权威状态。
+        #
+        # 代价被并发吃掉了：`dumpsys power` 要 ~100ms，和抓屏**同时**跑，
+        # 这 100ms 就藏进了 dump 的等待窗口里（真机实测 698ms → 589ms，
+        # 8 轮元素数稳定，没有连接池被抽干）。
+        screen_state: str | None = None
+        power_task: asyncio.Task[str] | None = None
+        power_reader = getattr(device_controller, "get_screen_power_state", None)
+        if power_reader is not None:
+            power_task = asyncio.create_task(power_reader())
+            # `create_task` 只是把协程排进日程表，**不会**立刻开跑 —— 要等当前
+            # 协程让出控制权。这一行显式让一次，电源状态那个 adb 调用才会真正
+            # 启动，然后和下面的抓屏重叠跑（否则就退化成串行 +100ms）。
+            await asyncio.sleep(0)
         try:
-            device_data = await device_controller.get_screen_data(on_screenshot=_run_ocr_inline)
-        except TypeError:
-            # 自定义控制器没跟上新签名时不能整轮挂掉，退回原来的串行路径。
-            logger.warning("Controller does not support on_screenshot; using serial path")
-            device_data = await device_controller.get_screen_data()
+            try:
+                device_data = await device_controller.get_screen_data(on_screenshot=_run_ocr_inline)
+            except TypeError:
+                # 自定义控制器没跟上新签名时不能整轮挂掉，退回原来的串行路径。
+                logger.warning("Controller does not support on_screenshot; using serial path")
+                device_data = await device_controller.get_screen_data()
+        finally:
+            # 抓屏炸了也要把电源状态收回来，不能留一个悬空的 task。
+            if power_task is not None:
+                screen_state = await power_task
+
+        if screen_state == "off":
+            logger.warning(
+                "[contextor] The screen is OFF — the screenshot is black and the element "
+                "tree only holds systemui leftovers. The agent will be told to wake it up."
+            )
 
         if not ocr_done:
             # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
@@ -113,6 +146,7 @@ class ContextorNode:
                 "focused_app_info": current_app_package,
                 "screen_size": (device_data.width, device_data.height),
                 "device_date": device_date,
+                "screen_state": screen_state,
                 "agents_thoughts": [agent_outcome],
             },
             agent="contextor",

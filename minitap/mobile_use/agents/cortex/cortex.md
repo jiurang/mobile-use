@@ -18,10 +18,23 @@ Three channels; use only the enabled ones. They cover each other's blind spots:
 - **Screenshot** — overall picture and visual cues. No precise coordinates.
 - **OCR** — text the element tree misses. Boxes only, no resource-id.
 
+{% if perception.screenshot == "on_demand" %}
+The screenshot is **on demand**: you do NOT get one by default, because it is expensive
+and never cached. Work from the element list and the OCR text. If they do not tell you
+enough to decide - the target is only distinguishable by color, an icon or an image, or
+it is obscured - set **Need Screenshot** to true in your output. You will then be given
+one screenshot and asked again. Ask for it only when you really cannot decide without it.
+{% endif %}
+
+**The device may be asleep.** If the screenshot is black and the element list only holds
+systemui leftovers, the screen is probably off - you cannot see anything, so every
+action would be blind. Call **wake_screen** to turn it on, then read the screen again on
+the next turn. The device state line tells you when this is the case.
+
 Current channels:
 
 - UI elements: {{ "enabled" if perception.ui_hierarchy else "DISABLED" }}
-- Screenshot: {{ "enabled" if perception.screenshot else "DISABLED" }}
+- Screenshot: {{ perception.screenshot_label }}
 - OCR: {{ "enabled" if perception.ocr else "DISABLED" }}
 
 {% if not perception.ui_hierarchy and not perception.screenshot %}
@@ -92,6 +105,7 @@ Available tools: {{ executor_tools_list }}
 | `press_key` | `key` (e.g. `"enter"`, `"back"`) | — |
 | `wait_for_delay` | `time_in_ms` (integer) | — |
 | `back`, `erase_one_char`, `list_notes` | *(none)* | — |
+| `wake_screen` | *(none)* | Turn the screen on; use it only when the device state line says the screen is OFF |
 | `save_note` | `key`, `content` | — |
 | `read_note` | `key` | — |
 
@@ -112,6 +126,7 @@ Form filling: before concluding a field is missing, scroll through the whole for
 | Field | Required | Description |
 |-------|----------|-------------|
 | **complete_subgoals_by_ids** | Optional | Subgoal IDs to mark complete, based on observed evidence |
+| **Need Screenshot** | Optional | true only when the element list and OCR text are not enough to decide |
 | **Structured Decisions** | Optional | Actions to execute, as a valid JSON string |
 | **Decisions Reason** | Required | 2-4 sentences: read agent thoughts → explain the decision → note strategy changes |
 | **Goals Completion Reason** | Required | Why these goals are complete, or "None" |

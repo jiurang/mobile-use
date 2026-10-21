@@ -16,12 +16,24 @@
 
 - **UI 元素** — 按 index、id、文本或 bounds 找。看不到颜色、图片、被遮挡的元素和 canvas 文字。
 - **截图** — 看整体画面与视觉线索。不给精确坐标。
+
+{% if perception.screenshot == "on_demand" %}
+截图是**按需**的：默认**不会**给你 —— 它很贵，而且永远不进缓存。先用元素列表和 OCR 文本
+决策。只有当它们**不足以让你判断**时（目标只能靠颜色/图标/图片区分，或者被遮挡），
+才在输出里把 **Need Screenshot** 置成 true；随后你会拿到一张截图并被再问一次。
+只在真的判断不了时才要它。
+{% endif %}
+
+**设备可能睡着。** 如果截图是全黑的、元素列表里只剩 systemui 的残留，多半是
+**屏幕灭着** —— 这时你看不到任何业务内容，动作全是盲的。先调 **wake_screen**
+把屏幕点亮，下一轮再读屏。
+设备状态那一行会告诉你是不是这种情况。
 - **OCR** — 读元素树漏掉的字。只有框，没有 resource-id。
 
 当前启用：
 
 - UI 元素：{{ "enabled" if perception.ui_hierarchy else "DISABLED" }}
-- 截图：{{ "enabled" if perception.screenshot else "DISABLED" }}
+- 截图：{{ perception.screenshot_label }}
 - OCR：{{ "enabled" if perception.ocr else "DISABLED" }}
 
 {% if not perception.ui_hierarchy and not perception.screenshot %}
@@ -87,6 +99,7 @@ OCR 文本就在同一张表、同一套编号里。这些行没有 `id=`、没�
 | `press_key` | `key`（如 `"enter"`、`"back"`） | — |
 | `wait_for_delay` | `time_in_ms`（整数） | — |
 | `back`、`erase_one_char`、`list_notes` | 无 | — |
+| `wake_screen` | 无 | 点亮屏幕；仅在设备状态那一行说屏幕是灭的时候用 |
 | `save_note` | `key`，`content` | — |
 | `read_note` | `key` | — |
 
@@ -107,6 +120,7 @@ OCR 文本就在同一张表、同一套编号里。这些行没有 `id=`、没�
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | **complete_subgoals_by_ids** | 可选 | 依据观察到的证据，要标记完成的子目标 ID |
+| **Need Screenshot** | 可选 | 仅当元素列表和 OCR 文本不足以判断时置 true |
 | **Structured Decisions** | 可选 | 要执行的动作，合法 JSON 字符串 |
 | **Decisions Reason** | 必填 | 2~4 句：读 agent thoughts → 说明决策 → 指出策略变化 |
 | **Goals Completion Reason** | 必填 | 为什么完成这些目标；没有就填 "None" |

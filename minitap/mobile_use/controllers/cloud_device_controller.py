@@ -308,6 +308,34 @@ class CloudAndroidController(MobileDeviceController):
             logger.error(f"Failed to press home: {e}")
             return False
 
+    async def get_screen_power_state(self) -> str:
+        """Read the screen power state ("on" / "off" / "unknown").
+
+        Same判据 as the local Android controller: ``dumpsys power`` 的
+        ``mWakefulness``。屏幕灭时截图全黑、层级树只剩 systemui 残留，agent 会盲操作。
+        """
+        try:
+            raw = await asyncio.to_thread(self.device.shell, "dumpsys power")
+        except Exception as e:
+            logger.warning(f"Failed to read screen power state: {e}")
+            return "unknown"
+        out = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        if "mWakefulness=Awake" in out:
+            return "on"
+        if "mWakefulness=Asleep" in out or "mWakefulness=Dozing" in out:
+            return "off"
+        return "unknown"
+
+    async def wake_up(self) -> bool:
+        """Wake the screen up and dismiss a keyless lock screen."""
+        try:
+            await asyncio.to_thread(self.device.shell, "input keyevent 224")  # KEYCODE_WAKEUP
+            await asyncio.to_thread(self.device.shell, "wm dismiss-keyguard")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to wake up the screen: {e}")
+            return False
+
     async def press_enter(self) -> bool:
         """Press the enter key."""
         try:

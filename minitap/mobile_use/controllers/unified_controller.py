@@ -168,6 +168,14 @@ class UnifiedMobileController:
     async def press_enter(self) -> bool:
         return await self._controller.press_enter()
 
+    async def get_screen_power_state(self) -> str:
+        """屏幕电源状态："on" / "off" / "unknown"。"""
+        return await self._controller.get_screen_power_state()
+
+    async def wake_up(self) -> bool:
+        """唤醒屏幕并尝试划掉无密码锁屏。"""
+        return await self._controller.wake_up()
+
     async def erase_text(self, nb_chars: int | None = None) -> bool:
         return await self._controller.erase_text(nb_chars)
 

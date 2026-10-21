@@ -29,12 +29,30 @@ AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
 
 
 class _Perception:
-    """planner/cortex 里 {{ perception.xxx }} 读的就是这三个字段。"""
+    """planner/cortex 里 {{ perception.xxx }} 读的就是这三个字段。
 
-    def __init__(self, ui_hierarchy: bool = True, ocr: bool = True, screenshot: bool = True) -> None:
+    `screenshot` 是三态（True / False / "on_demand"），模板用
+    `screenshot_label` 显示状态文案 —— "on_demand" 是真值，直接用真假判断
+    会把它显示成 "enabled"，模型就以为图已经在手里了。
+    """
+
+    def __init__(
+        self,
+        ui_hierarchy: bool = True,
+        ocr: bool = True,
+        screenshot: bool | str = True,
+    ) -> None:
         self.ui_hierarchy = ui_hierarchy
         self.ocr = ocr
         self.screenshot = screenshot
+
+    @property
+    def screenshot_label(self) -> str:
+        if self.screenshot is True:
+            return "enabled"
+        if self.screenshot is False:
+            return "DISABLED"
+        return "on demand"
 
 
 def _perception_variants() -> list[_Perception]:

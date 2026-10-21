@@ -201,6 +201,23 @@ class iOSDeviceController(MobileDeviceController):
             logger.error(f"Failed to press enter: {e}")
             return False
 
+    async def get_screen_power_state(self) -> str:
+        """iOS 侧**读不到**屏幕电源状态。
+
+        WDA / IDB 都不提供「屏幕是不是亮的」这个查询，本仓库也没有对应能力。
+        返回 ``"unknown"`` —— 含义是「不知道」，**不是「亮着」**，
+        所以 cortex 不会因此误判成息屏。
+        """
+        return "unknown"
+
+    async def wake_up(self) -> bool:
+        """iOS 侧**无法**程序化唤醒屏幕。
+
+        返回 False 并说明原因，让调用方如实回报失败，而不是假装成功。
+        """
+        logger.warning("wake_up is not supported on iOS (no WDA/IDB screen-wake API)")
+        return False
+
     async def get_ui_hierarchy(self) -> list[dict]:
         """Get UI hierarchy using IDB accessibility info or WDA source."""
         try:

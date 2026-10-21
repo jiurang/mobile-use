@@ -76,7 +76,7 @@ IsReplan = bool
 
 
 class PerceptionConfig(BaseModel):
-    """三条感知通道的开关 + 感知前的沉降等待。三个通道默认全开。
+    """三条感知通道的开关 + 感知前的沉降等待。
 
     关掉任何一条都是**纯粹减少**该通道带来的信息与开销，不会改变另外两条的
     行为：
@@ -86,12 +86,45 @@ class PerceptionConfig(BaseModel):
     - `ui_hierarchy`：Cortex 不再收到 UI 元素列表，也不再拿它做坐标合法性校验
       （`tools/bounds_validation.py` 会退化成只看 OCR 框）。
     - `ocr`：Contextor 不跑 OCR，Cortex 不收到 OCR 文本块，坐标校验退回只看层级树。
+
+    `screenshot` 是**三态**：
+
+    - `True` —— 每轮都把截图塞进 prompt（老行为）。
+    - `False` —— 完全不发图。
+    - `"on_demand"` —— **默认不发图**；Cortex 在结构化输出里把 `need_screenshot`
+      置 true 时，才在**同一轮内**补一张图再问一次。
+
+    为什么默认改成 `"on_demand"`（2026-10-21 实测）
+    ------------------------------------------------
+    截图进 prompt 的代价是**每轮都付、且永远付**：
+
+    - 它是**不可缓存**的 —— 在 prompt 末尾，而 provider 的缓存单元建在「用户输入
+      的末尾」，请求总长一变（base64 长度随画面变）就匹配不上。
+    - 实测那 47,672 字符的 base64 占了整个易变尾部的 **92%**；砍掉它之后
+      12 轮里只有 1 轮低于 80%，带它时约 1/3 的轮次掉到 6-12%
+      （见 `doc/cache-hit-rate-audit-20261020.md` 第 8 节）。
+
+    绝大多数决策靠 UI 元素表 + OCR 就够（模型报的是索引，坐标由代码给），
+    图只在「颜色 / 图标 / 遮挡 / 图片内容」这些文字表达不了的地方才需要。
     """
 
-    screenshot: bool = True
+    screenshot: bool | Literal["on_demand"] = "on_demand"
     ui_hierarchy: bool = True
     ocr: bool = True
     ocr_config: OcrConfig = Field(default_factory=OcrConfig)
+
+    @property
+    def screenshot_label(self) -> str:
+        """给 prompt 模板显示用的通道状态文案。
+
+        模板不能直接用 `perception.screenshot` 的真假判断 —— `"on_demand"` 是
+        真值，模板会把它显示成「enabled」，模型就以为图已经在手里了。
+        """
+        if self.screenshot is True:
+            return "enabled"
+        if self.screenshot is False:
+            return "DISABLED"
+        return "on demand"
 
     # 动作之后的**沉降等待下限**（毫秒）。
     #

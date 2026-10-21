@@ -110,21 +110,37 @@ class TestInvokeRecordsUsage:
 
     def test_skips_recording_without_agent_name(self, captured):
         """没传 agent 名就不记 —— 避免把调用归到 'unknown' 污染统计。"""
+
         async def call():
             return self._response()
 
         asyncio.run(llm_module.invoke_llm_with_timeout_message(call(), task_id="t1"))
         assert captured == []
 
-    def test_missing_usage_records_zeros_not_crash(self, captured):
-        """provider 不返回 usage 时记 0，不能抛异常。"""
+    def test_missing_usage_records_nothing_not_crash(self, captured):
+        """provider 不返回 usage 时**不记这一行**（而不是记 0），且不能抛异常。
+
+        契约变更（2026-10-21）
+        --------------------
+        原来这里记 0，理由是「provider 根本没回报 usage，不是我们丢的」。但
+        **「provider 没报」和「我们没拿到」在实现上分不开**，而在 headless
+        路径上后者是常态：`_record_usage` 在 LangGraph 的图里压根收不到响应
+        （ContextVar 跨不过图的任务上下文），于是**每一行都记成 0** ——
+        「成本核算的唯一数据源」于是把每次调用都算成免费。
+
+        现在的口径与 manager 一致（`manager-server` 的 api-contract.md：
+        「整次执行没有上报过 usage 时这些字段全是 null——『没上报』不等于
+        『零消耗』」）：**读不到就不报这一行**。
+
+        图里的 usage 由 `services/usage_bridge.py` 的 graph-config callback
+        上报（那条路在 TUI / 安卓服务 / manager 上都已验证可行）。
+        """
+
         async def call():
             return _Obj()
 
         asyncio.run(llm_module.invoke_llm_with_timeout_message(call(), agent_name="planner"))
-        assert len(captured) == 1
-        assert captured[0]["input_tokens"] == 0
-        assert captured[0]["output_tokens"] == 0
+        assert captured == []
 
     def test_result_returned_even_when_recording_explodes(self, monkeypatch):
         """埋点自身抛异常时，主流程必须照常返回结果。"""

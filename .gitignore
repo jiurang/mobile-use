@@ -16,3 +16,6 @@ llm-config.override.jsonc
 
 # 探针脚本产出的中间文件（截图对比图等），跑 scripts/probe_*.py 可重新生成
 probe_out/
+
+# mermaid 渲染的临时产物（_mmd_*.mmd / .svg / .png / _puppeteer_config.json）
+v/

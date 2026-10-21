@@ -206,6 +206,14 @@ Target 内联于 focus_and_clear_text     378 token
 | 删 `title` + 折叠 `anyOf` | 2,938 | −622 | −17.5% |
 | 以上 + `Target` 共享 `$ref` | 3,110 | −450 | −12.6% |
 | 结构优化 + 删 `Args:` 块 | 2,844 | **−716** | **−20.1%** |
+
+> ⚠️ **2026-10-21 更新**：上表的 −716 是**旧版工具集**的数字。拿现在的 16 个
+> 工具实测（`probe_out/probe_tool_schema_surgery.py`）：
+> **4,333 → 3,871 token（−462，−10.7%）**，且只有 5 个用 `Target` 模型的工具有收益
+> （各 −113）—— 其余工具的 schema 里没有 `title` / `anyOf` 可砍。
+> **手术已落地**：`utils/tool_schema_surgery.py` + `services/llm.py` 的
+> `ToolSchemaSurgeryMixin`（挂在 `_get_request_payload` 之后，一处覆盖全部
+> OpenAI 兼容 provider，对工具实现零侵入）。
 | 结构优化 + 删 `Args:` + 中文化 | 3,412 | −148 | −4.2% |
 
 **结论：真正的大头是 JSON 结构噪音，不是措辞。**
@@ -218,7 +226,7 @@ Target 内联于 focus_and_clear_text     378 token
 
 ### 5.2.3 推荐方案
 
-**只做结构手术，保持英文，合计 −716 token（−20.1%）**，落在 `executor.py` 调用 `bind_tools` 之前，对工具实现零侵入：
+**只做结构手术，保持英文，合计 −716 token（−20.1%）**（**实测现值 −462 / −10.7%，见上面的更新**），落在 `bind_tools` 之后、请求体组装完成时，对工具实现零侵入：
 
 1. 递归删除所有 `title` 键
 2. `anyOf: [X, null]` 折叠为 `X`（保留 `default: null` 表示可省略）
@@ -283,8 +291,12 @@ Target 内联于 focus_and_clear_text     378 token
 
 **结论：中文化的收益是负的，不建议为了省 token 而做。** 中文提示词的其他价值（模型的中文理解能力、与业务术语一致性）是独立议题，不在本节成本讨论范围内。
 
-### 5.3 【中】截图不缩分辨率
-**问题**：`get_compressed_b64_screenshot` 仅执行 `quality=50` 的 JPEG 重编码，**无任何 resize**。
+### 5.3 ✅ 截图已缩分辨率（2026-10-17 落地）
+> ⚠️ 下面是 2026-10-16 的**旧结论**，已经过期。
+>
+> 10-17 的 `78bc8a2` / `34084bf` 就实现了缩放：`utils/image_compress.py` 的
+> `compress_screenshot_base64` 默认带 `max_width=640 / max_height=1536`
+> （`DEFAULT_MAX_WIDTH/HEIGHT`），**截图早就缩过了**。
 - `android_controller.py:299-310`
 - `ios_controller.py:339-356`
 - `cloud_device_controller.py:407-418`
@@ -298,7 +310,18 @@ Target 内联于 focus_and_clear_text     378 token
 实测 1/4/8 轮为 199 / 790 / 1,578 token。
 `cortex.py:139` 的 `RemoveMessage(REMOVE_ALL_MESSAGES)` 会在下一轮清空，**因此跨轮不累积**，仅影响单个 cortex 决策内的多工具连续调用场景。优先级低于前两项。
 
-### 5.5 【前置】telemetry 缺少 token 埋点
+### 5.5 ✅ telemetry 已有 token 埋点（2026-10-21 补）
+
+> ⚠️ 下面是 2026-10-16 的旧结论，已经过期。
+>
+> 10-19 的 `deda761` 接上了 usage 捕获，10-21 又补了**缓存命中量**
+> （`utils/llm_usage.py` 的 `extract_cache_tokens` + telemetry 的 `cached_tokens`）。
+> 顺带修掉一个根因：langchain-openai 在**流式**请求下、且 `stream_usage` 未设时
+> **不转发 provider 报的 usage**（`usage_metadata` 直接是 `None`）——
+> `get_minimax_llm()` 现在显式传 `stream_usage=True`。
+> 详见 `doc/cache-hit-rate-audit-20261020.md` 第 7 节。
+
+#### 5.5 【历史】telemetry 缺少 token 埋点
 
 `services/telemetry.py` 中 `capture_executor_action` / `capture_cortex_decision` / `capture_task_completed` **均无 token / usage 字段**。
 
@@ -377,13 +400,13 @@ HumanMessage(
 | # | 动作 | 预期收益 | 风险 |
 |---|---|---|---|
 | 1 | **接 token telemetry**（5.5） | 验证手段本身 | 无 |
-| 2 | **工具 schema 结构手术**（5.2.3） | −716/次（−20.1%） | 低，但需验证 `anyOf` 折叠后 provider 的 nullable 判定 |
+| 2 | ✅ **工具 schema 结构手术**（5.2.3） | **−462/次（−10.7%，实测）** | 已落地。`anyOf` 折叠的 nullable 风险已验：provider 不校验 tool_call 参数的 schema（显式 null 两种 schema 都 200） |
 | 3 | **裁剪 `agents_thoughts` 发送量**（5.1） | 长任务最高可省 50%+ | 中，影响长程记忆，需定裁剪策略 |
 | 4 | **截图降分辨率 A/B**（5.3） | −75% 截图成本 | 中，影响视觉判断，需真机对比 |
 | 5 | `executor_messages` 截断（5.4） | 单轮内 ~1.5k | 低 |
 | — | ~~中文化提示词~~ | **负收益 +50%** | 不做 |
 
-**注意 2 与 3 的量级差异**：schema 结构手术是**每轮固定省 716**，确定性强、无语义损失，应最先落地；`agents_thoughts` 裁剪收益随任务长度增长，但需要你先定策略（见 5.1 的约束说明）。
+**注意 2 与 3 的量级差异**：schema 结构手术是**每轮固定省 462**（实测），确定性强、无语义损失，已落地；`agents_thoughts` 裁剪收益随任务长度增长，但需要你先定策略（见 5.1 的约束说明）。
 
 ---
 

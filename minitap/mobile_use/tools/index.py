@@ -17,6 +17,7 @@ from minitap.mobile_use.tools.mobile.video_recording import (
     stop_video_recording_wrapper,
 )
 from minitap.mobile_use.tools.mobile.wait_for_delay import wait_for_delay_wrapper
+from minitap.mobile_use.tools.mobile.wake_screen import wake_screen_wrapper
 from minitap.mobile_use.tools.scratchpad import (
     list_notes_wrapper,
     read_note_wrapper,
@@ -37,6 +38,8 @@ EXECUTOR_WRAPPERS_TOOLS = [
     focus_and_clear_text_wrapper,
     press_key_wrapper,
     wait_for_delay_wrapper,
+    # 屏幕是灭的时候用它点亮 —— 息屏时截图全黑、层级树只剩 systemui 残留，agent 会盲操作
+    wake_screen_wrapper,
     # Scratchpad tools for persistent memory
     save_note_wrapper,
     read_note_wrapper,
@@ -64,4 +67,26 @@ def get_tools_from_wrappers(
 
 
 def format_tools_list(ctx: MobileUseContext, wrappers: list[ToolWrapper]) -> str:
-    return ", ".join([tool.name for tool in get_tools_from_wrappers(ctx, wrappers)])
+    """给 system prompt 用的工具名清单，**按名称排序**。
+
+    为什么排序
+    ----------
+    这串名字会进 system prompt（cortex.py / planner.py），而 system prompt 是
+    前缀缓存的最前段。实测（2026-10-20，MiniMax M3.1-Flash）：
+    工具清单在 cortex system prompt 的第 3950/6861 字符处（约 58% 深度），
+    把顺序换掉，缓存从 10,477 token 掉到 1,169 —— 破在 system 内部 58% 的位置，
+    后面全部重算。
+
+    现在的顺序来自 `get_tools_from_wrappers`，而它是遍历模块级固定 list
+    （`EXECUTOR_WRAPPERS_TOOLS`），**当前是稳定的**。但稳定性是「碰巧」的：
+    哪天有人把注册改成 dict / set 遍历，或调整 wrapper 顺序，进程重启后
+    system prompt 就会换序，整个缓存静默归零 —— 而这类改动看起来完全无害。
+
+    按名称排序把「碰巧稳定」变成「按定义稳定」，一行成本换一个单点消除。
+
+    注意：这里只排**名字清单**。真正的 tools schema 数组（`get_tools_from_wrappers`
+    的返回值）不在这里动 —— MiniMax 的缓存键不含 tools（实测去掉 tools 数组
+    缓存量不变），改它的顺序没有缓存收益，却会改变模型选工具时的平局顺序。
+    """
+    names = [tool.name for tool in get_tools_from_wrappers(ctx, wrappers)]
+    return ", ".join(sorted(names))

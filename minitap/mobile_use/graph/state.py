@@ -56,6 +56,13 @@ class State(BaseModel):
     latest_screenshot: Annotated[str | None, "Latest screenshot base64 of the device", take_last]
     focused_app_info: Annotated[str | None, "Focused app info", take_last]
     device_date: Annotated[str | None, "Date of the device", take_last]
+    screen_state: Annotated[
+        str | None,
+        "Screen power state: 'on' / 'off' / 'unknown'. "
+        "A screen that is off shows a black screenshot and an element tree that "
+        "only holds systemui leftovers.",
+        take_last,
+    ] = None
 
     # 屏幕元素表：UI 层级树 + OCR 文本合并后的统一索引表。
     #

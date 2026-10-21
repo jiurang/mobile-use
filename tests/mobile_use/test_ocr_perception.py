@@ -208,9 +208,20 @@ class TestOcrTextsAsElements:
 
 
 class TestPerceptionConfig:
-    def test_all_three_channels_default_on(self):
+    def test_ui_and_ocr_default_on(self):
         p = PerceptionConfig()
-        assert p.screenshot and p.ui_hierarchy and p.ocr
+        assert p.ui_hierarchy and p.ocr
+
+    def test_screenshot_defaults_to_on_demand(self):
+        """截图默认**按需**（2026-10-21 改）。
+
+        截图是最贵的一块，而且永远不可缓存：它在 prompt 末尾，base64 长度随
+        画面变 → 请求总长每轮都变 → provider 的缓存单元匹配不上 → 归零。
+        绝大多数决策靠元素表 + OCR 就够，图只在颜色/图标/遮挡这些地方才需要。
+        """
+        p = PerceptionConfig()
+        assert p.screenshot == "on_demand"
+        assert p.screenshot_label == "on demand"
 
     def test_channels_are_independent(self):
         p = PerceptionConfig(screenshot=False)

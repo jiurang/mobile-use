@@ -100,6 +100,34 @@ class MobileDeviceController(Protocol):
         """
         raise NotImplementedError("Subclasses must implement this method")
 
+    async def get_screen_power_state(self) -> str:
+        """
+        Read the screen power state.
+
+        Returns:
+            "on" / "off" / "unknown". A screen that is off yields an empty
+            element tree and a black screenshot, so the agent would act blind
+            unless it is told.
+
+        默认实现返回 ``"unknown"`` —— 含义是「不知道」，**不是「亮着」**，
+        所以 cortex 不会因此误判成息屏。实现不了这一项的控制器（iOS、云端
+        旧实现、测试替身）都走这个默认值，不需要各自实现一遍。
+        """
+        return "unknown"
+
+    async def wake_up(self) -> bool:
+        """
+        Wake the screen up and dismiss a keyless lock screen.
+
+        Returns:
+            True on success, False on failure. A PIN-protected screen cannot be
+            dismissed programmatically, so callers should re-read the power
+            state to confirm.
+
+        默认实现返回 ``False`` —— 实现不了就如实说做不到。
+        """
+        return False
+
     @abstractmethod
     async def get_ui_hierarchy(self) -> list[dict]:
         """

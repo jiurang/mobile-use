@@ -269,6 +269,7 @@ cortex 必须输出 `complete_subgoals_by_ids`（[cortex.md](../minitap/mobile_u
 |---|---|---|
 | 3 | ✅ feedback 移出 system prompt | [cortex.py](../minitap/mobile_use/agents/cortex/cortex.py#L232) 末尾消息 |
 | 2 | ✅ 消息按 恒定→只追加→每轮变 分层 | [cortex.py](../minitap/mobile_use/agents/cortex/cortex.py#L171-L212)；完成情况以 `Subgoal status` **索引**排在 thoughts **之后**（替换式、按计划序固定槽位）；子目标骨架随计划日志留在 L1 |
+| 2b | ✅ **计划日志也挪到 thoughts 之后**（2026-10-21） | 计划日志只追加，但**排在 thoughts 前面时**，replan 的追加点之后全部重算 → thoughts 全长满价重算。挪到 thoughts 之后后实测（真 API，122 条 thoughts）：replan 当轮 cached 2,329 → **10,411**，满价重算 8,261 → **183**。见 [cache-hit-rate-audit-20261020.md](cache-hit-rate-audit-20261020.md) |
 | 6 | ✅ 静态段不留 `{{ }}` 动态值 | [cortex.md](../minitap/mobile_use/agents/cortex/cortex.md) 整段静态 |
 | 4 | ✅ 设备基本信息与 date / 前台 app 拆开 | 恒定块 [cortex.py](../minitap/mobile_use/agents/cortex/cortex.py#L181-L193)、易变块 [cortex.py](../minitap/mobile_use/agents/cortex/cortex.py#L230-L239) |
 | 1 | ✅ 计划骨架 / 完成情况拆成纯函数 | [planner/utils.py](../minitap/mobile_use/agents/planner/utils.py#L67-L102)（`render_plan_skeleton` 骨架 + `render_subgoal_status` 完成索引） |

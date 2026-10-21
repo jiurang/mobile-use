@@ -325,6 +325,7 @@ class TelemetryService:
         model: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cached_tokens: int = 0,
         duration_seconds: float | None = None,
         used_fallback: bool = False,
     ) -> None:
@@ -335,11 +336,17 @@ class TelemetryService:
         `(w//768+1)*(h//768+1)*258`），无法验证真实端到端用量，也就无法证明
         截图降分辨率这类优化到底省了多少。接上之后才是真实 API 返回的 usage。
 
+        `cached_tokens` 是**本次输入中命中前缀缓存的 token 数**（input 的子集）。
+        单独记是因为它是第三个数：并进 input 会算错成本，丢掉它则遥测里没有
+        「命中率」这个指标 —— 而提示词分层的收益只能靠它证明。
+        2026-10-21 起才有这个字段；旧 trace 里没有，按 0 处理。
+
         Args:
             task_id: 任务 trace id。
             agent: 调用方 agent 名（cortex / executor / planner ...）。
             model: 模型标识。
             input_tokens / output_tokens: provider 报告的用量；读不到时传 0。
+            cached_tokens: provider 报告的前缀缓存命中量；读不到时传 0。
             duration_seconds: 本次调用耗时。
             used_fallback: 是否走了 fallback 模型。
         """
@@ -351,6 +358,7 @@ class TelemetryService:
                 "model": model,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
                 "total_tokens": input_tokens + output_tokens,
                 "duration_seconds": duration_seconds,
                 "used_fallback": used_fallback,

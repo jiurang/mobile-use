@@ -27,12 +27,14 @@ from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.utils.llm_usage import (
     close_capture,
+    extract_cache_tokens,
     extract_usage,
     first_captured,
     open_capture,
     record_raw_response,
 )
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.tool_schema_surgery import apply_tool_schema_surgery
 
 if TYPE_CHECKING:
     # Imported for typing only. The Google SDKs are imported inside the
@@ -163,19 +165,30 @@ def _record_usage(
     usage 必须从**原始响应**上取。cortex / planner / orchestrator 走的是
     `with_structured_output`，返回 pydantic 对象，usage 落不到 result 上；
     原始 AIMessage 由客户端侧（generate/agenerate 包装）塞进捕获槽，这里优先用它。
-    两个都读不到才记 0 —— 那说明 provider 根本没回报 usage，不是我们丢的。
+
+    **拿不到就不记**（而不是记 0）：「provider 没报 usage」和「这次调用零消耗」
+    是两件事，记 0 会让成本看起来像免费。2026-10-21 真机实测发现 headless 路径上
+    这里记的**每一行都是 0** —— 因为在 LangGraph 的图里那个捕获槽根本收不到东西
+    （ContextVar 跨不过图的任务上下文）。现在图里的 usage 由
+    `services/usage_bridge.py` 的 graph-config callback 上报，这条路只保留
+    「直接调用」的场景，两边不会重复计数。
     """
     if not agent_name:
         return
     try:
         usage = extract_usage(raw_response) or extract_usage(result)
-        input_tokens, output_tokens = usage if usage else (0, 0)
+        if usage is None:
+            return
+        input_tokens, output_tokens = usage
         telemetry.capture_llm_usage(
             task_id=task_id or "unknown",
             agent=agent_name,
             model=_extract_model_name(raw_response) or _extract_model_name(result),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            # 前缀缓存命中量是第三个数，单独记 —— 它是「提示词分层有没有用」
+            # 唯一的可观测证据（2026-10-21 起）。
+            cached_tokens=extract_cache_tokens(raw_response),
             duration_seconds=duration_seconds,
             used_fallback=used_fallback,
         )
@@ -284,7 +297,7 @@ def get_minitap_llm(
 
     custom_headers = _build_custom_headers(agent_name)
 
-    client = ChatOpenAI(
+    client = SurgeryChatOpenAI(
         model=model,
         temperature=temperature,
         max_retries=max_retries,
@@ -341,6 +354,37 @@ def get_vertex_llm(
         max_retries=2,
     )
     return client
+
+
+class ToolSchemaSurgeryMixin:
+    """给 OpenAI 兼容端点的**工具 schema** 做结构手术。
+
+    手术内容：删 ``title``、把 ``anyOf: [X, null]`` 折成 ``X``（保留
+    ``default: null``）。只动结构，不动任何语义描述。
+
+    为什么在这里做
+    --------------
+    ``_get_request_payload`` 是 langchain 把**所有** ``bind_tools`` 汇成请求体的
+    唯一出口 —— executor 的 16 个工具和 cortex 的结构化输出 schema 都从这儿走。
+    挂在这里的好处：
+    - 一处覆盖全部 OpenAI 兼容 provider（minimax / deepseek / openai /
+      openrouter / xai / minitap），不用逐个调用点改；
+    - **对工具实现零侵入**（工具函数不知道自己被改了 schema）；
+    - 手术只影响**发给 provider 的 body**，本地 pydantic 模型原样不动。
+
+    实测：executor 的 16 个工具 4,333 → 3,871 token（−462，−10.7%）。
+
+    **provider 不校验 tool_call 参数的 schema**（实测 MiniMax：显式 null 的参数
+    在手术前后都是 HTTP 200），所以 ``anyOf`` 折叠不会因为「模型传了 null」被拒。
+    """
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:  # type: ignore[override]
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)  # type: ignore[misc]
+        return apply_tool_schema_surgery(payload)
+
+
+class SurgeryChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
+    """``ChatOpenAI`` + 工具 schema 结构手术。"""
 
 
 class AnthropicCacheControlChat(ChatAnthropic):
@@ -403,7 +447,7 @@ def get_openai_llm(
     override = override or ProviderOverride()
     api_key = override.key_or("OPENAI_API_KEY")
     assert api_key is not None
-    client = ChatOpenAI(
+    client = SurgeryChatOpenAI(
         model=model_name,
         api_key=api_key,
         base_url=override.url_or("OPENAI_BASE_URL"),
@@ -420,7 +464,7 @@ def get_openrouter_llm(
     override = override or ProviderOverride()
     api_key = override.key_or("OPEN_ROUTER_API_KEY")
     assert api_key is not None
-    client = ChatOpenAI(
+    client = SurgeryChatOpenAI(
         model=model_name,
         temperature=temperature,
         api_key=api_key,
@@ -437,7 +481,7 @@ def get_grok_llm(
     override = override or ProviderOverride()
     api_key = override.key_or("XAI_API_KEY")
     assert api_key is not None
-    client = ChatOpenAI(
+    client = SurgeryChatOpenAI(
         model=model_name,
         api_key=api_key,
         temperature=temperature,
@@ -646,7 +690,7 @@ class _ToolCallStructuredRunnable(Runnable):
         )
 
 
-class MiniMaxChatOpenAI(ChatOpenAI):
+class MiniMaxChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
     """ChatOpenAI variant for MiniMax that bypasses LangChain's broken
     ``with_structured_output`` integration.
 
@@ -725,6 +769,13 @@ def get_minimax_llm(
         api_key=api_key,
         temperature=clamped_temperature,
         base_url=override.url_or("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
+        # 必须显式开：langchain-openai 只有在流式请求且 stream_usage=True 时
+        # 才把 provider 报的 usage 转发回来。不开的话，**每一次 LLM 调用的
+        # usage_metadata 都是 None** —— 于是遥测记 0（看起来像「这次调用免费」），
+        # 缓存命中率更是无从计算。
+        # manager 侧在宿主进程里补了同样的开关（runner-host/llm_usage_patch.py），
+        # 原因相同；这里直接在工厂里设，因为 mobile-use 就是上游本身。
+        stream_usage=True,
         # A bounded request timeout, because the default is not one. With
         # `request_timeout` unset the OpenAI SDK waits 600s and langchain retries
         # twice, so a single hung connection parks the whole agent for 30
@@ -742,7 +793,7 @@ def get_minimax_llm(
     return client
 
 
-class DeepSeekChatOpenAI(ChatOpenAI):
+class DeepSeekChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
     """ChatOpenAI variant for DeepSeek's OpenAI-compatible endpoint.
 
     **Do not simplify this back to plain ``ChatOpenAI`` without a live call.**
