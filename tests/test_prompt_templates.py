@@ -40,6 +40,15 @@ def _render(template_path: Path, variables: dict[str, object]) -> str:
     return env.from_string(template_path.read_text(encoding="utf-8")).render(**variables)
 
 
+def _perception(
+    ui_hierarchy: bool = True,
+    ocr: bool = True,
+    screenshot: bool | str = "on_demand",
+):
+    """感知开关的替身（和 `scripts/check_prompt_templates.py` 里的是同一个类）。"""
+    return _load()._Perception(ui_hierarchy, ocr, screenshot)
+
+
 def test_prompt_templates_render():
     """每个 agent 提示词模板在生产变量下都能编译并渲染出结果。"""
     checked, failures = _load().check()
@@ -57,16 +66,21 @@ def test_every_agent_prompt_is_registered():
     assert on_disk - set(template_vars) == set(), "有 .md 没登记渲染变量，无法校验"
 
 
-def test_executor_template_declares_exactly_three_vars():
-    """executor.md 的模板变量恰好三个：platform / executor_tools_list / goal。
+def test_executor_template_declares_exactly_four_vars():
+    """executor.md 的模板变量恰好四个：platform / executor_tools_list / goal / perception。
 
     多一个 → 渲染端要多传一个（调用点会对不上）；少一个 → 模板引用了没传的变量。
+
+    `perception` 是**感知通道开关状态**（Manager 侧）：三条通道开着哪几条，
+    提示词里必须写清楚 —— 否则模型会一直要一张不会来的图，或者按一个
+    被关掉的通道去寻址。一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
     """
     template_vars = _load().TEMPLATE_VARS
     assert set(template_vars["executor/executor.md"]) == {
         "platform",
         "executor_tools_list",
         "goal",
+        "perception",
     }
     # goal 必须登记成「取值可能为空」的变量，否则 {% if goal %} 的 else 分支
     # 永远编不到 —— 写坏了也能「全过」。
@@ -77,7 +91,12 @@ def test_executor_prompt_renders_without_leftover_placeholders():
     """渲染后不能残留 Jinja 占位符 —— 残留在 prompt 里等于给了模型一句废话。"""
     rendered = _render(
         _EXECUTOR_MD,
-        {"platform": "android", "executor_tools_list": "tap, back", "goal": "打开快手赚钱"},
+        {
+            "platform": "android",
+            "executor_tools_list": "tap, back",
+            "goal": "打开快手赚钱",
+            "perception": _perception(),
+        },
     )
     assert "{{" not in rendered and "{%" not in rendered
     assert "打开快手赚钱" in rendered
@@ -93,7 +112,12 @@ def test_executor_prompt_survives_an_empty_goal():
     """
     rendered = _render(
         _EXECUTOR_MD,
-        {"platform": "android", "executor_tools_list": "tap, back", "goal": ""},
+        {
+            "platform": "android",
+            "executor_tools_list": "tap, back",
+            "goal": "",
+            "perception": _perception(),
+        },
     )
     assert "{{" not in rendered and "{%" not in rendered
     # 不能留下一句空的 "Your goal:" 让模型以为渲染坏了
@@ -154,26 +178,46 @@ def test_executor_prompt_keeps_text_tools_table():
 
 
 def test_executor_prompt_keeps_perception_channels():
-    """感知通道不能丢：**两个通道**（UI 元素 + OCR）+ 设备状态（息屏）。
+    """感知通道不能丢：**三条通道**（UI 元素 + OCR + 图片）+ 设备状态（息屏）。
 
-    🔴 **2026-10-22 改**：截图通道整条关掉了 —— Executor 的「同轮二问」
-    要多花**整整一次 LLM 调用**（真机实测 executor 单次决策中位 5,276ms），
-    换来的只是「模型偶尔能看见颜色/图标/遮挡」。
+    🔴 **2026-10-22 改**：图片通道**回来了**，但语义换成了
+    「**Executor 自己举手**」（`need_screenshot`）—— 上一轮举手，下一轮
+    才附当屏截图（不再同轮二问，省一次 LLM 调用）。
 
-    丢了截图通道 ⇒ 模型看不见画面（这是个**能力削减**，真机跑完要看
-    「步数 / 失败目标数」有没有涨）；丢了设备状态就会在黑屏上反复空转
-    （真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）。
+    三条通道都由 Manager 侧开关控制（`perception.ui_hierarchy` /
+    `perception.ocr` / `perception.screenshot`），提示词必须**按开关渲染**：
+    通道关着却还在教模型用那个通道，模型就会一直要一张不会来的图。
+
+    丢了 UI/OCR 通道 ⇒ 模型看不见任何东西；丢了设备状态就会在黑屏上
+    反复空转（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "## Perception" in text
-    # 截图通道已关 ⇒ 不能再教模型要图
-    assert "need_screenshot" not in text
-    assert "There is no screenshot" in text
-    # 两个还在的通道
+    # 三个通道都在，且**按开关分支**渲染
+    assert "perception.ui_hierarchy" in text
+    assert "perception.ocr" in text
+    assert "perception.screenshot_channel" in text
+    # 两个文本通道
     assert "UI elements" in text
     assert "OCR" in text
     assert "device state line" in text
     assert "wake_screen" in text
+
+
+def test_executor_prompt_teaches_the_model_to_ask_for_a_picture():
+    """图片通道开着时，提示词必须教它**怎么要**（`need_screenshot`）。
+
+    通道关着时不能教 —— 否则模型会一直要一张不会来的图，而且它会以为自己
+    能看到画面。**关掉时模板里一个图相关的词都不该有**（见
+    `tests/mobile_use/test_screenshot_on_demand.py` 的零图词断言）。
+    """
+    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    assert "need_screenshot" in text
+    # 三种通道状态都有分支
+    assert 'perception.screenshot_channel == "always"' in text
+    assert 'perception.screenshot_channel == "on_demand"' in text
+    # 「off」档 = 整段图的内容**不渲染**（模板里没有第三个分支）
+    assert 'perception.screenshot_channel == "off"' not in text
 
 
 def test_executor_prompt_has_no_tool_json_schema():
@@ -194,10 +238,8 @@ def test_executor_prompt_has_no_tool_json_schema():
 def test_executor_prompt_output_fields_match_executor_output():
     """Output 字段表要和 `agents/executor/types.py:ExecutorOutput` 逐字对齐。"""
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    for field in ("actions", "agent_thought", "done", "done_reason"):
+    for field in ("actions", "agent_thought", "done", "done_reason", "need_screenshot"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
-    # 🔴 2026-10-22：截图通道关了，`need_screenshot` 不再是输出字段
-    assert "`need_screenshot`" not in text
     # agent_thought：≤1 句，且不许把目标陈述写进去（方案 §3.1.1 顺带说明）
     assert "one short sentence" in text
     assert "Never put the goal statement in it" in text

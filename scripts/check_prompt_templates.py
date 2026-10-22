@@ -28,34 +28,47 @@ AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
 
 
 class _Perception:
-    """planner/cortex 里 {{ perception.xxx }} 读的就是这三个字段。
+    """感知开关的替身（和 `context.PerceptionConfig` 同形）。
 
-    `screenshot` 是三态（True / False / "on_demand"），模板用
-    `screenshot_label` 显示状态文案 —— "on_demand" 是真值，直接用真假判断
-    会把它显示成 "enabled"，模型就以为图已经在手里了。
+    `screenshot` 是**三态字符串**：`"always"` / `"on_demand"` / `"off"`。
+    模板用 `screenshot_channel` 分支（它就是 `screenshot` 本身），
+    用 `can_see_screenshot` 判「模型能不能看图」。
+
+    ⚠️ 老代码里 `screenshot` 是 `bool | "on_demand"`（`True`=每轮都带图），
+    混型导致真假判断到处是坑。现在统一成字符串枚举，`True`/`False`
+    在 `PerceptionConfig` 的校验器里就被收成 `"on_demand"`/`"off"`。
     """
 
     def __init__(
         self,
         ui_hierarchy: bool = True,
         ocr: bool = True,
-        screenshot: bool | str = True,
+        screenshot: str = "on_demand",
     ) -> None:
         self.ui_hierarchy = ui_hierarchy
         self.ocr = ocr
         self.screenshot = screenshot
 
     @property
-    def screenshot_label(self) -> str:
-        if self.screenshot is True:
-            return "enabled"
-        if self.screenshot is False:
-            return "DISABLED"
-        return "on demand"
+    def screenshot_channel(self) -> str:
+        return self.screenshot
+
+    @property
+    def can_see_screenshot(self) -> bool:
+        return self.screenshot != "off"
 
 
 def _perception_variants() -> list[_Perception]:
-    return [_Perception(True, True, True), _Perception(False, False, False)]
+    """感知开关的典型组合 —— 模板里每种都有一条分支，都要编到。
+
+    特别要编到 `"off"`：**不能看图时模板里不许出现图相关的词**，
+    那条分支（以及整段被跳过的内容）必须能正常渲染。
+    """
+    return [
+        _Perception(True, True, "always"),  # 每轮都带图
+        _Perception(True, True, "on_demand"),  # 默认：Executor 自己决定
+        _Perception(False, False, "off"),  # 全关（连图都没有）
+    ]
 
 
 # 每个模板一条：渲染时调用方真实提供的变量。
@@ -90,16 +103,21 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "previous_plan": "subgoal-0",
         "agent_thoughts": "thought",
     },
-    # executor.py 的 system prompt 渲染（契约 W1.1）—— 三个变量，缺一不可。
+    # executor.py 的 system prompt 渲染（契约 W1.1）—— 四个变量，缺一不可。
     # goal 放在模板**末尾**是有意的，不是随手写的：executor.md 里只有 goal 会变
     # （Cortex 每下发一个子目标就换一个），而前缀缓存是**前缀**匹配 —— goal 后面
     # 的一切每次换子目标都要重算。它前面那段静态内容（工具表、元素索引说明、
     # 规则）因此能跨子目标一直命中。实测依据见 tools/index.py:69-89：system
     # prompt 内部 58% 处一断，缓存从 10,477 token 掉到 1,169。
+    #
+    # `perception` 是**感知通道开关状态**（Manager 侧）：三条通道开着哪几条，
+    # 提示词里要写清楚 —— 否则模型会一直要一张不会来的图，或者按一个被关掉的
+    # 通道去寻址。一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
     "executor/executor.md": {
         "platform": "android",
         "executor_tools_list": "tools",
         "goal": "打开快手赚钱",
+        "perception": _Perception(True, True, "on_demand"),
     },
     # executor.md 的中文兄弟文件。代码块、jinja 变量与英文版逐字节对齐，
     # 所以渲染变量表也保持一致。
@@ -107,6 +125,7 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "platform": "android",
         "executor_tools_list": "tools",
         "goal": "打开快手赚钱",
+        "perception": _Perception(True, True, "on_demand"),
     },
     # reporter.md **完全静态**：没有任何模板变量。Reporter 只写 summary + 挑
     # evidence，outcome / actions_taken / failed_targets 全由代码填（见
@@ -157,9 +176,10 @@ def _branches(base: dict[str, object]) -> list[dict[str, object]]:
             continue
         for value in (None, base[name]):
             variants.append({**base, name: value})
-    # perception 有三个独立开关，至少要覆盖「全开」和「全关」。
+    # perception 有三个独立开关，模板里每种组合都有分支 —— 都要编一遍。
     if isinstance(base.get("perception"), _Perception):
-        variants.append({**base, "perception": _Perception(False, False, False)})
+        for perception in _perception_variants():
+            variants.append({**base, "perception": perception})
     return variants
 
 
