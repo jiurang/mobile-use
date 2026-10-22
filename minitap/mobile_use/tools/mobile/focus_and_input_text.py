@@ -24,6 +24,7 @@ from minitap.mobile_use.tools.utils import (
     resolve_target,
 )
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.screen_fingerprint import build_context, format_context
 from minitap.mobile_use.utils.ui_hierarchy import find_element_by_resource_id, get_element_text
 
 logger = get_logger(__name__)
@@ -158,6 +159,13 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
             if result.ok
             else focus_and_input_text_wrapper.on_failure_fn(text_to_type=text, error=result.error)
         )
+        # 🔴 附上**上下文指纹**（~40 字符）—— 和 tap 同一个理由：
+        # app 改版后 id 会变，**邻居**不会。详见 ``utils/screen_fingerprint.py``。
+        if result.ok and target.resource_id:
+            context = build_context(state.latest_screen_elements, target.resource_id)
+            ctx_text = format_context(context)
+            if ctx_text:
+                agent_outcome = f"{agent_outcome} {ctx_text}"
 
         tool_message = ToolMessage(
             tool_call_id=tool_call_id,

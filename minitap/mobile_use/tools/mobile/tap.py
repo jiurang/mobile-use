@@ -26,6 +26,7 @@ from minitap.mobile_use.tools.utils import (
 )
 from minitap.mobile_use.utils.failed_targets import FailedTarget
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.screen_fingerprint import build_context, format_context
 
 logger = get_logger(__name__)
 
@@ -225,6 +226,21 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
         failure_details = ""  # 成功时用不到，但要在分支外可见
         if success:
             agent_outcome = tap_wrapper.on_success_fn(successful_selector)
+            # 🔴 附上**上下文指纹**（~40 字符）。
+            #
+            # 为什么：真机实测（2026-10-22，快手）同一个「搜索」入口的 id
+            # 4 小时内从 ``right_tv`` 变成 ``thanos_home_top_search``，点赞按钮
+            # 从 ``like_button`` 变成 ``like_element_click_layout`` —— 靠 id
+            # 回放的宏，app 一发版就全废。而**邻居**（那几个 tab 的文字）
+            # 没变。
+            #
+            # 工具结果文字本来就在下一轮 prompt 的历史里，也进 trace ⇒
+            # 一条通道同时解决「宏要能编译」和「宏要能跨版本重定位」两件事。
+            if target.resource_id:
+                context = build_context(state.latest_screen_elements, target.resource_id)
+                ctx_text = format_context(context)
+                if ctx_text:
+                    agent_outcome = f"{agent_outcome} {ctx_text}"
             # 成功即清账：模型已经换了目标，「连续失败」这件事到此为止。
             failed_targets: list[FailedTarget] = []
         else:

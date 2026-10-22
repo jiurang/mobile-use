@@ -7,6 +7,11 @@ from minitap.mobile_use.tools.mobile.focus_and_clear_text import focus_and_clear
 from minitap.mobile_use.tools.mobile.focus_and_input_text import focus_and_input_text_wrapper
 from minitap.mobile_use.tools.mobile.launch_app import launch_app_wrapper
 from minitap.mobile_use.tools.mobile.long_press_on import long_press_on_wrapper
+from minitap.mobile_use.tools.mobile.macros import (
+    find_macros_wrapper,
+    run_macro_wrapper,
+    save_macro_wrapper,
+)
 from minitap.mobile_use.tools.mobile.open_link import open_link_wrapper
 from minitap.mobile_use.tools.mobile.press_key import press_key_wrapper
 from minitap.mobile_use.tools.mobile.stop_app import stop_app_wrapper
@@ -44,6 +49,10 @@ EXECUTOR_WRAPPERS_TOOLS = [
     save_note_wrapper,
     read_note_wrapper,
     list_notes_wrapper,
+    # 宏（脚本）：查 / 存 / 跑。跑宏是**零次 LLM 调用**的一串已决定的动作。
+    find_macros_wrapper,
+    save_macro_wrapper,
+    run_macro_wrapper,
 ]
 
 VIDEO_RECORDING_WRAPPERS = [
