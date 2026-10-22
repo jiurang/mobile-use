@@ -16,6 +16,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
 )
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
+from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.tools.index import (
     EXECUTOR_WRAPPERS_TOOLS,
     VIDEO_RECORDING_WRAPPERS,
@@ -130,6 +131,33 @@ class PlannerNode:
     )
     async def __call__(self, state: State):
         needs_replan = one_of_them_is_failure(state.subgoal_plan)
+
+        # 重规划计数（方案 §11.6「replan 触发计数」）。
+        #
+        # 这个埋点唯一的用途是**验证看门狗还活着（R16）**：R16 要求「计划级失败
+        # 不能没人管」，新拓扑里的处理链是
+        # ``reporter → orchestrator → convergence → replan → planner`` ——
+        # 每一次真正走到 replan，就证明这条链通了。反过来，「跑了很久却一次
+        # replan 都没有」有两种可能：一次没失败过（正常），或者**看门狗断了**
+        # （子目标失败了没人接手，Cortex 一直重发到撞 recursion_limit）。
+        # 这两种光看别的指标分不开。
+        #
+        # 埋在这里而不是 `convergence_gate`：那个是纯函数，拿不到 task_id；
+        # 而 planner 正好算得出 `needs_replan`。
+        #
+        # ⚠️ 只报数量，不报子目标原文（原文是用户数据）。
+        if needs_replan:
+            telemetry.capture_replan(
+                task_id=self.ctx.trace_id,
+                plan_version=state.plan_version,
+                failed_subgoals=sum(
+                    1 for s in state.subgoal_plan if s.status == SubgoalStatus.FAILURE
+                ),
+                completed_subgoals=sum(
+                    1 for s in state.subgoal_plan if s.status == SubgoalStatus.SUCCESS
+                ),
+                total_subgoals=len(state.subgoal_plan),
+            )
 
         current_locked_app_package = (
             self.ctx.execution_setup.get_locked_app_package() if self.ctx.execution_setup else None

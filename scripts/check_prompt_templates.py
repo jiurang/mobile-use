@@ -5,8 +5,8 @@
 最后一步渲染 prompt 时才崩。模板必须能在不接设备的情况下先编一遍。
 
 这里的变量表逐条抄自各 agent 真实的 `.render(...)` 调用点（cortex.py / planner.py /
-executor.py / contextor.py / orchestrator.py / hopper.py / video_analyzer.py），
-所以它既能挡住语法错，也能挡住「模板引用了代码从没传过的变量」。
+executor.py / contextor.py / orchestrator.py / hopper.py / video_analyzer.py /
+reporter.py），所以它既能挡住语法错，也能挡住「模板引用了代码从没传过的变量」。
 
 可用变量取值要覆盖两种分支：{% if x %} 只跑一种取值时，少写的 {% else %} / {% endif %}
 依然编得过，所以 locked_app_package / video_recording_enabled 都要试 None 与真值。
@@ -22,7 +22,6 @@ import sys
 from pathlib import Path
 
 from jinja2 import Environment, StrictUndefined
-from jinja2.exceptions import TemplateError
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
@@ -91,8 +90,21 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "previous_plan": "subgoal-0",
         "agent_thoughts": "thought",
     },
-    # executor.py:126
-    "executor/executor.md": {"platform": "android"},
+    # executor.py 的 system prompt 渲染（契约 W1.1）—— 三个变量，缺一不可。
+    # goal 放在模板**末尾**是有意的，不是随手写的：executor.md 里只有 goal 会变
+    # （Cortex 每下发一个子目标就换一个），而前缀缓存是**前缀**匹配 —— goal 后面
+    # 的一切每次换子目标都要重算。它前面那段静态内容（工具表、元素索引说明、
+    # 规则）因此能跨子目标一直命中。实测依据见 tools/index.py:69-89：system
+    # prompt 内部 58% 处一断，缓存从 10,477 token 掉到 1,169。
+    "executor/executor.md": {
+        "platform": "android",
+        "executor_tools_list": "tools",
+        "goal": "打开快手赚钱",
+    },
+    # reporter.md **完全静态**：没有任何模板变量。Reporter 只写 summary + 挑
+    # evidence，outcome / actions_taken / failed_targets 全由代码填（见
+    # agents/executor/types.py:ExecutorReport），所以它不需要模板变量。
+    "reporter/reporter.md": {},
     # contextor.py:218
     "contextor/contextor.md": {
         "task_goal": "打开快手赚钱",
@@ -125,7 +137,9 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
 }
 
 # 这些变量在生产里取值可能为 None，每个取值都要编一遍。
-OPTIONAL_VARS = ("locked_app_package", "video_recording_enabled")
+# goal 也要进来：executor.md 里它是「有就内联、没有就指向下一条消息」两个分支，
+# 只编一个分支的话，写坏的 {% else %} 照样「全过」。
+OPTIONAL_VARS = ("locked_app_package", "video_recording_enabled", "goal")
 
 
 def _branches(base: dict[str, object]) -> list[dict[str, object]]:
@@ -172,7 +186,8 @@ def main() -> int:
     checked, failures = check()
     for f in failures:
         print(f"FAIL {f}")
-    print(f"\n{checked - len(failures)}/{checked} 渲染通过" if failures else f"{checked}/{checked} 渲染通过")
+    passed = checked - len(failures)
+    print(f"\n{passed}/{checked} 渲染通过" if failures else f"{checked}/{checked} 渲染通过")
     return 1 if failures else 0
 
 

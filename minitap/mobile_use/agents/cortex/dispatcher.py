@@ -131,6 +131,18 @@ def _looks_valid(action: dict, tool: BaseTool, thought: str) -> dict | None:
     另外顺手拦一类最常见的形态错误：声明为对象的参数（比如 `target`）
     传了字符串或数字 —— 这种在 ToolNode 里报错太晚，直接退回 LLM 更划算。
     """
+    kwargs, _reason = _looks_valid_with_reason(action, tool, thought)
+    return kwargs
+
+
+def _looks_valid_with_reason(
+    action: dict, tool: BaseTool, thought: str
+) -> tuple[dict | None, str | None]:
+    """和 `_looks_valid` 一样，但**同时返回给模型看的拒绝理由**。
+
+    理由要能直接塞进下一轮 prompt —— 模型得知道**自己错在哪**，
+    光说「不合法」它只会换个方式再犯一次。
+    """
     kwargs = {k: v for k, v in action.items() if k not in _NAME_KEYS}
     kwargs["agent_thought"] = kwargs.get("agent_thought") or thought
 
@@ -138,20 +150,28 @@ def _looks_valid(action: dict, tool: BaseTool, thought: str) -> dict | None:
     for key in kwargs:
         if key not in visible:
             logger.info(f"Dispatch: unknown arg '{key}' for tool '{tool.name}'")
-            return None
+            return None, (
+                f"'{key}' is not a valid argument for '{tool.name}'; "
+                f"its arguments are: {', '.join(sorted(visible))}"
+            )
 
     missing = _required_args(tool) - set(kwargs)
     if missing:
         logger.info(f"Dispatch: tool '{tool.name}' missing {sorted(missing)}")
-        return None
+        return None, (
+            f"'{tool.name}' is missing required argument(s): {', '.join(sorted(missing))}"
+        )
 
     for key, value in kwargs.items():
         prop = visible.get(key) or {}
         if prop.get("type") == "object" and not isinstance(value, dict):
             logger.info(f"Dispatch: arg '{key}' of '{tool.name}' should be an object")
-            return None
+            return None, (
+                f"'{key}' of '{tool.name}' must be an object, "
+                f"e.g. {key}: {{\"index\": 7}}"
+            )
 
-    return kwargs
+    return kwargs, None
 
 
 def dispatch_decisions(
@@ -171,15 +191,54 @@ def dispatch_decisions(
         调用方必须退回 Executor 的 LLM 路径。空列表也返回 None
         （没有动作可发，和「解析失败」在调用方的处理方式是一样的）。
     """
+    calls, _reason = dispatch_decisions_with_reason(decisions, default_thought, tools)
+    return calls
+
+
+def dispatch_decisions_with_reason(
+    decisions: str | None,
+    default_thought: str | None,
+    tools: list[BaseTool],
+) -> tuple[list[ToolCall] | None, str | None]:
+    """和 `dispatch_decisions` 一样，但**同时返回拒绝理由**。
+
+    为什么需要它
+    ------------
+    旧架构里 dispatcher 失败 → 退回 Executor 的 LLM **重新转写**同一批
+    decisions，那是有意义的（转写器重试可能就写对了）。
+
+    新架构里 Executor 的 LLM **就是决策者**（它自己决定动作），
+    所以「退回 LLM」退回来的还是同一个决策者 —— 它大概率输出**同样的坏动作**，
+    因为它没看到自己错在哪。这会变成死循环。
+
+    ⇒ 正确的做法是把**拒绝理由**回灌给 Executor，让它带着
+    「你刚才说的 `teleport` 不是个工具」重新决策。
+
+    Returns:
+        `(tool_calls, reason)`。成功时 reason 为 None；
+        失败时 tool_calls 为 None、reason 是给模型看的一句话。
+    """
     actions = parse_actions(decisions)
     if not actions:
-        return None
+        # ⚠️ **空 actions 和「解析失败」是两回事**，回灌给模型的理由必须不同：
+        #   * 空 actions —— 模型**没决定任何动作**（它可能卡住了 / 上一轮失败了）。
+        #     说「格式错」会让它去改格式，而它本来就没格式问题。
+        #   * 解析失败 —— 模型输出的东西根本不是 JSON 数组。
+        if decisions is not None and decisions.strip() in ("[]", "[ ]"):
+            return None, (
+                "you returned an empty action list — decide one concrete action to take, "
+                "or set done=true if the goal is already reached"
+            )
+        return None, (
+            "the decisions could not be parsed as a JSON array of actions; "
+            "see the Tools table for the expected shape"
+        )
 
     thought = (default_thought or "").strip()
     if not thought:
         # agent_thought 是所有工具的必填参数，没有它发不出去。
         logger.info("Dispatch: no agent_thought available (decisions_reason empty)")
-        return None
+        return None, "agent_thought is required for every action"
 
     by_name = {tool.name: tool for tool in tools}
     calls: list[ToolCall] = []
@@ -191,11 +250,14 @@ def dispatch_decisions(
         tool = by_name.get(tool_name) if tool_name else None
         if tool is None:
             logger.info(f"Dispatch: unknown tool {tool_name!r} (action #{index})")
-            return None
+            return None, (
+                f"'{tool_name}' is not a known tool; "
+                f"available tools are: {', '.join(sorted(by_name))}"
+            )
 
-        kwargs = _looks_valid(action, tool, thought)
+        kwargs, reason = _looks_valid_with_reason(action, tool, thought)
         if kwargs is None:
-            return None
+            return None, reason
 
         calls.append(
             ToolCall(name=tool.name, args=kwargs, id=f"dispatch_{uuid.uuid4().hex[:12]}")
@@ -205,4 +267,4 @@ def dispatch_decisions(
         f"Dispatch: direct execution of {len(calls)} action(s) "
         f"[{', '.join(c['name'] for c in calls)}] — skipping executor LLM"
     )
-    return calls
+    return calls, None

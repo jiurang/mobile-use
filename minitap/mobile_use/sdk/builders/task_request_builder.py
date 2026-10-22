@@ -7,7 +7,7 @@ from typing import Self, TypeVar, cast
 
 from pydantic import BaseModel
 
-from minitap.mobile_use.constants import RECURSION_LIMIT
+from minitap.mobile_use.constants import DEFAULT_MAX_STEPS
 from minitap.mobile_use.sdk.types.agent import AgentProfile
 from minitap.mobile_use.sdk.types.task import TaskRequest, TaskRequestCommon
 
@@ -22,7 +22,7 @@ class TaskRequestCommonBuilder(BaseModel):
     """
 
     def __init__(self):
-        self._max_steps = RECURSION_LIMIT
+        self._max_steps = DEFAULT_MAX_STEPS
         self._record_trace = False
         self._trace_path = Path("mobile-use-traces")
         self._llm_output_path: Path | None = None

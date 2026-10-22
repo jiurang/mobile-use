@@ -1,3 +1,25 @@
-RECURSION_LIMIT = 400
+# 任务默认的动作步预算。
+#
+# ⚠️ **口径变更（2026-10-21，方案 §11.5 M12）**：这个值以前叫 `RECURSION_LIMIT`、
+# 是 400，含义是「LangGraph 的 `recursion_limit`」—— 而那个量数的是**图的
+# super-step**（节点执行次数），不是「动作步」。
+#
+# 改造前实测：400 个 super-step ≈ **66 个动作步**（6.05 super-step/动作步）。
+# 现在 `max_steps` 的语义统一成「**动作步**」，由 `sdk/agent.py` 的
+# `compute_recursion_limit()` 换算成 super-step 上限。
+#
+# 所以默认值必须跟着下调 —— 否则同一个默认值的最坏情况花费会涨 6 倍多：
+# 一次跑飞的任务从烧 66 步变成烧 400 步，正好和这轮改造的降本目标相反。
+#
+# **80 是这么定的**：实测新拓扑典型 5.2 super-step/动作步、最坏 9 个
+# （`scripts/probe_superstep_budget.py`），80 × 5.2 ≈ 416 —— 和改造前 400 个
+# super-step 的预算基本对齐；而每步的开销从「一次带截图的 cortex 调用」变成
+# 「一次 executor 调用」，单步比改造前便宜，所以 80 是保守的。
+#
+# ⚠️ 显式调用 `with_max_steps(N)` 的语义**也**变了：N 现在真的是 N 个动作步
+# （改造前 N 个 super-step ≈ N/6 个动作步）。这属于把一个一直被误用的字段
+# 拉回它字面上的意思，不是新加的限制。
+DEFAULT_MAX_STEPS = 80
+
 MAX_MESSAGES_IN_HISTORY = 25
 EXECUTOR_MESSAGES_KEY = "executor_messages"

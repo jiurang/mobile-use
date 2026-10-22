@@ -38,6 +38,11 @@ from minitap.mobile_use.utils.llm_usage import extract_usage
 # Graph node -> display label. Mirrors the `add_node` calls in graph/graph.py.
 # Nodes outside this set (the graph itself, LangGraph internals, sub-chains
 # inside a node such as structured-output parsers) are ignored on purpose.
+#
+# ⚠️ 这是一份**硬编码白名单**：`on_chain_start` 里 `node not in AGENT_LABELS`
+# 就直接 return，所以名单里没有的节点在 TUI 里**完全不出现**（静默消失，
+# 不是报错）。Executor 自主执行架构（2026-10-21）新增的 `reporter` 节点
+# 必须登记在这里，否则用户看不到「这一轮汇报了」。
 AGENT_LABELS: dict[str, str] = {
     "planner": "planner",
     "orchestrator": "orchestrator",
@@ -45,6 +50,8 @@ AGENT_LABELS: dict[str, str] = {
     "cortex": "cortex",
     "executor": "executor",
     "executor_tools": "executor_tools",
+    # 汇报节点：把 executor 的执行日志压成结论，用户要能一眼看出「这一轮汇报了」
+    "reporter": "reporter",
     "summarizer": "summarizer",
 }
 

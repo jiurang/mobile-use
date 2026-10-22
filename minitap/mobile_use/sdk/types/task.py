@@ -10,7 +10,7 @@ from typing import Any, Literal, TypeVar, overload
 from pydantic import BaseModel, Field
 
 from minitap.mobile_use.config import LLMConfig, get_default_llm_config
-from minitap.mobile_use.constants import RECURSION_LIMIT
+from minitap.mobile_use.constants import DEFAULT_MAX_STEPS
 from minitap.mobile_use.context import DeviceContext
 from minitap.mobile_use.sdk.utils import load_llm_config_override
 
@@ -65,7 +65,7 @@ class TaskRequestBase(BaseModel):
     Defines common parameters of a mobile automation task request.
     """
 
-    max_steps: int = RECURSION_LIMIT
+    max_steps: int = DEFAULT_MAX_STEPS
     record_trace: bool = False
     trace_path: Path = Path("mobile-use-traces")
     llm_output_path: Path | None = None
@@ -77,7 +77,7 @@ class TaskRequestCommon(TaskRequestBase):
     Defines common parameters for any task request.
     """
 
-    max_steps: int = RECURSION_LIMIT
+    max_steps: int = DEFAULT_MAX_STEPS
     locked_app_package: str | None = None
     app_path: Path | None = None
     """Path to an app to install before running the task.

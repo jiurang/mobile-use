@@ -2,6 +2,7 @@ import logging
 import sys
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from colorama import Fore, Style, init
 
@@ -73,22 +74,22 @@ class MobileUseLogger:
 
         self.logger.addHandler(file_handler)
 
-    def debug(self, message: str, **kwargs):
+    def debug(self, message: str, **kwargs: Any):
         self.logger.debug(message, extra={"log_level": LogLevel.DEBUG}, **kwargs)
 
-    def info(self, message: str, **kwargs):
+    def info(self, message: str, **kwargs: Any):
         self.logger.info(message, extra={"log_level": LogLevel.INFO}, **kwargs)
 
-    def success(self, message: str, **kwargs):
+    def success(self, message: str, **kwargs: Any):
         self.logger.info(message, extra={"log_level": LogLevel.SUCCESS}, **kwargs)
 
-    def warning(self, message: str, **kwargs):
+    def warning(self, message: str, **kwargs: Any):
         self.logger.warning(message, extra={"log_level": LogLevel.WARNING}, **kwargs)
 
-    def error(self, message: str, **kwargs):
+    def error(self, message: str, **kwargs: Any):
         self.logger.error(message, extra={"log_level": LogLevel.ERROR}, **kwargs)
 
-    def critical(self, message: str, **kwargs):
+    def critical(self, message: str, **kwargs: Any):
         self.logger.critical(message, extra={"log_level": LogLevel.CRITICAL}, **kwargs)
 
     def header(self, message: str, **_kwargs):

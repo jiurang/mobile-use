@@ -25,6 +25,7 @@ AGENT_ROLE_NAMES: tuple[str, ...] = (
     "contextor",
     "cortex",
     "executor",
+    "reporter",
 )
 UTILS_ROLE_NAMES: tuple[str, ...] = (
     "outputter",
@@ -93,7 +94,7 @@ def llm_config_for_single_model(
     """把「一条渠道」铺成一份完整的 LLMConfig —— 每个角色都用它。
 
     存在的意义:runner(PC 或 apk 里跑的那份)拿到 manager 下发的渠道参数后,不该
-    自己知道 mobile-use 有 planner/cortex/executor/... 这 8 个角色名,更不该漏掉
+    自己知道 mobile-use 有 planner/cortex/executor/... 这 9 个角色名,更不该漏掉
     其中一个 —— 漏掉的那个会静默落回默认模型,是最难查的一类故障。所以角色清单留在
     这一侧维护。
 
@@ -124,7 +125,7 @@ def llm_config_for_role_overrides(
     """把「一条基础渠道 + 按角色的覆盖」铺成一份完整的 LLMConfig。
 
     和 :func:`llm_config_for_single_model` 的区别只有一处：**每个角色可以指向
-    不同的模型**。基础渠道填满全部 8 个角色，``overrides`` 里点名的角色改用自己的
+    不同的模型**。基础渠道填满全部 9 个角色，``overrides`` 里点名的角色改用自己的
     接入参数，其余角色照旧。
 
     为什么覆盖必须自带**完整**的接入参数（provider + model + 可选的 key/端点/温度），
@@ -139,7 +140,7 @@ def llm_config_for_role_overrides(
             「我给 cortex 指定了模型，它还在用默认的」。
 
     Returns:
-        一份 8 个角色全部有值的 LLMConfig。
+        一份 9 个角色全部有值的 LLMConfig。
     """
     role_map = dict(overrides or {})
     unknown = sorted(set(role_map) - set(ALL_ROLE_NAMES))
@@ -160,6 +161,7 @@ def llm_config_for_role_overrides(
         contextor=_llm_node(spec_for("contextor")),
         cortex=_llm_node(spec_for("cortex")),
         executor=_llm_node(spec_for("executor")),
+        reporter=_llm_node(spec_for("reporter")),
         utils=LLMConfigUtils(
             outputter=_llm_node(spec_for("outputter")),
             hopper=_llm_node(spec_for("hopper")),

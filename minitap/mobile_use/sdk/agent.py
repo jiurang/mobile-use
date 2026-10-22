@@ -73,6 +73,85 @@ TOutput = TypeVar("TOutput", bound=BaseModel | None)
 load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# recursion_limit 换算（方案 §11.5 M12 / §10 R21）
+# ---------------------------------------------------------------------------
+#
+# LangGraph 的 `recursion_limit` 数的是**图的 super-step**（= 节点执行次数），
+# 既不是 LLM 调用次数，也不是「动作步」。所以 `max_steps`（用户填的
+# 「最多跑几步」）不能直接当 `recursion_limit` 用 —— 改造前后图的形状变了，
+# 同一个 `max_steps` 能跑的动作数会差好几倍。
+#
+# 实测依据（langgraph 1.2.15；探针 `scripts/probe_superstep_budget.py`，
+# 复刻真实拓扑 + 真 `State` + 真条件边，不调 LLM、不碰设备）：
+#
+# 1. `recursion_limit = R` → 恰好跑 **R 个** super-step 就撞
+#    `GraphRecursionError`（实测 R=3/5/7/10/13/20/50 → 节点执行 3/5/7/10/13/20/50）。
+#    LangGraph 内部是 `stop = step + recursion_limit + 1`（`pregel/_loop.py:1859`），
+#    净效果就是「R 个 super-step」—— 用不着去掰扯那个 +1。
+#
+# 2. **改造前**的图：一轮 = contextor + cortex + executor + executor_tools +
+#    summarizer + convergence = **6** 个 super-step 才跑 **1** 个动作
+#    （实测 R=400 → 399 super-step / 66 次工具执行 = 6.05）。
+#
+# 3. **改造后**的图（Executor 自主循环）：
+#    * 一个动作步 = contextor + executor + executor_tools + summarizer = **4** 个
+#      super-step（工具执行完必须回 contextor 重建元素表 —— 索引契约，见
+#      `graph/graph.py` 的模块文档）；
+#    * 每个子目标另有固定开销 **9** 个：cortex 下发 1 + 收尾那轮 2
+#      （contextor + executor 报 done）+ reporter 1 + orchestrator×2
+#      + convergence×2 + cortex 验收 1；
+#    * 起跑 **3** 个：planner + orchestrator + convergence。
+#
+# ⇒ 精确模型（探针实测 S 个子目标 × 每目标 K 个动作步，**误差 0**）：
+#       super_steps = 3 + S × (4K + 9)
+#       executor 步数 E = S × (K + 1)
+#   ⇒ super_steps = 3 + 4E + 5S
+#   ⇒ 每个动作步最坏要 **9** 个 super-step（K=0：子目标一步没做就收尾）；
+#     典型情况（K=4~5，方案 §4.3 真机实测）只要 5.0~4.6 个。
+#
+# 系数取**最坏情况 9**：宁可多给，不能少给 —— 给少了任务会在中途撞
+# `GraphRecursionError` 直接崩掉，已经花掉的钱和跑过的步数全白费。
+# 代价只是「跑飞的任务多烧一点」：上限是天花板，不是配额。
+
+SUPER_STEPS_PER_ACTION_STEP = 9
+
+# 固定开销：起跑 3 + 收尾 1 + 4 次 replan 的余量（planner + orchestrator +
+# convergence + cortex = 4 个/次，replan 不产生动作步但照样吃 super-step）
+# + 保险。给固定开销留够，是为了让「起跑就撞上限」这种边角情况也能跑完。
+FIXED_SUPER_STEPS = 32
+
+
+def compute_recursion_limit(max_steps: int) -> int:
+    """把「最多跑多少个动作步」换算成 LangGraph 的 `recursion_limit`。
+
+    `max_steps` 的语义是**动作步数**（用户填「最多跑几步」），
+    `recursion_limit` 的语义是**图节点执行次数**。两者不是一回事。
+
+    公式（系数 9 是实测值，见上面那段注释）：
+
+        recursion_limit = max_steps × 9 + 32
+
+    负数按 0 算（`max_steps` 没有下界校验，这里兜住）。
+    """
+    return max(max_steps, 0) * SUPER_STEPS_PER_ACTION_STEP + FIXED_SUPER_STEPS
+
+
+def count_action_steps(state: State | None) -> int:
+    """这个任务实际跑了多少个**动作步**（上报用的 `steps_count`）。
+
+    口径（方案 §11.5 M13）：`state.total_steps` —— executor 节点每跑一轮 +1，
+    跨子目标累加、换目标不归零。
+
+    **不能**用 `len(state.agents_thoughts)`：改造后 Contextor 每个动作步写 1 条
+    thought（`agents/contextor/contextor.py:191`），Cortex / Orchestrator 每个子目标
+    再各写几条 —— thought 的**条数**是「感知 + 监督的次数」，和「跑了多少个动作步」
+    根本不是一个东西。拿它当步数上报，看板上看到的是「想了几次」而不是
+    「干了几个动作」。
+    """
+    return state.total_steps if state else 0
+
+
 class Agent:
     _config: AgentConfig
     _tasks: list[Task] = []
@@ -677,7 +756,7 @@ class Agent:
                 async for chunk in (await get_graph(context)).astream(
                     input=graph_input,
                     config={
-                        "recursion_limit": task.request.max_steps,
+                        "recursion_limit": compute_recursion_limit(task.request.max_steps),
                         "callbacks": self._config.graph_config_callbacks,
                     },
                     stream_mode=["messages", "custom", "updates", "values"],
@@ -719,7 +798,7 @@ class Agent:
                 logger.info(f"✅ Automation '{task_name}' is success ✅")
                 await task.finalize(content=output, state=last_state_snapshot)
                 duration = (datetime.now(UTC) - task_start_time).total_seconds()
-                steps_count = len(last_state.agents_thoughts) if last_state else 0
+                steps_count = count_action_steps(last_state)
                 telemetry.capture_task_completed(
                     task_id=task_id,
                     success=True,
@@ -737,7 +816,7 @@ class Agent:
                     cancelled=True,
                 )
                 duration = (datetime.now(UTC) - task_start_time).total_seconds()
-                steps_count = len(last_state.agents_thoughts) if last_state else 0
+                steps_count = count_action_steps(last_state)
                 telemetry.capture_task_completed(
                     task_id=task_id,
                     success=False,
@@ -755,7 +834,7 @@ class Agent:
                     error=err,
                 )
                 duration = (datetime.now(UTC) - task_start_time).total_seconds()
-                steps_count = len(last_state.agents_thoughts) if last_state else 0
+                steps_count = count_action_steps(last_state)
                 telemetry.capture_task_completed(
                     task_id=task_id,
                     success=False,

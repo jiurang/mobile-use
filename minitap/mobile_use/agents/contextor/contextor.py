@@ -1,6 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
+from typing import Any, cast
 
 from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -20,20 +21,22 @@ from minitap.mobile_use.services.ocr.types import OcrEngine, OcrText
 from minitap.mobile_use.utils.app_launch_utils import launch_app_with_retries
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.screen_elements import ScreenElement, build_screen_elements
+from minitap.mobile_use.utils.ui_hierarchy_view import normalize_hierarchy
 
 logger = get_logger(__name__)
 
 
 class ContextorNode:
     def __init__(self, ctx: MobileUseContext):
-        self.ctx = ctx
+        self.ctx: MobileUseContext = ctx
 
     @wrap_with_callbacks(
         before=lambda: logger.info("Starting Contextor Agent"),
         on_success=lambda _: logger.success("Contextor Agent"),
         on_failure=lambda _: logger.error("Contextor Agent"),
     )
-    async def __call__(self, state: State):
+    async def __call__(self, state: State) -> dict[str, Any]:
         device_controller = create_device_controller(self.ctx)
 
         # ---- 屏幕沉降等待（动作后至少等这么久才抓屏）----
@@ -94,10 +97,7 @@ class ContextorNode:
                 screen_state = await power_task
 
         if screen_state == "off":
-            logger.warning(
-                "[contextor] The screen is OFF — the screenshot is black and the element "
-                "tree only holds systemui leftovers. The agent will be told to wake it up."
-            )
+            logger.warning("[contextor] Screen is OFF — agent will be told to wake it up.")
 
         if not ocr_done:
             # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
@@ -114,33 +114,66 @@ class ContextorNode:
             if should_verify_app_lock:
                 if current_app_package:
                     try:
-                        verification: AppLockVerificationOutput = (
-                            await self._handle_app_lock_verification(
-                                state=state,
-                                current_app_package=current_app_package,
-                                locked_app_package=locked_app_package,
-                            )
+                        verification = await self._handle_app_lock_verification(
+                            state=state,
+                            current_app_package=current_app_package,
+                            locked_app_package=locked_app_package,
                         )
                         agent_outcome = verification.to_optional_message()
                     except Exception as e:
                         logger.error(f"Failed to verify app lock: {e}")
                 else:
                     logger.warning(
-                        f"App lock feature is setup for {locked_app_package}, "
-                        "but could not determine current app, skipping"
+                        f"App lock: current app unknown, skipping ({locked_app_package})"
                     )
             else:
-                logger.warning(
-                    f"App lock feature is setup for {locked_app_package}, "
-                    "but initial launch was not successful, skipping"
-                )
+                logger.warning(f"App lock: initial launch failed, skipping ({locked_app_package})")
 
         ocr_results = ocr_box[0] if ocr_box else None
+
+        # ---- 屏幕元素表：UI 层级树 + OCR 合成**一张**统一索引的表 ----
+        #
+        # 为什么建在这里（以前在 cortex 里建）：这张表**就是索引契约**本身 ——
+        # 模型报的 `Target.index` 要还原成「它当时看到的那一行」，编号只在
+        # **那一次裁剪**上成立（屏可能已经变了，执行时重新 dump 再重新编号，
+        # 编号会和模型看到的不一致）。
+        #
+        # 所以建表必须和抓屏在**同一个节点**里做完：抓屏和建表之间不可能有
+        # 任何动作插进来，工具读到的就一定是模型看到的那一屏的表。
+
+        # `perception.ui_hierarchy` 是「要不要把层级树给模型看」的开关（不是抓不抓，
+        # 控制器照样把树返回来）。关掉时整条层级树通道都不走，表里也不会有 UI 行。
+        # 用 getattr 兜底：精简过的 perception 对象（测试替身）可能没这个字段，
+        # 缺省按 PerceptionConfig 的默认值 True（= 开）处理。
+        use_ui_hierarchy = getattr(self.ctx.perception, "ui_hierarchy", True)
+        tree_rows: list[dict[str, Any]] | None = None
+        if use_ui_hierarchy and device_data.elements:
+            tree_rows = normalize_hierarchy(device_data.elements)
+
+        screen_elements: list[ScreenElement] = []
+        if tree_rows is not None:
+            screen_elements = build_screen_elements(
+                tree_rows=tree_rows,
+                ocr_results=(ocr_results if self.ctx.perception.ocr else None),
+                foreground_package=current_app_package,
+            )
+        # tree_rows is None = 层级树形状不认识（iOS / 云设备）→ 建不出表，
+        # 元素表留空。工具侧会因此走 `latest_ocr_results` 的老路径
+        # （tools/utils.py:384-398），那边**不用改**。
+        # 这里是「不猜」：猜错就是静默剥夺别的平台的感知能力。
 
         return await state.asanitize_update(
             ctx=self.ctx,
             update={
-                "latest_ui_hierarchy": device_data.elements,
+                # 索引契约本身，**不能被清空**：工具要把 Target.index 还原成
+                # 当屏那一行的真实坐标，只有这一次裁剪的结果算数。
+                # 下一次 contextor 会整体覆盖它。
+                "latest_screen_elements": screen_elements,
+                # 建完表就清空层级树：它没有索引契约，工具侧走
+                # controller.get_ui_elements() 现取即可。留着它会让工具侧
+                # 按 id / 文字查找的分支复活（tools/utils.py:178,197）——
+                # 那是行为变更，不在本次范围内。
+                "latest_ui_hierarchy": None,
                 "latest_ocr_results": ocr_results,
                 "latest_screenshot": device_data.base64,
                 "focused_app_info": current_app_package,
@@ -197,11 +230,8 @@ class ContextorNode:
         try:
             started = time.perf_counter()
             results = engine.recognize(screenshot_base64)
-            logger.info(
-                f"OCR: {len(results)} texts in "
-                f"{(time.perf_counter() - started) * 1000:.0f}ms "
-                f"(engine={engine.name})"
-            )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info(f"OCR: {len(results)} texts in {elapsed_ms:.0f}ms (engine={engine.name})")
             return results
         except Exception as e:
             logger.warning(f"OCR failed, continuing without it: {type(e).__name__}: {e}")
@@ -232,10 +262,7 @@ class ContextorNode:
                 status="already_in_foreground",
             )
 
-        logger.warning(
-            f"App lock violation detected: expected '{locked_app_package}', "
-            f"but current app is '{current_app_package}'"
-        )
+        logger.warning(f"App lock: want {locked_app_package}, got {current_app_package}")
 
         decision: ContextorOutput = await self._invoke_contextor_llm(
             initial_goal=state.initial_goal,
@@ -300,18 +327,21 @@ class ContextorNode:
             ctx=self.ctx, name="contextor", use_fallback=True
         ).with_structured_output(ContextorOutput)
 
-        response: ContextorOutput = await with_fallback(
-            main_call=lambda: invoke_llm_with_timeout_message(
-                llm.ainvoke(messages),
-                agent_name="contextor",
-                task_id=self.ctx.trace_id,
+        response = cast(
+            ContextorOutput,
+            await with_fallback(
+                main_call=lambda: invoke_llm_with_timeout_message(
+                    llm.ainvoke(messages),
+                    agent_name="contextor",
+                    task_id=self.ctx.trace_id,
+                ),
+                fallback_call=lambda: invoke_llm_with_timeout_message(
+                    llm_fallback.ainvoke(messages),
+                    agent_name="contextor",
+                    task_id=self.ctx.trace_id,
+                    used_fallback=True,
+                ),
             ),
-            fallback_call=lambda: invoke_llm_with_timeout_message(
-                llm_fallback.ainvoke(messages),
-                agent_name="contextor",
-                task_id=self.ctx.trace_id,
-                used_fallback=True,
-            ),
-        )  # type: ignore
+        )
 
         return response
