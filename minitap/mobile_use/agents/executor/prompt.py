@@ -332,7 +332,6 @@ def build_executor_messages(
     failures: list[dict],
     local_messages: list[AnyMessage],
     device_state_lines: list[str],
-    screenshot_message: AnyMessage | None = None,
     ocr_results: list | None = None,
 ) -> list[BaseMessage]:
     """组装 Executor 每一轮的 prompt。
@@ -345,12 +344,16 @@ def build_executor_messages(
         [4] HumanMessage    失败事实清单（每轮变：会增长）
         [5] HumanMessage    设备状态（每轮变：前台 app 会变）
         [6] HumanMessage    屏幕元素表（每轮变：重编号）—— **必须最后**
-        [7] HumanMessage    截图（仅 need_screenshot 时）
 
     ⚠️ **顺序 = 缓存命中率**。前缀缓存只覆盖从头开始的连续前缀：
     任何每轮变的内容排在局部历史**之前**，它之后的整段历史每轮都要满价重算。
     真机实测（2026-10-21）：设备状态和失败清单卡在历史前面时，
     executor 的缓存命中率只有 15.8%（六个 agent 里最差，而它调用量最大）。
+
+    🔴 **2026-10-22 删掉了原来的 [7] 截图块**。Executor 的截图通道整条关掉了
+    （见 `agents/executor/types.py`），prompt 里不再有图。
+    这同时少了一个**永远不可缓存**的块 —— 截图的 base64 长度随画面变，
+    前缀缓存直接失效。
 
     Args:
         ctx: 运行上下文。
@@ -363,7 +366,6 @@ def build_executor_messages(
             过长的成功工具结果**（见 :func:`truncate_local_history`），
             ``state`` 里的原对象不动 —— Reporter 读的是原对象。
         device_state_lines: 设备状态行。
-        screenshot_message: 截图消息（仅在模型要图时才有）。
         ocr_results: OCR 结果。**只在没有元素表时用**（iOS / 云设备路径），
             渲染成 legacy OCR 块，并**带上「用 ocr_index」的说明段**。
 
@@ -423,8 +425,5 @@ def build_executor_messages(
         ocr_text = render_legacy_ocr_block(ocr_results)
         if ocr_text:
             messages.append(HumanMessage(content=ocr_text))
-
-    if screenshot_message is not None:
-        messages.append(screenshot_message)
 
     return messages

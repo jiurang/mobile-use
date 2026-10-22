@@ -69,20 +69,30 @@ def main() -> int:
         ),
         "failed",
     )
-    check(
-        f"步数超限({MAX_STEPS_PER_SUBGOAL + 1}) → blocked",
-        determine_outcome_for(
-            _state(executor_done=True, executor_steps=MAX_STEPS_PER_SUBGOAL + 1)
-        ),
-        "blocked",
-    )
-    check(
-        "步数恰好等于上限 → 不算超限",
-        determine_outcome_for(
-            _state(executor_done=True, executor_steps=MAX_STEPS_PER_SUBGOAL)
-        ),
-        "completed",
-    )
+    # ⚠️ 步数上限**默认不限**（`MAX_STEPS_PER_SUBGOAL = None`，2026-10-22 起）。
+    # ⇒ 默认下 outcome **永远不是 blocked**；下面两条要测 blocked，得先临时
+    # 配一个上限（monkeypatch 那个模块常量）。
+    if MAX_STEPS_PER_SUBGOAL is None:
+        check(
+            "默认不限 ⇒ 步数再多也不会 blocked",
+            determine_outcome_for(_state(executor_done=True, executor_steps=999)),
+            "completed",
+        )
+    else:
+        check(
+            f"步数超限({MAX_STEPS_PER_SUBGOAL + 1}) → blocked",
+            determine_outcome_for(
+                _state(executor_done=True, executor_steps=MAX_STEPS_PER_SUBGOAL + 1)
+            ),
+            "blocked",
+        )
+        check(
+            "步数恰好等于上限 → 不算超限",
+            determine_outcome_for(
+                _state(executor_done=True, executor_steps=MAX_STEPS_PER_SUBGOAL)
+            ),
+            "completed",
+        )
 
     print()
     print("=" * 70)

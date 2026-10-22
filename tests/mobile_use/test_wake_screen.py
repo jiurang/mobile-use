@@ -196,9 +196,10 @@ class TestContextorReadsPowerState:
         from minitap.mobile_use.agents.contextor import contextor as ctx_mod
 
         monkeypatch.setattr(ctx_mod, "create_device_controller", lambda _ctx: controller)
-        monkeypatch.setattr(
-            ctx_mod, "get_current_foreground_package_async", lambda _ctx: _async_none()
-        )
+        # 🔴 2026-10-22：不再有 `get_current_foreground_package_async` 这条 adb
+        # 往返 —— 前台包名改成**从刚抓回来的层级树里推**
+        # （`utils.screen_elements.foreground_package_from_tree`）。
+        # 少一次串行 adb 往返（实测 127ms），整段感知快 40%。
         monkeypatch.setattr(ctx_mod, "get_device_date", lambda _ctx: None)
 
         node = ctx_mod.ContextorNode.__new__(ctx_mod.ContextorNode)

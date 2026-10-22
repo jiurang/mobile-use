@@ -1,6 +1,6 @@
 // Override the LLM config here for the agents.
 
-// Supported providers: openai, google, openrouter, xai, vertexai, anthropic, azure, minimax, deepseek, siliconflow
+// Supported providers: openai, google, openrouter, xai, vertexai, anthropic, azure, minimax, deepseek, siliconflow, llamacpp
 // You can use any model as long as it is supported by the provider.
 // MiniMax models: MiniMax-M2.7 (200k context), MiniMax-M2.7-highspeed
 // DeepSeek models: deepseek-v4-pro (1M context, no vision), deepseek-flash (1M context, vision)
@@ -9,6 +9,13 @@
 //   zai-org/GLM-4.5V            视觉 ✔  工具调用 ✔  结构化输出 ✘（不支持 json 模式）→ 给 executor
 //   Qwen/Qwen3-VL-32B-Instruct   视觉 ✔  工具调用 ✘  结构化输出 ✔          → 给 cortex
 //   Qwen/Qwen2.5-72B-Instruct   视觉 ✘  工具调用 ✔  结构化输出 ✔          → 给其余角色
+// llamacpp models: 本地 llama-server（llama.cpp）的 OpenAI 兼容端点，模型名原样写 server 上的 id
+//   （例如 unsloth/Qwen3.5-0.8B-GGUF:Q6_K，带 :Q6_K 后缀）。实测要点：
+//   - 思考链默认开着且会吃光 token 预算 → 客户端默认发 enable_thinking=false 把它关掉；
+//   - 结构化输出走原生 response_format=json_schema（llama.cpp 用 GBNF 硬约束），不是「schema 当工具绑」；
+//   - 单次生成的 token 上限必须有界（n_predict 默认 -1，不限长会挂死）。
+//   - 节点上可以写 "thinking": true / false 覆盖这个开关（管理端下发时也是走这条）。
+//   - 用法探针：python scripts/probe_llamacpp.py
 
 // Do not modify this file directly, instead copy it to llm-config.override.jsonc and modify it there.
 

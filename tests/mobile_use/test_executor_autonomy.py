@@ -543,19 +543,34 @@ def test_t11b_single_element_array_works():
 # ---------------------------------------------------------------------------
 
 
-def test_t13_executor_output_has_need_screenshot():
-    """Executor 必须能要图 —— 否则它看不见颜色/图标/遮挡的目标。"""
-    assert "need_screenshot" in ExecutorOutput.model_fields
-    out = ExecutorOutput(actions=[], need_screenshot=True)
-    assert out.need_screenshot is True
+def test_t13_executor_output_has_no_need_screenshot():
+    """🔴 2026-10-22：Executor 的**截图通道整条关掉了**。
+
+    原来这个字段让模型能说「我需要看图」→ 同轮补一张 → **再问一次 LLM**
+    （真机实测 executor 单次决策中位 5,276ms，那一次二问就是白白多花的）。
+
+    现在：
+    * 字段**不在** schema 里 ⇒ 模型不会再提这件事；
+    * 模型如果仍然吐出这个键（提示词残留 / 旧习惯），pydantic 忽略它，
+      **不会报错、也不会触发任何额外动作**。
+    """
+    assert "need_screenshot" not in ExecutorOutput.model_fields
+
+    # 多余的键必须被静默忽略，不能让整轮挂掉
+    out = ExecutorOutput(actions=[], need_screenshot=True)  # type: ignore[call-arg]
+    assert out.actions == []
+    assert not hasattr(out, "need_screenshot")
 
 
 def test_t13b_executor_prompt_mentions_screenshot_and_wake():
-    """executor.md 必须有截图按需 + 息屏唤醒的说明。"""
+    """executor.md 必须说清「**没有截图**」+ 息屏唤醒。"""
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
-    assert "need_screenshot" in text
+    # 截图通道已关 ⇒ 不能再教模型要图
+    assert "need_screenshot" not in text
+    assert "There is no screenshot" in text
+    # 息屏唤醒必须留着（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）
     assert "wake_screen" in text
 
 
@@ -609,8 +624,35 @@ def test_t2b_executor_steps_default_is_zero():
 
 
 def test_t4_step_limit_is_configurable_and_generous():
-    """步数上限要先设宽（12），等 telemetry 统计出真实分布再收紧。"""
-    assert MAX_STEPS_PER_SUBGOAL >= 8
+    """步数上限**默认不限**（2026-10-22 改）。
+
+    原来是 12。两条实测证据说明它是错的：
+
+    * 它**腰斩正常子目标** —— 真机跑一个「往上滚到结果页顶部，确认第一条是否带
+      『广告』标识」的子目标，12 步不够 → 被截断成 ``outcome=blocked``
+      → 换招 → 重发。**那个子目标本来是做得完的**。
+    * 它**掩盖了真因** —— 执行器原地打转时，它把「打转」腰斩成「这个子目标
+      走不通」，于是换招重来、清空局部历史、更瞎（限制-症状倒挂）。
+
+    ⇒ 现在默认不限（None）。要恢复上限：把它改成整数（代码路径都还在）。
+    """
+    assert MAX_STEPS_PER_SUBGOAL is None, "默认必须不限子目标步数"
+
+
+def test_t4b_default_limit_means_outcome_is_never_blocked():
+    """T4b：默认不限 ⇒ ``outcome`` 不会是 ``blocked``（那条分支只在配了上限时可达）。"""
+    from minitap.mobile_use.agents.reporter.reporter import determine_outcome_for
+
+    state = State(
+        **{
+            **_initial_state(),
+            # 步数远超任何可能的子目标上限
+            "executor_steps": 999,
+            "executor_done": True,
+            "executor_failures": [],
+        }
+    )
+    assert determine_outcome_for(state) == "completed", "默认不该有 blocked"
 
 
 def test_t4b_breaker_blocks_repeated_same_target():
@@ -1906,6 +1948,74 @@ async def test_t35_reissue_of_the_same_subgoal_keeps_the_local_history(monkeypat
 
     assert update.get("executor_goal") == "Try the search box instead"
     assert EXECUTOR_MESSAGES_KEY in update, "换目标必须清局部历史（否则会以为旧动作做过了）"
+
+
+# ---------------------------------------------------------------------------
+# T36 —— planner 的韧性：解析失败不许杀死整个任务
+# ---------------------------------------------------------------------------
+#
+# 和 cortex 同一个病（N33）：MiniMax 偶发返回空响应 ⇒ `_parse` 抛 ⇒ 任务当场死。
+# planner 更靠前：**计划挂了整个任务连第一步都走不了**。
+#
+# 降级成什么（不引入任何新的事实断言）：
+# * replan 场景（有被标失败的子目标）⇒ **把那个失败的子目标重新下发一次**
+#   （它「还没做完」，所以重新下发是事实，不是编造）。
+# * 首次规划（没有旧计划）⇒ **没有可退守的东西**，只能抛 —— 这条真的无解。
+
+
+class _AlwaysFailingPlannerLLM:
+    def __init__(self, calls: list):
+        self.calls = calls
+
+    def with_structured_output(self, schema):
+        return self
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        raise ValueError("MiniMax response had no tool_calls and no content.")
+
+
+@pytest.mark.asyncio
+async def test_t36_planner_parse_failure_degrades_to_reissuing_the_failed_subgoal(monkeypatch):
+    """T36：planner 解析失败 → 重试 → 降级成重新下发失败的子目标（不抛）。"""
+    import minitap.mobile_use.agents.planner.planner as planner_mod
+    from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus
+
+    calls: list = []
+    monkeypatch.setattr(
+        planner_mod,
+        "get_llm",
+        lambda **kwargs: _AlwaysFailingPlannerLLM(calls),
+    )
+    monkeypatch.setattr(
+        planner_mod,
+        "get_current_foreground_package_async",
+        lambda ctx: _async_none(),
+    )
+
+    state = State(
+        **{
+            **_initial_state(),
+            "subgoal_plan": [
+                Subgoal(id="sg1", description="Open Settings", status=SubgoalStatus.SUCCESS),
+                Subgoal(
+                    id="sg2",
+                    description="Enter the WLAN page",
+                    status=SubgoalStatus.FAILURE,
+                ),
+            ],
+        }
+    )
+
+    # ⚠️ 关键：**不抛**（抛了 = 一次 provider 抖动让整个任务当场死）
+    update = await planner_mod.PlannerNode(_ctx())(state)
+
+    plan = update.get("subgoal_plan") or []
+    assert plan, "降级后必须还有计划"
+    descriptions = [s.description for s in plan]
+    assert "Enter the WLAN page" in descriptions, "失败的子目标应该被重新下发"
+    # 已完成的子目标照旧保留（不能因为重规划就重做一遍）
+    assert "Open Settings" in descriptions
 
 
 async def _async_none():

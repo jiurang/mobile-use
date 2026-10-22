@@ -15,7 +15,8 @@ Executor 自己看屏、自己决定下一个动作、自己执行，循环到�
    bind_tools 的 JSON schema 是 4,008 token，而且**不参与缓存键**（实测 E5），
    所以每轮都按满价计费。Executor 的工具用法靠 `executor.md` 的**文本工具表**
    教（365 token，静态，可缓存）。结构化输出只绑定 `ExecutorOutput` 这一个
-   小 schema（`services/llm.py:529` 的 `_ToolCallStructuredRunnable`）。
+   小 schema（走 `services/llm.py` 的 `get_structured_llm`：默认把 schema 当
+   工具绑，llamacpp 这类 provider 走原生 json_schema 语法约束）。
 
 2. **dispatcher 失败要回灌，不能退回 LLM。**
    旧架构里 dispatcher 失败 → 退回 LLM 重新转写，那是有意义的。
@@ -30,9 +31,7 @@ Executor 自己看屏、自己决定下一个动作、自己执行，循环到�
 
 from __future__ import annotations
 
-import asyncio
 import json
-from typing import Any, cast
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -41,26 +40,49 @@ from minitap.mobile_use.agents.executor.prompt import build_executor_messages
 from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
-from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message
+from minitap.mobile_use.services.llm import (
+    get_structured_llm,
+    invoke_llm_with_timeout_message,
+)
 from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.tools.index import (
     EXECUTOR_WRAPPERS_TOOLS,
     VIDEO_RECORDING_WRAPPERS,
     get_tools_from_wrappers,
 )
-from minitap.mobile_use.utils.conversations import get_screenshot_message_for_llm
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 单个子目标最多执行几步。超了就强制收尾，汇报给 Cortex 决定怎么办。
+# 单个子目标最多执行几步。**默认不限（None）** —— 超了才强制收尾，汇报给 Cortex。
 #
-# 为什么不是 8：真机运行日志（probe_out/dump_run.log）实测单个任务的
-# 轮/子目标 ≈ 4.0~5.3，但那是 n=1 的样本；新架构的 Executor 只有一句目标陈述、
-# 没有全局视野，遇到走不通的子目标**不会放弃，只会磨**。
-# 所以宁可先设宽一点（12），等 telemetry 统计出真实分布再收紧。
-MAX_STEPS_PER_SUBGOAL = 12
+# 🔴 **2026-10-22 改：原来是 12，现在是「不限」。**
+#
+# 两条实测证据都说明那个 12 是错的：
+#
+# 1. **它会腰斩正常子目标。** 真机跑一个「往上滚到结果页顶部，确认第一条是否带
+#    『广告』标识」的子目标 —— 12 步不够，被截断成 `outcome=blocked`
+#    → 触发换招 → 重发。**子目标本来是做得完的**（用户提供的现场：
+#    `swipe_percentages(...)` 之后紧跟 `step limit of 12 reached`）。
+#    12 这个数的依据只是**一次**运行的 4.0~5.3 步/子目标（n=1），而
+#    「往上滚到顶部再读」这种子目标天然就比平均值长得多。
+#
+# 2. **它掩盖了真因（限制-症状倒挂）。** 执行器原地打转时，它把「打转」腰斩成
+#    「这个子目标走不通」→ 换招重来 → 清空局部历史 → 更瞎。
+#    **限制把症状盖住了，还顺手制造了新的因果。**
+#
+# ⇒ 现在**默认不限**：子目标做到模型说 done / 失败为止。
+#
+# **兜底是谁**：全局动作步预算（`constants.DEFAULT_MAX_STEPS` → LangGraph 的
+# `recursion_limit`）。那是**任务级**预算，不是子目标级的。
+# ⚠️ 代价要说清：没有子目标级上限，**一个子目标就能吃掉整个任务预算**，
+# 撞到 `recursion_limit` 时是 `GraphRecursionError`（任务失败，不是优雅收尾）。
+# 这是「不做限制」的必然代价 —— 要不要把全局预算耗尽改成**优雅收尾 + 上报**
+# （而不是崩），是下一个要拍板的点。
+#
+# 要恢复上限：把这个值改成整数（代码路径都还在，只是默认不触发）。
+MAX_STEPS_PER_SUBGOAL: int | None = None
 
 
 def _rejection_code(reason: str | None) -> str:
@@ -149,8 +171,10 @@ class ExecutorNode:
                 agent="executor",
             )
 
-        if step_index > MAX_STEPS_PER_SUBGOAL:
-            # 熔断：到上限了就不该再调 LLM（那只会继续磨）。
+        if MAX_STEPS_PER_SUBGOAL is not None and step_index > MAX_STEPS_PER_SUBGOAL:
+            # 熔断：**只有在配了上限时才触发**（默认 None = 不限，
+            # 见上面 `MAX_STEPS_PER_SUBGOAL` 的说明）。
+            # 到上限了就不该再调 LLM（那只会继续磨）。
             # 直接收尾，把「已经试过什么」交给 Cortex 换招。
             logger.warning(
                 f"[executor] Step limit reached ({MAX_STEPS_PER_SUBGOAL}); "
@@ -168,20 +192,14 @@ class ExecutorNode:
 
         response = await self._decide(state=state, goal=goal)
 
-        # ---- 模型要图：同一轮补一张再问一次 ----
+        # 🔴 **2026-10-22 删掉了「同轮二问」**（原来叫 `need_screenshot`）。
         #
-        # 不新开一轮：多一轮意味着多一次完整 prompt 重算 + 一次生成。
-        # 同轮补图只有真正需要图的那少数轮次才多花这一次。
-        if response.need_screenshot:
-            screenshot_message = await self._capture_screenshot(state=state)
-            if screenshot_message is not None:
-                # 二问：带上截图重新决策一次。解析失败由 `_decide` 内部降级，
-                # 返回的永远是一个可用的 ExecutorOutput。
-                response = await self._decide(
-                    state=state,
-                    goal=goal,
-                    screenshot_message=screenshot_message,
-                )
+        # 原来这里：模型说「我需要看图」→ 补一张图 → **再问一次 LLM**。
+        # 那是整整一次 LLM 调用（真机实测 executor 单次决策中位 5,276ms），
+        # 换来的只是「模型偶尔能看见颜色/图标/遮挡」。
+        #
+        # 现在截图通道整条关掉（见 `agents/executor/types.py` 的说明）。
+        # 模型从���只靠 **UI 元素表 + OCR** 决策。
 
         # ---- 目标达成 → 直接收尾，**不碰 actions** ----
         #
@@ -270,18 +288,15 @@ class ExecutorNode:
         *,
         state: State,
         goal: str,
-        screenshot_message=None,
     ) -> ExecutorOutput:
         """问一次 LLM，拿结构化输出。
 
-        **只绑定 `ExecutorOutput` 这一个 schema**（`services/llm.py:529` 的
-        `_ToolCallStructuredRunnable`），**不** bind 那 16 个设备工具。
+        **只绑定 `ExecutorOutput` 这一个 schema**（走 `services/llm.py` 的
+        `get_structured_llm`），**不** bind 那 16 个设备工具。
 
         解析失败**不会**返回 None —— 内部已经降级成「空动作 + 说明」，
         调用方拿到的永远是一个可用的 `ExecutorOutput`。
         """
-        from minitap.mobile_use.services.llm import _ToolCallStructuredRunnable
-
         device_state_lines: list[str] = []
         if state.device_date:
             device_state_lines.append(f"Device date: {state.device_date}")
@@ -304,17 +319,14 @@ class ExecutorNode:
             failures=state.executor_failures,
             local_messages=state.executor_messages,
             device_state_lines=device_state_lines,
-            screenshot_message=screenshot_message,
             # iOS / 云设备：没有统一元素表时用 legacy OCR 块（编号与
             # latest_ocr_results 的下标严格对应，工具侧按那个下标解析）。
             ocr_results=state.latest_ocr_results,
         )
 
-        llm = get_llm(ctx=self.ctx, name="executor")
-        # `_ToolCallStructuredRunnable` 的 llm 形参标的是 ChatOpenAI，但
-        # `get_llm` 返回的是 BaseChatModel（anthropic 渠道甚至不是 ChatOpenAI）。
-        # 它只用到 `bind_tools`，所以这里放宽成 Any —— services/llm.py 不动它的签名。
-        runner = _ToolCallStructuredRunnable(cast("Any", llm), ExecutorOutput)
+        # 结构化输出按 **provider 能力**分派：llamacpp 走原生 json_schema 语法约束，
+        # 其它 provider 保持原样（schema 当工具绑）—— 见 `get_structured_llm`。
+        runner = get_structured_llm(ctx=self.ctx, name="executor", schema=ExecutorOutput)
 
         response = await self._invoke(runner, messages)
 
@@ -339,7 +351,7 @@ class ExecutorNode:
                     content=(
                         "Your last answer could not be read. You must call the "
                         "ExecutorOutput tool with the fields (actions, agent_thought, "
-                        "done, done_reason, need_screenshot). Do not write the output "
+                        "done, done_reason). Do not write the output "
                         "as plain text — a plain-text answer is discarded."
                     )
                 ),
@@ -398,21 +410,12 @@ class ExecutorNode:
             return None
         return response if isinstance(response, ExecutorOutput) else None
 
-    async def _capture_screenshot(self, *, state: State):
-        """抓一张当屏截图给模型（on_demand）。
+    # 🔴 **2026-10-22 删掉了 `_capture_screenshot`。**
+    #
+    # 原来它给「同轮二问」补图：把 `state.latest_screenshot`（一张全分辨率
+    # base64 PNG）解码 → 等比缩到 610x1356 → 重编码成 JPEG（实测 65ms），
+    # 然后**再问一次 LLM**（真机实测 executor 单次决策中位 5,276ms）。
+    #
+    # 现在截图通道整条关掉（见 `agents/executor/types.py` 的说明），
+    # 这条路没有消费者了。
 
-        用 `state.latest_screenshot`（Contextor 刚抓的）——决策时 executor
-        还没动过屏幕，所以它就是**当前**画面，不用重抓（重抓会多花一次
-        adb 往返，还可能拿到不同帧）。
-        """
-        from minitap.mobile_use.controllers.controller_factory import create_device_controller
-
-        screenshot = state.latest_screenshot
-        if not screenshot:
-            return None
-        controller = create_device_controller(self.ctx)
-        # 压缩是同步 PIL 操作，放到线程里避免阻塞事件循环。
-        compressed = await asyncio.to_thread(
-            controller.get_compressed_b64_screenshot, screenshot
-        )
-        return get_screenshot_message_for_llm(compressed)

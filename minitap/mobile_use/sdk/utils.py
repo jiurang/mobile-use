@@ -11,6 +11,7 @@ from minitap.mobile_use.config import (
     LLMWithFallback,
     deep_merge_llm_config,
     get_default_llm_config,
+    provider_requires_api_key,
 )
 from minitap.mobile_use.utils.file import load_jsonc
 from minitap.mobile_use.utils.logger import get_logger
@@ -60,16 +61,34 @@ def _llm_entry(spec: Mapping[str, Any]) -> dict[str, Any]:
     「不出现」和「None」在这里是两种语义：前者表示「沿用设备本地的既有配置 /
     各调用点的硬编码值」，后者是同义的显式写法。两种都对，但保持老行为
     （:func:`llm_config_for_single_model` 一直是不出现）能少一类「行为悄悄变了」。
+
+    **这条路径是「渠道」路径，密钥不是可选项。** 这里的入参来自 manager
+    运行期下发的渠道：manager 已经明确指定了用哪个模型、哪个端点、哪把密钥。
+    缺密钥时如果放行，mobile-use 会从设备本地的 .env 里补一把 —— 症状是
+    「我明明选了 M3.1，跑起来是 .env 里那个模型」，而且**它不报错**。
+    所以缺密钥在这里直接拒绝，报清楚缺的是哪一项。
+
+    端点（base_url）不同：不给就用该 provider 自带的默认端点（代码里的常量），
+    但同样不会去读 .env —— 那由 :attr:`LLM.allow_env_fallback` 保证。
     """
     provider = spec.get("provider")
     model = spec.get("model")
     if not provider or not model:
         raise ValueError(f"an LLM spec needs both provider and model, got: {dict(spec)!r}")
+    api_key = spec.get("api_key")
+    if not api_key and provider_requires_api_key(provider):
+        raise ValueError(
+            f"渠道缺少 api_key（provider={provider}, model={model}）："
+            f"渠道必须自带密钥，不允许回退到设备本地的 .env。"
+            f"请在 manager 的渠道配置里补上 API Key。"
+        )
     entry: dict[str, Any] = {"provider": provider, "model": model}
-    for key in ("base_url", "api_key", "temperature"):
+    for key in ("base_url", "api_key", "temperature", "thinking"):
         value = spec.get(key)
         if value is not None:
             entry[key] = value
+    # 运行期下发的渠道：不再从设备本地的环境补齐缺失项。见 LLM.allow_env_fallback。
+    entry["allow_env_fallback"] = False
     return entry
 
 
@@ -90,6 +109,7 @@ def llm_config_for_single_model(
     base_url: str | None = None,
     api_key: str | None = None,
     temperature: float | None = None,
+    thinking: bool | None = None,
 ) -> LLMConfig:
     """把「一条渠道」铺成一份完整的 LLMConfig —— 每个角色都用它。
 
@@ -103,9 +123,16 @@ def llm_config_for_single_model(
     Args:
         provider: LLMProvider 的取值,如 "minimax"。
         model: 模型名。
-        base_url: 端点。None 表示沿用 settings / 官方默认。
-        api_key: 密钥。None 表示沿用 settings。
+        base_url: 端点。None 表示用该 provider 自带的默认端点（**不读 .env**）。
+        api_key: 密钥。**provider 需要密钥时必填**（azure / vertexai 除外）——
+            None 不再表示「沿用 settings」：渠道下发时缺密钥会静默落到设备本地的
+            .env，症状是「我明明选了 A，跑起来是 B」且不报错。
         temperature: 温度。None 表示沿用各 agent 调用点的硬编码值。
+        thinking: 「要不要思考」。None 表示沿用该 provider 自己的默认。
+            只有 llamacpp 这类「思考链会吃光 token 预算」的 provider 消费它。
+
+    Raises:
+        ValueError: provider/model 缺失，或 provider 需要密钥而 api_key 为空。
     """
     return llm_config_for_role_overrides(
         {
@@ -114,6 +141,7 @@ def llm_config_for_single_model(
             "base_url": base_url,
             "api_key": api_key,
             "temperature": temperature,
+            "thinking": thinking,
         }
     )
 
@@ -133,6 +161,10 @@ def llm_config_for_role_overrides(
     Gemini、其余走 MiniMax 是最常见的一种。只给模型名不给供应商，那个角色就会静默
     落回基础渠道的供应商，症状是「以为换了模型，其实在同一个模型上跑」。
 
+    **这条路径产出的配置不回退到设备本地的 .env。** 密钥缺失在这里就报错，
+    端点缺失用 provider 自带的默认端点；两者都不会去读 .env。原因见
+    :func:`_llm_entry` 和 :attr:`~minitap.mobile_use.config.LLM.allow_env_fallback`。
+
     Args:
         base: 基础接入参数，键为 provider / model / base_url / api_key / temperature。
         overrides: 角色名 → 该角色专用的接入参数。键必须是 :data:`ALL_ROLE_NAMES`
@@ -141,6 +173,9 @@ def llm_config_for_role_overrides(
 
     Returns:
         一份 9 个角色全部有值的 LLMConfig。
+
+    Raises:
+        ValueError: 角色名不认识，或某个接入参数缺 provider / model / 必需的密钥。
     """
     role_map = dict(overrides or {})
     unknown = sorted(set(role_map) - set(ALL_ROLE_NAMES))

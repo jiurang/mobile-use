@@ -303,16 +303,34 @@ class UIAutomatorClient:
 
         并发说明（2026-10-17 真机实测，Redmi Turbo 4）
         -------------------------------------------------
-        串行时这一段是 145 + 1188 + 2 = 1335ms，其中 `dump_hierarchy` 独占 89%。
-        截图和 dump 是两个互相独立的 HTTP 请求，发给设备上 u2 agent 的不同端点，
-        实测可以真并发：5 轮零失败，重叠量恰好等于截图耗时（145ms）——
-        也就是截图被完全藏进了 dump 的窗口，分毫不占关键路径。
+        ⚠️ **2026-10-22 更正**：下面这段数字是**当时**测的，后来被实测推翻了 ——
+        「dump 独占 89%、OCR 藏进 dump 的窗口」这个结论**已经不成立**。
 
-        OCR 只能吃截图，所以在「截图完成那一刻」就跑，正好落进 dump 剩下的
-        1100ms 里。关键路径从 145+1188+2+432=1767ms 压到 1190ms。
+        2026-10-22 重新实测（同一台 Redmi Turbo 4 / Android 16）::
+
+            device.screenshot()          166 ms
+            dump_hierarchy()             134~206 ms   （静态屏；动画屏 200~800ms）
+            OCR 推理                      381~443 ms
+            _pil_to_base64（PNG 编码）      79 ms
+            整段 get_screen_data          607 ms
+
+        ⇒ **dump 变快了，OCR 没变** ⇒ 现在是 **OCR 才是关键路径**，
+        dump 反而被藏进了「截图 + PNG 编码 + OCR」那条链的窗口里。
+
+        原始记录（保留，说明当时为什么会那么设计）::
+
+            串行时这一段是 145 + 1188 + 2 = 1335ms，其中 `dump_hierarchy` 独占 89%。
+            截图和 dump 是两个互相独立的 HTTP 请求，发给设备上 u2 agent 的不同端点，
+            实测可以真并发：5 轮零失败，重叠量恰好等于截图耗时（145ms）——
+            也就是截图被完全藏进了 dump 的窗口，分毫不占关键路径。
 
         iOS 那边早就是 `asyncio.gather` 并行了（controllers/ios_controller.py），
         Android 这里是唯一的例外。
+
+        ⚠️ **另一个仍然成立的事实**：`dump_hierarchy` 自带 waitForIdle ——
+        屏幕还在动的时候它会**自己等**（实测滚动场景里它等了 609ms）。
+        感知层的沉降下限正是靠这一点才敢从 3000ms 降到 200ms
+        （见 ``agents/contextor/contextor.py`` 的 ``_confirm_tree_stable``）。
         """
         device = self._ensure_connected()
 

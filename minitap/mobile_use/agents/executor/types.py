@@ -65,15 +65,29 @@ class ExecutorOutput(BaseModel):
         default=None,
         description="Why the goal is considered reached. Required when done=true.",
     )
-    need_screenshot: bool = Field(
-        default=False,
-        description=(
-            "Set to true ONLY when the screen element list and the OCR text are "
-            "NOT enough to decide what to do - e.g. the target is only "
-            "distinguishable by color, an icon, an image, or it is obscured. "
-            "You will then be given a screenshot and asked again."
-        ),
-    )
+    # 🔴 **2026-10-22 删掉了 `need_screenshot`。**
+    #
+    # Executor 不再有「要图」这个能力：截图通道整条关掉。
+    #
+    # 为什么关
+    # --------
+    # 1. **二问的代价是整整一次 LLM 调用**（真机实测 executor 单次决策中位
+    #    5,276ms）—— 收益只是「模型偶尔看不见颜色/图标/遮挡」。
+    # 2. 截图进 prompt 是**唯一永远不可缓存**的那一块（base64 长度随画面变，
+    #    前缀缓存直接失效）—— 实测它占了整个易变尾部的 92%。
+    # 3. `state.latest_screenshot` 的**唯一消费者**就是这条二问路径
+    #    （`agents/executor/executor.py` 的 `_capture_screenshot`）——
+    #    关掉之后截图整条路就没有消费者了。
+    #
+    # 代价
+    # ----
+    # 模型从此**看不到画面**，只能靠 UI 元素表 + OCR。颜色、图标、图片内容、
+    # 遮挡关系这些它读不出来。**这是个能力削减，不是纯优化** —— 真机跑完
+    # 要看「步数 / 失败目标数」有没有涨。
+    #
+    # 模型如果仍然吐出 `need_screenshot`（旧习惯 / 提示词残留），pydantic
+    # 会**忽略**这个多余的键（extra=ignore），不会报错、也不会触发任何
+    # 额外动作。
 
 
 class ExecutorReport(BaseModel):

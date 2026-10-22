@@ -120,6 +120,51 @@ def _should_drop_systemui(foreground_package: str | None) -> bool:
     return not foreground_package.startswith("com.android.systemui")
 
 
+def foreground_package_from_tree(elements: list[dict] | None) -> str | None:
+    """从层级树里推当前前台应用的包名。
+
+    为什么不再单独跑一次 adb
+    ----------------------
+    原来这一项是 ``dumpsys window | grep mCurrentFocus`` —— 一次**串行**的
+    adb 往返（真机实测中位 127ms），而且排在抓屏**之后**，全额计入关键路径。
+
+    但**答案就在刚抓回来的树里**：树里每个元素都带 ``package``。
+
+    判据：**元素最多的那个包**（排除系统 UI）。
+    ⚠️ **不能用「第一个带 package 的节点」** —— 真机实测那是错的：
+    MIUI 的树第一个节点是**桌面**（``com.miui.home``），哪怕前台明明是
+    设置（``dumpsys`` 说是 ``com.android.settings``）。真机逐屏对账
+    （设置首页 / WLAN 页 / 通知栏 / 桌面，4/4 一致）见
+    ``scripts/verify_perception_changes.py``。
+
+    排除系统 UI 的理由：状态栏那 40~50 个 systemui 节点不属于任何应用，
+    而且它们是所有应用**共有**的 —— 留着它们，前台就永远推不出来。
+    全树都是系统 UI 时（通知栏展开）退回总众数。
+
+    精度要求
+    --------
+    这个包名只有一个用途：``_should_drop_systemui`` 判断要不要保留系统
+    状态栏的行。所以「是不是 systemui」这一层判对就够了。
+    """
+    if not elements:
+        return None
+
+    counts: dict[str, int] = {}
+    for element in elements:
+        package = element.get("package")
+        if package:
+            counts[package] = counts.get(package, 0) + 1
+    if not counts:
+        return None
+
+    systemui = {"com.android.systemui", "miui.systemui.plugin"}
+    app_counts = {k: v for k, v in counts.items() if k not in systemui}
+    if app_counts:
+        return max(app_counts, key=lambda k: app_counts[k])
+    # 全是系统 UI（通知栏 / 状态栏设置页）⇒ 用总众数
+    return max(counts, key=lambda k: counts[k])
+
+
 class ScreenElement(BaseModel):
     """屏幕上的一个可寻址对象。
 

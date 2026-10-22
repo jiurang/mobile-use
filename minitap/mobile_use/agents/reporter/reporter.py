@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from functools import cache
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 from jinja2 import Template
 from langchain_core.messages import (
@@ -47,7 +47,7 @@ from minitap.mobile_use.agents.planner.utils import get_current_subgoal
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import (
-    get_llm,
+    get_structured_llm,
     invoke_llm_with_timeout_message,
     with_fallback,
 )
@@ -178,8 +178,6 @@ class ReporterNode:
 
         需要更详细的总结时（`llm_free=False`）才调 LLM。
         """
-        from minitap.mobile_use.services.llm import _ToolCallStructuredRunnable
-
         if self.llm_free:
             return (
                 code_summary(outcome=outcome, failed_count=len(failed_targets)),
@@ -199,14 +197,12 @@ class ReporterNode:
             failed_targets=failed_targets,
         )
 
-        llm = get_llm(ctx=self.ctx, name="reporter")
-        llm_fallback = get_llm(ctx=self.ctx, name="reporter", use_fallback=True)
-        # `_ToolCallStructuredRunnable` 的 llm 形参标的是 ChatOpenAI，但
-        # `get_llm` 返回的是 BaseChatModel（anthropic 渠道甚至不是 ChatOpenAI）。
-        # 它只用到 `bind_tools`，所以这里放宽成 Any —— services/llm.py 不在
-        # W8 的名下，不去动它的签名。
-        runner = _ToolCallStructuredRunnable(cast("Any", llm), ReporterSummary)
-        runner_fallback = _ToolCallStructuredRunnable(cast("Any", llm_fallback), ReporterSummary)
+        # 结构化输出按 **provider 能力**分派：llamacpp 走原生 json_schema 语法约束，
+        # 其它 provider 保持原样（schema 当工具绑）—— 见 `get_structured_llm`。
+        runner = get_structured_llm(ctx=self.ctx, name="reporter", schema=ReporterSummary)
+        runner_fallback = get_structured_llm(
+            ctx=self.ctx, name="reporter", schema=ReporterSummary, use_fallback=True
+        )
 
         try:
             response = cast(
@@ -261,7 +257,13 @@ def step_limit_reached(state: State) -> bool:
     （``agents/executor/executor.py`` 的 step_limit 分支）。
     所以这里不能只看 ``executor_done`` —— 否则一次撞上限的尝试会被判成
     ``completed``，Cortex 就会以为这个子目标做成了。
+
+    ⚠️ **默认不限**（``MAX_STEPS_PER_SUBGOAL is None``）⇒ 这个判定恒为 False
+    ⇒ ``outcome`` 不会是 ``blocked``。``blocked`` 这条分支留着，是为了
+    「有人把上限配回来」时行为不变（代码路径都在，只是默认不触发）。
     """
+    if MAX_STEPS_PER_SUBGOAL is None:
+        return False
     return state.executor_steps > MAX_STEPS_PER_SUBGOAL
 
 
@@ -320,7 +322,6 @@ def blocked_reason_for(state: State) -> str | None:
         f"step limit of {MAX_STEPS_PER_SUBGOAL} reached; "
         "the attempt was stopped before the goal was reached"
     )
-
 
 # ---------------------------------------------------------------------------
 # 事实层：从 state 直搬，逐字
@@ -611,10 +612,11 @@ def code_summary(*, outcome: str, failed_count: int) -> str:
     if outcome == "completed":
         return "子目标已完成（证据见下方：动作结果 + 屏幕上看到的文字）。"
     if outcome == "blocked":
-        return (
-            f"子目标未完成：触到步数上限（{MAX_STEPS_PER_SUBGOAL} 步），"
-            "见失败清单。"
-        )
+        limit = MAX_STEPS_PER_SUBGOAL
+        if limit is None:
+            # 默认不限 ⇒ blocked 本来不可达；这里是「有人把上限配回来了」的兜底。
+            return "子目标未完成，见失败清单。"
+        return f"子目标未完成：触到步数上限（{limit} 步），见失败清单。"
     if failed_count:
         return f"子目标未完成，见失败清单（{failed_count} 条失败事实）。"
     return "子目标未完成，未记录到失败事实。"

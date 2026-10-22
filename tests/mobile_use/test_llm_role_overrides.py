@@ -155,22 +155,35 @@ def test_override_carries_its_own_provider_and_endpoint():
     assert cfg.cortex.fallback.api_key.get_secret_value() == "other-key"
 
 
-def test_override_without_key_falls_back_to_settings():
-    """覆盖不自带密钥时沿用 settings —— 和基础渠道同一套语义。"""
+def test_override_without_key_is_rejected():
+    """覆盖角色不自带密钥时必须报错，不能沿用 settings。
+
+    回落 .env 的症状是「我给 cortex 选了 M2.7，它跑起来用的是 .env 里那个模型
+    的密钥」—— 而 .env 里那把密钥的模型可能根本不是 M2.7。
+    """
     monkey = pytest.MonkeyPatch()
     monkey.setattr(settings, "MINIMAX_API_KEY", SecretStr("env-key"), raising=False)
-    monkey.setattr(settings, "MINIMAX_BASE_URL", "https://env.example.com/v1", raising=False)
     try:
-        cfg = llm_config_for_role_overrides(
+        with pytest.raises(ValueError, match="api_key"):
+            llm_config_for_role_overrides(
+                BASE,
+                {"cortex": {"provider": "minimax", "model": "MiniMax-M2.7"}},
+            )
+    finally:
+        monkey.undo()
+
+
+def test_override_without_key_does_not_silently_use_the_base_key():
+    """最坏的一种情况：覆盖角色缺密钥，却悄悄用上了基础渠道的密钥。
+
+    这时「我给 cortex 换了模型」在密钥层面根本没换过 —— 症状和「换了但没生效」
+    长得一模一样，所以必须在这里挡死。
+    """
+    with pytest.raises(ValueError, match="api_key"):
+        llm_config_for_role_overrides(
             BASE,
             {"cortex": {"provider": "minimax", "model": "MiniMax-M2.7"}},
         )
-        client = get_llm(_ctx(cfg), name="cortex")
-        assert client.openai_api_key is not None
-        assert client.openai_api_key.get_secret_value() == "env-key"
-        assert client.openai_api_base == "https://env.example.com/v1"
-    finally:
-        monkey.undo()
 
 
 def test_unknown_role_name_is_rejected():

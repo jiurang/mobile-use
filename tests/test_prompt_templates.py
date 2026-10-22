@@ -154,15 +154,24 @@ def test_executor_prompt_keeps_text_tools_table():
 
 
 def test_executor_prompt_keeps_perception_channels():
-    """感知通道不能丢：按需截图 + 设备状态（息屏）。
+    """感知通道不能丢：**两个通道**（UI 元素 + OCR）+ 设备状态（息屏）。
 
-    丢了截图通道就分不清颜色/图标/遮挡的目标；丢了设备状态就会在黑屏上
-    反复空转（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）。
+    🔴 **2026-10-22 改**：截图通道整条关掉了 —— Executor 的「同轮二问」
+    要多花**整整一次 LLM 调用**（真机实测 executor 单次决策中位 5,276ms），
+    换来的只是「模型偶尔能看见颜色/图标/遮挡」。
+
+    丢了截图通道 ⇒ 模型看不见画面（这是个**能力削减**，真机跑完要看
+    「步数 / 失败目标数」有没有涨）；丢了设备状态就会在黑屏上反复空转
+    （真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "## Perception" in text
-    assert "need_screenshot" in text
-    assert "on demand" in text
+    # 截图通道已关 ⇒ 不能再教模型要图
+    assert "need_screenshot" not in text
+    assert "There is no screenshot" in text
+    # 两个还在的通道
+    assert "UI elements" in text
+    assert "OCR" in text
     assert "device state line" in text
     assert "wake_screen" in text
 
@@ -185,8 +194,10 @@ def test_executor_prompt_has_no_tool_json_schema():
 def test_executor_prompt_output_fields_match_executor_output():
     """Output 字段表要和 `agents/executor/types.py:ExecutorOutput` 逐字对齐。"""
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    for field in ("actions", "agent_thought", "done", "done_reason", "need_screenshot"):
+    for field in ("actions", "agent_thought", "done", "done_reason"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
+    # 🔴 2026-10-22：截图通道关了，`need_screenshot` 不再是输出字段
+    assert "`need_screenshot`" not in text
     # agent_thought：≤1 句，且不许把目标陈述写进去（方案 §3.1.1 顺带说明）
     assert "one short sentence" in text
     assert "Never put the goal statement in it" in text

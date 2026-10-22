@@ -101,6 +101,13 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "executor_tools_list": "tools",
         "goal": "打开快手赚钱",
     },
+    # executor.md 的中文兄弟文件。代码块、jinja 变量与英文版逐字节对齐，
+    # 所以渲染变量表也保持一致。
+    "executor/executor-zh.md": {
+        "platform": "android",
+        "executor_tools_list": "tools",
+        "goal": "打开快手赚钱",
+    },
     # reporter.md **完全静态**：没有任何模板变量。Reporter 只写 summary + 挑
     # evidence，outcome / actions_taken / failed_targets 全由代码填（见
     # agents/executor/types.py:ExecutorReport），所以它不需要模板变量。

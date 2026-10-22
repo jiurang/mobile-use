@@ -11,7 +11,6 @@ from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.controller_factory import create_device_controller
 from minitap.mobile_use.controllers.platform_specific_commands_controller import (
-    get_current_foreground_package_async,
     get_device_date,
 )
 from minitap.mobile_use.graph.state import State
@@ -21,7 +20,12 @@ from minitap.mobile_use.services.ocr.types import OcrEngine, OcrText
 from minitap.mobile_use.utils.app_launch_utils import launch_app_with_retries
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
-from minitap.mobile_use.utils.screen_elements import ScreenElement, build_screen_elements
+from minitap.mobile_use.utils.screen_elements import (
+    ScreenElement,
+    build_screen_elements,
+    foreground_package_from_tree,
+)
+from minitap.mobile_use.utils.screen_stability import is_stable, tree_fingerprint
 from minitap.mobile_use.utils.ui_hierarchy_view import normalize_hierarchy
 
 logger = get_logger(__name__)
@@ -39,19 +43,40 @@ class ContextorNode:
     async def __call__(self, state: State) -> dict[str, Any]:
         device_controller = create_device_controller(self.ctx)
 
-        # ---- 屏幕沉降等待（动作后至少等这么久才抓屏）----
+        # ---- 屏幕沉降：等下限 + 确认这一屏已经定下来 ----
         #
-        # 上滑换页之后，交互控件是**延迟挂载**的：实测新页面的 like 类
-        # resource-id 在动作后 2.0s / 2.5s 才出现在层级树里。抓早了会拿到
-        # 一棵「控件还没挂上」的树，看起来像「这个按钮不存在」。
+        # 🔴 **2026-10-22 改：原来是「纯等 3 秒」，现在是「等 200ms + 确认稳定」。**
         #
-        # 它是**下限**不是固定延迟：距离上一个动屏动作已经够久时（真机实测
-        # 决策延迟中位 19.2s，绝大多数轮次都属于这种情况）一个字都不等。
+        # 原来那个 3 秒的依据（「控件延迟挂载，抓早了拿到半成品」）经真机实测
+        # 拆成了两半：
+        #
+        # * **「防动画」那部分不需要外部下限** —— ``dump_hierarchy`` 自带
+        #   waitForIdle，屏幕还在动的时候它**自己会等**（实测滚动场景里
+        #   dump#0 耗时 609ms，那 609ms 就是它在等）。外部下限在做同一件事，
+        #   只是更粗、更贵。
+        # * **「懒加载」那部分外部下限也挡不住** —— 它挡的是「静默期内才挂上
+        #   的控件」，而那需要时间维度上的多次采样才能发现。
+        #
+        # 所以现在分两步：
+        #
+        # 1. **等下限**（``settle_delay_ms``，默认 200ms）—— 防「动作刚发出、
+        #    屏幕还没开始变」的竞态。
+        # 2. **确认稳定**（``_confirm_tree_stable``）—— 连续两次树级 dump 比
+        #    指纹，相同才算定下来了。**只 dump 树，不截图不跑 OCR**
+        #    （树级 dump 实测 150~250ms，整段 get_screen_data 要 600ms）。
+        #
+        # ⚠️ 「静 ≠ 全」：新页面的控件是懒加载的，实测 dump#1/dump#2 内容已经
+        # 一样（91 个元素）但 228 才是完整的 ⇒ 稳定确认**会漏判**这种情况。
+        # 这是已知代价，验收看「步数 / 失败目标数」，不看「点错率」。
         await self._wait_for_settle(state)
+        await self._confirm_tree_stable(device_controller, state)
 
         # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。
-        # dump_hierarchy 真机要 ~1.2s，OCR 只要 ~0.4s，截图一到位就开始，
-        # 整段推理藏进 dump 的等待窗口里，关键路径不增加。
+        #
+        # ⚠️ **2026-10-22 更正**：这里原来写着「dump_hierarchy 真机要 ~1.2s，
+        # OCR 只要 ~0.4s，整段推理藏进 dump 的等待窗口里」。
+        # **实测那个前提没了**：dump 静态屏只要 134~206ms，OCR 却要 381~443ms
+        # ⇒ 现在是 **OCR 才是关键路径**，dump 反而被藏起来了。
         ocr_box: list[list[OcrText] | None] = []
         ocr_done = False
 
@@ -80,10 +105,20 @@ class ContextorNode:
         power_reader = getattr(device_controller, "get_screen_power_state", None)
         if power_reader is not None:
             power_task = asyncio.create_task(power_reader())
+        # 设备日期：**和抓屏并发**。原来它是抓屏之后的**串行** adb 往返
+        # （`device.shell("date")`，实测中位 88ms），全额计入关键路径。
+        # 改成 to_thread 之后它和 dump 的等待窗口重叠，净增 ≈ 0。
+        #
+        # ⚠️ 保留读**设备**时钟而不是用本机时钟：设备时区可能和 PC 不同，
+        # 那会让 prompt 里的 "Device date" 说错时间。（iOS 那条路本来就用
+        # 本机时钟，那是另一回事。）
+        date_task = asyncio.create_task(asyncio.to_thread(get_device_date, self.ctx))
+        if power_reader is not None:
             # `create_task` 只是把协程排进日程表，**不会**立刻开跑 —— 要等当前
-            # 协程让出控制权。这一行显式让一次，电源状态那个 adb 调用才会真正
-            # 启动，然后和下面的抓屏重叠跑（否则就退化成串行 +100ms）。
+            # 协程让出控制权。这一行显式让一次，电源状态 / 日期那两个 adb 调用
+            # 才会真正启动，然后和下面的抓屏重叠跑（否则就退化成串行 +100ms）。
             await asyncio.sleep(0)
+        device_date: str = ""
         try:
             try:
                 device_data = await device_controller.get_screen_data(on_screenshot=_run_ocr_inline)
@@ -92,9 +127,12 @@ class ContextorNode:
                 logger.warning("Controller does not support on_screenshot; using serial path")
                 device_data = await device_controller.get_screen_data()
         finally:
-            # 抓屏炸了也要把电源状态收回来，不能留一个悬空的 task。
+            # 抓屏炸了也要把电源状态和日期收回来，不能留两个悬空的 task
+            # （悬空 task 会在事件循环关闭时报 "Task exception was never
+            # retrieved"，把真正的异常盖掉）。
             if power_task is not None:
                 screen_state = await power_task
+            device_date = await date_task
 
         if screen_state == "off":
             logger.warning("[contextor] Screen is OFF — agent will be told to wake it up.")
@@ -103,8 +141,11 @@ class ContextorNode:
             # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
             ocr_box.append(await self._run_ocr(device_data.base64))
 
-        current_app_package = await get_current_foreground_package_async(self.ctx)
-        device_date = get_device_date(self.ctx)
+        # 前台包名：**从刚抓回来的树里推**，不再单独跑一次
+        # `dumpsys window | grep mCurrentFocus`（那是 127ms 的串行 adb 往返，
+        # 实测省掉它整段感知快 40%）。详见
+        # `utils/screen_elements.foreground_package_from_tree`。
+        current_app_package = foreground_package_from_tree(device_data.elements)
         agent_outcome: str | None = None
         if self.ctx.execution_setup and self.ctx.execution_setup.app_lock_status:
             locked_app_package = self.ctx.execution_setup.app_lock_status.locked_app_package
@@ -189,6 +230,9 @@ class ContextorNode:
         """抓屏之前，等屏幕沉降到配置的下限。
 
         返回实际等待的秒数（0 表示没等）。
+
+        ⚠️ **它现在只是「起步下限」，不再是完整的沉降保证。**
+        「这一屏定下来没有」由 :meth:`_confirm_tree_stable` 判。
         """
         delay_ms = self.ctx.perception.settle_delay_ms
         if delay_ms <= 0 or state.last_action_at is None:
@@ -205,6 +249,71 @@ class ContextorNode:
         )
         await asyncio.sleep(remaining)
         return remaining
+
+    async def _confirm_tree_stable(self, device_controller, state: State) -> bool:
+        """确认这一屏已经定下来 —— 连续两次树级 dump 的指纹相同。
+
+        为什么要有这一步
+        ----------------
+        沉降下限从 3000ms 降到 200ms 之后，「抓早了」的风险回来了。实测
+        （Redmi Turbo 4 / Android 16）动作后立刻抓屏会拿到**过渡态**：
+
+            页面导航（点进 WLAN）：49 → 91 → 91 → **228** 个元素
+            列表滚动：           292 → 267 → 240 → **239** 个元素
+            返回键：             **141**（一次就稳）
+
+        这一步就是**把「还在动」挡掉**：连续两次采样内容一样 ⇒ 屏定下来了。
+
+        代价（为什么说它便宜）
+        --------------------
+        * **只 dump 树**，不截图、不跑 OCR —— 树级 dump 实测 150~250ms，
+          整段 ``get_screen_data`` 要 600ms（截图 166 + PNG 编码 79 + OCR 381）。
+        * **不做无谓的重抓**：没动过屏的步骤（读笔记、等一下）**完全跳过**。
+        * 两次采样**连着发**，中间不额外等 —— ``dump_hierarchy`` 自带
+          waitForIdle，屏幕还在动的时候它自己会等。
+
+        什么时候做
+        ----------
+        **上一次动作动过屏**（``last_action_at`` 有值）才做。只读步骤不动屏，
+        屏早就是稳的，没必要多花两次 dump。
+
+        ⚠️ **已知误判面：「静 ≠ 全」**
+        懒加载的控件可能在静默期之后才挂上（实测 dump#1/dump#2 内容一样
+        但都不是完整的）。这一挡不住。**验收看「步数」和「失败目标数」**，
+        不看「点错率」。
+        """
+        max_retries = getattr(self.ctx.perception, "settle_max_retries", 0)
+        if max_retries <= 0 or getattr(state, "last_action_at", None) is None:
+            return False
+
+        previous: str | None = None
+        for attempt in range(max_retries + 1):
+            elements = await device_controller.get_hierarchy_only()
+            if not elements:
+                # 拿不到树就当「没法确认」——保留现状，别在这里把流程卡住。
+                logger.warning("[contextor] Could not dump hierarchy for stability check")
+                return False
+
+            current = tree_fingerprint(elements)
+            if is_stable(previous, current):
+                logger.info(
+                    f"[contextor] Screen stable after {attempt} stability check(s) "
+                    f"({len(elements)} elements)"
+                )
+                return True
+
+            previous = current
+            if attempt < max_retries:
+                # 还在变 ⇒ 再等一个下限，再采一次。
+                delay_ms = self.ctx.perception.settle_delay_ms
+                if delay_ms > 0:
+                    await asyncio.sleep(delay_ms / 1000.0)
+
+        logger.info(
+            "[contextor] Screen still changing after "
+            f"{max_retries} stability check(s); proceeding with the latest capture"
+        )
+        return False
 
     def _resolve_ocr_engine(self, screenshot_base64: str | None) -> OcrEngine | None:
         """OCR 的开关 + 可用性检查。两条执行路径共用。"""

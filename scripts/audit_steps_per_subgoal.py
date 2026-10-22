@@ -53,14 +53,17 @@ sys.path.insert(0, str(ROOT / "minitap"))
 MIN_LIMIT = 12
 
 
-def current_limit() -> int:
-    """从**代码里**读当前上限（单一事实源，不在这里复写一个数）。"""
+def current_limit() -> int | None:
+    """从**代码里**读当前上限（单一事实源，不在这里复写一个数）。
+
+    返回 None = **默认不限**（2026-10-22 起 `MAX_STEPS_PER_SUBGOAL = None`）。
+    """
     try:
         from minitap.mobile_use.agents.executor.executor import MAX_STEPS_PER_SUBGOAL
 
-        return int(MAX_STEPS_PER_SUBGOAL)
-    except Exception:  # noqa: BLE001 - 读不到就退回文档里的下限值
-        return MIN_LIMIT
+        return MAX_STEPS_PER_SUBGOAL
+    except Exception:  # noqa: BLE001 - 读不到就退回「不限」
+        return None
 
 
 def _percentile(values: list[int], q: float) -> float:
@@ -139,12 +142,16 @@ def main() -> int:
     p50 = _percentile(steps, 0.50)
     p90 = _percentile(steps, 0.90)
     limit = current_limit()
-    censored = [s for s in steps if s >= limit]
+    # 「打到上限」= 样本恰好落在上限上（说明那次被截断了，真实值看不到）。
+    # **默认不限（limit is None）⇒ 没有删失这回事**，分布是完整的。
+    censored = [s for s in steps if limit is not None and s >= limit]
 
     print(f"\n运行次数: {runs}   子目标样本: {len(steps)}")
     print(f"步数分布: min={min(steps)} p50={p50:.1f} p90={p90:.1f} max={max(steps)}")
     print(f"逐个: {sorted(steps)}")
-    print(f"当前 MAX_STEPS_PER_SUBGOAL = {limit}")
+    print(
+        f"当前 MAX_STEPS_PER_SUBGOAL = {limit if limit is not None else '不限（None）'}"
+    )
     if replans:
         print(f"replan 次数: {len(replans)}（>0 = 看门狗真的被触发过，R16 生效）")
     else:
@@ -178,6 +185,8 @@ def main() -> int:
         print()
 
         # 分辨 (a) 上限偏小 / (b) 那次是瞎转
+        # （到这里 `limit` 一定不是 None —— `censored` 非空就意味着配了上限）
+        assert limit is not None
         flailing, unknown = [], []
         for sid, seq in per_subgoal.items():
             hit_idx = next((i for i, (s, _) in enumerate(seq) if s >= limit), None)
@@ -214,6 +223,14 @@ def main() -> int:
     suggested = max(MIN_LIMIT, int(p90) + 1)
 
     print()
+    if limit is None:
+        print("⇒ **当前默认不限步数**（`MAX_STEPS_PER_SUBGOAL = None`）。")
+        print(f"  观测到的步数分布是**完整**的（没有被截断的样本）：p90={p90:.1f} max={max(steps)}")
+        print("  ⇒ 这个分布可以用来回答「一个子目标通常要几步」，")
+        print("     但**不该**再据此配一个上限（2026-10-22 实测：12 会腰斩正常子目标）。")
+        print("  ⇒ 兜底只剩**全局动作步预算**（`constants.DEFAULT_MAX_STEPS`）。")
+        return 0
+
     if runs < args.min_runs:
         print(f"⚠ **样本不足**（{runs} < {args.min_runs} 次运行）⇒ 不改步数上限。")
         print("  实测已证明单次运行不可靠：两次运行的每子目标步数差了 3.4 倍。")

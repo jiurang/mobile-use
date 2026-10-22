@@ -354,6 +354,27 @@ class CloudAndroidController(MobileDeviceController):
             logger.error(f"Failed to get UI hierarchy: {e}")
             return []
 
+    async def get_hierarchy_only(self) -> list[dict] | None:
+        """**只要层级树** —— 不截图、不跑 OCR（沉降稳定性确认用）。
+
+        和 Android 本地那条同源：``dump_hierarchy`` 自带 waitForIdle，
+        返回的树一定是「静」的，但不保证「全」（懒加载控件可能还没挂上）。
+        """
+        from minitap.mobile_use.clients.ui_automator_client import (
+            _parse_hierarchy_xml_to_elements,
+        )
+
+        try:
+            if self._ui_client is None:
+                return None
+            xml = await asyncio.to_thread(self._ui_client.get_hierarchy)
+            if not xml:
+                return None
+            return _parse_hierarchy_xml_to_elements(xml)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to dump hierarchy only: {e}")
+            return None
+
     def find_element(
         self,
         ui_hierarchy: list[dict],

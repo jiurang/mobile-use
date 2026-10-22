@@ -1,17 +1,22 @@
 """图片按需取（③）的行为锁定。
 
-三条链路都要锁：
+🔴 **2026-10-22 变更：Executor 的截图通道整条关掉了。**
+
+原来 Executor 能说「我需要看图」→ 同轮补一张 → **再问一次 LLM**。
+实测那次二问就是整整一次 LLM 调用（executor 单次决策中位 5,276ms），
+换来的只是「模型偶尔能看见颜色/图标/遮挡」。现在 Executor 只靠
+**UI 元素表 + OCR** 决策。
+
+这个文件锁的是三件事：
 
 1. **通道三态** —— `True`（每轮带图）/ `False`（不带）/ `"on_demand"`（按需）。
-   默认是 `"on_demand"`：截图是最贵、且**永远不可缓存**的那一块。
-2. **谁来要图** —— 2026-10-21「Executor 自主执行」改造后，要图的是
-   **Executor**（`ExecutorOutput.need_screenshot`），不再是 Cortex。
-   Cortex 已经不看屏了（感知全部下沉给 Executor），所以它没有这个字段。
-3. **prompt 渲染** —— `executor.md` 必须说清「什么时候要图」和「要了会给图」。
+   配置项本身还在（`PerceptionConfig.screenshot`），但 Executor 不用它了。
+2. **截图通道已关** —— `ExecutorOutput` 没有 `need_screenshot`；模型硬吐这个
+   键也被静默忽略。
+3. **prompt 渲染** —— `executor.md` 必须说清「**没有截图**」+ 息屏唤醒。
 
 ⚠️ 改造前这个文件测的是 cortex 的 `should_request_screenshot`，
 那套机制随 Cortex 不再看屏一起删掉了（`cortex.py` 里不再有这个函数）。
-截图按需的能力**没有丢**，只是换了主人 —— 现在在 Executor 侧。
 """
 
 from __future__ import annotations
@@ -63,30 +68,31 @@ class TestScreenshotMode:
         assert p.ui_hierarchy and p.ocr
 
 
-class TestExecutorOwnsTheScreenshotChannel:
-    """要图的能力搬到了 Executor 侧 —— 锁住它没丢。"""
+class TestExecutorScreenshotChannelIsOff:
+    """🔴 2026-10-22：Executor 的截图通道**整条关掉**。
 
-    def test_executor_output_has_need_screenshot(self):
-        """Executor 的输出模型必须带 `need_screenshot`。"""
-        assert "need_screenshot" in ExecutorOutput.model_fields
+    原来是「要图 → 同轮补一张 → **再问一次 LLM**」。实测那次二问就是
+    整整一次 LLM 调用（executor 单次决策中位 5,276ms），换来的只是
+    「模型偶尔能看见颜色/图标/遮挡」。
 
-    def test_need_screenshot_defaults_to_false(self):
-        """默认不要图 —— 图是最贵的一块，不能每轮都带。"""
-        assert ExecutorOutput(actions=[]).need_screenshot is False
+    关掉之后：
+    * `ExecutorOutput` 没有 `need_screenshot` ⇒ 模型不会再提这件事；
+    * 模型仍然吐这个键 ⇒ pydantic 静默忽略 ⇒ 不报错、不触发额外动作。
+    """
 
-    def test_need_screenshot_alone_is_a_legal_answer(self):
-        """「我要图」是**合法应答**，不是错误。
+    def test_executor_output_has_no_need_screenshot(self):
+        """Executor 的输出模型**不带** `need_screenshot`。"""
+        assert "need_screenshot" not in ExecutorOutput.model_fields
 
-        2026-10-21 真机踩出来的：模型只置 `need_screenshot`、没给动作时，
-        旧 cortex 的空响应校验会直接抛 "empty response" → 整轮失败 →
-        agent 在原地白烧步数（实测 51 步没跑完）。
+    def test_stray_need_screenshot_is_ignored_not_fatal(self):
+        """模型要是仍然吐这个键，必须**静默忽略**，不能让整轮挂掉。
 
-        新架构里 `ExecutorOutput` 是 pydantic 模型，`need_screenshot=True`
-        + 空 actions 是**合法构造**，不会抛。
+        2026-10-21 真机踩出来的教训反过来用在这里：解析层的任何一次
+        硬失败都会让 agent 在原地白烧步数（实测 51 步没跑完）。
         """
-        out = ExecutorOutput(actions=[], need_screenshot=True)
-        assert out.need_screenshot is True
+        out = ExecutorOutput(actions=[], need_screenshot=True)  # type: ignore[call-arg]
         assert out.actions == []
+        assert not hasattr(out, "need_screenshot")
 
     def test_cortex_no_longer_owns_the_screenshot_channel(self):
         """Cortex 已经不看屏了，不该再有 `need_screenshot` 字段。"""
@@ -105,11 +111,17 @@ class TestPromptRendering:
             goal="读出当前连接的 Wi-Fi 名称",
         )
 
-    def test_prompt_explains_the_on_demand_mechanism(self):
-        """必须说清：什么时候置 need_screenshot、要了会给图。"""
+    def test_prompt_says_there_is_no_screenshot(self):
+        """必须说清「**没有截图**」—— 否则模型会以为图在手里。"""
         out = self._render()
-        assert "need_screenshot" in out
-        assert "asked again" in out or "asked once more" in out or "given one screenshot" in out
+        assert "There is no screenshot" in out
+        assert "need_screenshot" not in out
+
+    def test_prompt_keeps_the_two_remaining_channels(self):
+        """UI 元素 + OCR 这两个通道必须留着。"""
+        out = self._render()
+        assert "UI elements" in out
+        assert "OCR" in out
 
     def test_prompt_explains_the_screen_may_be_asleep(self):
         """息屏时截图全黑、元素表只剩残留 —— 必须告诉模型怎么应对。"""
@@ -117,11 +129,6 @@ class TestPromptRendering:
         assert "wake_screen" in out
         assert "OFF" in out or "asleep" in out
 
-    def test_prompt_tells_the_model_not_to_ask_every_round(self):
-        """「Ask for it only when you really cannot decide」—— 不能每轮都要图。"""
+    def test_output_table_does_not_list_the_removed_field(self):
         out = self._render()
-        assert "Ask for it only" in out or "only when" in out
-
-    def test_output_table_lists_the_field(self):
-        out = self._render()
-        assert "need_screenshot" in out
+        assert "need_screenshot" not in out

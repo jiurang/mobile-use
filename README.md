@@ -128,6 +128,30 @@ Mobile-use runs on your own Android or iOS device with your choice of supported 
     >
     > Two more measured facts: the vision models reject a **forced** `tool_choice` (`400 Specifying functions for tool_choice is not yet supported`) — which is why structured output goes out as `response_format` first, with a tool-call retry as the second path; and `temperature` accepts 0..2, so `hopper`'s hardcoded `0` keeps working.
 
+    **Using a local llama.cpp server (llama-server):**
+
+    `llama-server` (from [llama.cpp](https://github.com/ggml-org/llama.cpp)) serves any GGUF model over an OpenAI-compatible API. The `llamacpp` provider points mobile-use at it:
+
+    1. Start the server, e.g. `llama serve -hf unsloth/Qwen3.5-0.8B-GGUF:Q6_K --ctx-size 65536`
+    2. Set `"provider": "llamacpp"` and the model name **exactly as the server reports it** (via `GET /v1/models` — e.g. `unsloth/Qwen3.5-0.8B-GGUF:Q6_K`, including the `:Q6_K` suffix) on the agent nodes you want to run locally
+    3. Optionally set `LLAMACPP_BASE_URL` (default `http://127.0.0.1:9931/v1`) and `LLAMACPP_API_KEY` (only needed when the server was started with `--api-key`)
+
+    Three measured facts (llama-server b11782, 2026-10-22) — they are why this provider is not just "the `openai` provider with a different URL":
+
+    - **Thinking has to be turned off.** The model answers in a thinking chain by default, and the chain eats the whole token budget — the answer body comes back empty and every structured output fails to parse. The provider therefore sends `chat_template_kwargs: {"enable_thinking": false}` per request, so **you do not have to restart the server**. Switch it back on per channel with `"thinking": true` (that is what the manager web UI's *thinking mode* switch writes).
+    - **The generation cap must be bounded.** llama.cpp's `n_predict` defaults to `-1` (unlimited) and a thinking model keeps going — with no cap the request never returns (measured: 20s and 300s timeouts). The provider sends `max_tokens` (1024 with thinking off, 8192 with it on).
+    - **Structured output goes out as native `response_format=json_schema`.** llama.cpp enforces it with a GBNF grammar, so the answer is valid JSON by construction; the "bind the schema as a tool" path (which the other providers use) is unreliable on small models — they often answer in prose instead of calling the tool.
+
+    Check the endpoint with the probe before pointing a real task at it:
+
+    ```bash
+    python scripts/probe_llamacpp.py            # per-role parse rate + latency
+    python scripts/probe_llamacpp.py --thinking # same, with the thinking chain on
+    ```
+
+    > [!NOTE]
+    > The agent runs where you start it. With `run-local.ps1` (or `python -m minitap.mobile_use.main`) the LLM calls come from the PC, so `127.0.0.1:9931` reaches your local server. When the agent runs inside the Android app, the call originates on the phone — forward the port with `adb reverse tcp:9931 tcp:9931` first.
+
     **Using Anthropic Claude:**
 
     [Anthropic](https://www.anthropic.com/) provides Claude — a capable, safety-focused model family. To use it:

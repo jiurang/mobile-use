@@ -136,6 +136,24 @@ class MobileDeviceController(Protocol):
         """
         raise NotImplementedError("Subclasses must implement this method")
 
+    async def get_hierarchy_only(self) -> list[dict] | None:
+        """**只要层级树**，不要截图、不要 OCR。
+
+        这是沉降稳定性确认要用的那个能力：判定「这一屏定下来没有」只需要
+        树的内容，不需要图。Android 实测一次树级 dump 约 150~250ms，
+        而整段 ``get_screen_data`` 要 600ms（截图 166 + PNG 编码 79 + OCR 381）。
+
+        默认实现回退到 ``get_ui_hierarchy()`` —— 那条路会连截图和 OCR 一起做，
+        慢但正确。**实现不了轻量路径的平台（iOS、云端）走这一条**，
+        代价是每次确认多花一次 OCR。
+
+        返回 ``None`` 表示「拿不到树」，调用方应保留上一份而不是当成空树。
+        """
+        try:
+            return await self.get_ui_hierarchy()
+        except Exception:  # noqa: BLE001 - 拿不到就当没有，调用方会保留上一份
+            return None
+
     @abstractmethod
     def find_element(
         self,
@@ -175,8 +193,12 @@ class MobileDeviceController(Protocol):
 
         Args:
             on_screenshot: 可选回调，在截图拿到之后、层级树还在采集的窗口里
-                同步调用一次。Android 实测 `dump_hierarchy` 要 ~1.2s，OCR 只要
-                ~0.4s，把 OCR 塞进这个窗口等于白送。实现方不支持时忽略即可。
+                同步调用一次。Android 实测 `dump_hierarchy` 静态屏要
+                **134~206ms**（动画屏 200~800ms），OCR 要 **381~443ms**
+                ⇒ 现在是 **OCR 才是关键路径**，dump 反而被藏住了。
+                ⚠️ 2026-10-22 更正：这里原来写的是「dump 要 ~1.2s，OCR 只要
+                ~0.4s，把 OCR 塞进这个窗口等于白送」—— 那个前提**已被实测推翻**
+                （dump 变快了，OCR 没变）。实现方不支持时忽略即可。
 
         Returns:
             ScreenDataResponse with base64 screenshot, elements, width, height, platform

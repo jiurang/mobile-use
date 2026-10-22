@@ -102,6 +102,8 @@ Available tools: {{ executor_tools_list }}
 | `wake_screen` | *(none)* | Turn the screen on; use it only when the device state line says the screen is OFF |
 | `save_note` | `key`, `content` | — |
 | `read_note` | `key` | — |
+| `start_video_recording` | *(none)* | Starts a background screen recording: max 3 min (Android) / 15 min (iOS), no audio; runs until `stop_video_recording` |
+| `stop_video_recording` | optional `prompt` | Stops the recording, then analyzes the video; `prompt` says what to extract (e.g. "what happens after each 10s") |
 
 Every action is `{"action": "<tool name>", ...arguments}`. Tool and argument
 names must match exactly - an unknown name or key is rejected and the reason is
@@ -123,20 +125,18 @@ into the wrong field when the right one was observed.
 
 ## Perception
 
-Three channels, covering each other's blind spots:
+**Two channels, covering each other's blind spots:**
 
 - **UI elements** - find by `index` (or `ocr_index` when there is no element
   table), id, text or bounds. Blind to color, images, obscured elements and
   canvas text.
-- **Screenshot** - overall picture and visual cues. No precise coordinates.
 - **OCR** - text the element tree misses. Boxes only, no resource-id.
 
-**The screenshot is on demand.** You do NOT get one by default, because it is
-expensive and never cached. Work from the element list and the OCR text. If they
-do not tell you enough to decide - the target is only distinguishable by color,
-an icon or an image, or it is obscured - set **need_screenshot** to true in your
-output. You will then be given one screenshot and asked again. Ask for it only
-when you really cannot decide without it.
+**There is no screenshot.** You never get a picture of the screen, so you
+cannot judge color, icons, images or what is covering what. Decide from the
+element list and the OCR text. If the only thing that distinguishes a target
+is its appearance, pick the target whose text or id fits the goal instead, or
+say in `agent_thought` that you cannot tell them apart.
 
 **The device may be asleep.** If the screenshot is black and the element list
 only holds systemui leftovers, the screen is probably off - you cannot see
@@ -152,7 +152,7 @@ not nothing on screen.
 **You must answer by calling the `ExecutorOutput` tool.** Never write the output
 as plain text - a text answer is rejected and the round is wasted. Fields:
 `actions` (always a list, required unless `done`), `agent_thought`, `done`,
-`done_reason` (when `done`), `need_screenshot`.
+`done_reason` (when `done`).
 
 When the goal is reached - note that `actions` is empty and the reason carries
 the evidence:

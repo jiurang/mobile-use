@@ -6,7 +6,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast, overload
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -68,18 +68,48 @@ LLM_REQUEST_TIMEOUT_SECONDS = 180.0
 class ProviderOverride:
     """运行期下发的接入参数。字段为 ``None`` 表示「没下发,走 settings」。
 
-    这是 manager 侧「渠道」下发过来的 key / 端点在这里的落点。每个 provider 工厂都按
-    「override 优先、settings 兜底」解析,于是没下发渠道的部署行为与之前逐字节一致 ——
-    这是这条路径能被安全打开的前提。
+    这是 manager 侧「渠道」下发过来的 key / 端点在这里的落点。每个 provider 工厂默认
+    都按「override 优先、settings 兜底」解析,于是没下发渠道的部署行为与之前逐字节
+    一致 —— 这是这条路径能被安全打开的前提。
+
+    ``strict`` 打开时,「settings 兜底」这一层被**去掉**:只认渠道下发的值。
+    它由 :attr:`~minitap.mobile_use.config.LLM.allow_env_fallback` 的反值决定,
+    也就是「这条接入参数是运行期下发的渠道」时为 True。
+
+    为什么渠道必须 strict:manager 明确指定了用哪个模型、哪个端点、哪把密钥,
+    这时候再从设备本地的 .env 里补一把,症状是「我明明选了 M3.1,跑起来是 .env 里
+    那个模型」—— 而且它**不报错**。渠道下发时缺了什么,应该响亮地失败,
+    而不是悄悄用另一个接入点。
     """
 
     api_key: SecretStr | None = None
     base_url: str | None = None
+    strict: bool = False
 
-    def key_or(self, attr: str) -> SecretStr | None:
+    #: 渠道下发的「要不要思考」开关。None = 没下发 = 用 provider / settings 的默认。
+    #: 只有 llamacpp 消费它（见 :func:`get_llamacpp_llm`）。
+    thinking: bool | None = None
+
+    def key_or(self, attr: str, required: bool = True) -> SecretStr | None:
+        if self.strict:
+            if not self.api_key:
+                if not required:
+                    # 这个 provider 可以不要密钥（azure 走 DefaultAzureCredential）。
+                    return None
+                # 到这里说明渠道漏了密钥。明确说清楚「哪一环断了 + 去哪补」,
+                # 而不是让调用方的 assert 打出一个没有信息量的 AssertionError。
+                raise ValueError(
+                    f"渠道没有下发 API Key，而且这条路径不允许回退到设备本地的 .env（{attr}）。"
+                    f"请在 manager 的渠道配置里补上密钥，或换一条带密钥的渠道。"
+                )
+            return self.api_key
         return self.api_key or getattr(settings, attr, None)
 
     def url_or(self, attr: str, default: str | None = None) -> str | None:
+        if self.strict:
+            # 渠道没给端点时用 provider 自带的默认端点（那是代码里的常量，
+            # 不是设备本地环境的一部分），但绝不读 .env 里的 <PROVIDER>_BASE_URL。
+            return self.base_url or default
         return self.base_url or getattr(settings, attr, None) or default
 
 
@@ -302,12 +332,13 @@ def get_minitap_llm(
     override = override or ProviderOverride()
     if api_key:
         effective_api_key = SecretStr(api_key)
-    elif override.api_key:
-        effective_api_key = override.api_key
-    elif settings.MINITAP_API_KEY:
-        effective_api_key = settings.MINITAP_API_KEY
     else:
-        raise ValueError("MINITAP_API_KEY must be provided or set in environment")
+        # key_or 自己处理两种语义：strict（渠道路径）只认渠道下发的密钥，缺了就报错；
+        # 非 strict 才是「渠道 → settings」的老兜底。minitap 原来是自己手写的
+        # 三段 if，漏掉了 strict 这一层。
+        effective_api_key = override.key_or("MINITAP_API_KEY")
+        if effective_api_key is None:
+            raise ValueError("MINITAP_API_KEY must be provided or set in environment")
 
     if max_retries is None and model.startswith("google/"):
         max_retries = 2
@@ -520,7 +551,8 @@ def get_azure_llm(
     assert endpoint is not None
 
     api_key: str | None = None
-    key = override.key_or("AZURE_API_KEY")
+    # azure 可以完全不带 key（走 DefaultAzureCredential），所以这里不能要求一定有。
+    key = override.key_or("AZURE_API_KEY", required=False)
     if key:
         api_key = key.get_secret_value()
 
@@ -1001,6 +1033,141 @@ def get_siliconflow_llm(
     return client
 
 
+# ---------------------------------------------------------------------------
+# llama.cpp / llama-server（本地 OpenAI 兼容端点）
+# ---------------------------------------------------------------------------
+#
+# 这个 provider 的所有参数都是**实测**出来的（2026-10-22，本机 llama-server
+# b11782，模型 unsloth/Qwen3.5-0.8B-GGUF:Q6_K）。三件事必须记住：
+#
+# 1. **思考链默认开着，而且会吃光 token 预算。** 不关掉时模型的输出全在
+#    ``reasoning_content`` 里，``content`` 恒为空 → 结构化输出必然解析失败。
+#    决定性对照（真实 schema + 真实客户端）：
+#      思考 ON  + max_tokens=256 → LengthFinishReasonError（JSON 没写完）
+#      思考 ON  + 不限长         → 挂死（20s / 300s 两次超时都没返回）
+#      思考 OFF + 不限长         → 2.8s 正常解析
+#    ⇒ 关思考用请求级的 ``chat_template_kwargs.enable_thinking``，**不用重启服务器**。
+# 2. **不限长 = 挂死。** llama.cpp 的 ``n_predict`` 默认 -1，而思考链会一直续写。
+#    所以 ``max_tokens`` 必须有界（见 ``settings.LLAMACPP_MAX_TOKENS``）。
+# 3. **结构化输出走 json_schema 语法约束。** llama.cpp 用 GBNF 硬约束输出，
+#    实测 5 个角色的 schema 全部解析成功；「schema 当工具绑」那条路在 0.8B 上
+#    会「不调工具、直接写散文」（实测 1/2 失败）。
+
+
+class _LlamaCppStructuredRunnable(Runnable):
+    """llama.cpp 的结构化输出：json_schema 主路径 + 工具备路径。
+
+    与 :class:`_SiliconFlowStructuredRunnable` 同形，差别在两条路径的成功率：
+    llama.cpp 的 json_schema 是**语法级**约束（GBNF），模型写不出不合法的 JSON，
+    实测 5/5 解析成功；工具绑定那条路在这里只是兜底（0.8B 经常不调工具）。
+    """
+
+    def __init__(self, llm: ChatOpenAI, schema: type[BaseModel]):
+        self.llm = llm
+        self.schema = schema
+        # 主路径：原生 response_format=json_schema。显式走 ChatOpenAI 的实现，
+        # 绕开 LlamaCppChatOpenAI 自己的覆盖（否则会无限递归）。
+        self._native = ChatOpenAI.with_structured_output(llm, schema, method="json_schema")
+        # 备路径：schema 当工具绑上去，不强制 tool_choice。
+        self._tool = _ToolCallStructuredRunnable(llm, schema, force_tool_choice=False)
+
+    def _fail(self, native_error: Exception, tool_error: Exception) -> ValueError:
+        return ValueError(
+            f"llama.cpp returned no parseable {self.schema.__name__}. "
+            f"json_schema path: {type(native_error).__name__}: {native_error}; "
+            f"tool path: {type(tool_error).__name__}: {tool_error}"
+        )
+
+    def invoke(self, input, config=None, **kwargs):
+        try:
+            return self._native.invoke(input, config=config, **kwargs)
+        except Exception as native_error:
+            try:
+                return self._tool.invoke(input, config=config, **kwargs)
+            except Exception as tool_error:
+                raise self._fail(native_error, tool_error) from tool_error
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        try:
+            return await self._native.ainvoke(input, config=config, **kwargs)
+        except Exception as native_error:
+            try:
+                return await self._tool.ainvoke(input, config=config, **kwargs)
+            except Exception as tool_error:
+                raise self._fail(native_error, tool_error) from tool_error
+
+
+class LlamaCppChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
+    """llama-server (llama.cpp) 的 OpenAI 兼容端点。
+
+    **Do not simplify this back to plain ``ChatOpenAI`` without a live call.**
+    见本节开头的三条实测结论 —— 少一样都会让结构化输出直接失败。
+    """
+
+    #: 这条 provider 的结构化输出走哪条路（见 :func:`get_structured_llm`）。
+    #: "tool" 是默认（把 schema 当工具绑），"json_schema" 是原生语法约束。
+    #: 必须是 ClassVar —— ChatOpenAI 是 pydantic 模型，未标注的类属性会被当成字段。
+    structured_output_strategy: ClassVar[str] = "json_schema"
+
+    def with_structured_output(self, schema=None, **kwargs):  # type: ignore[override]
+        if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+            kwargs.setdefault("method", "function_calling")
+            return super().with_structured_output(schema, **kwargs)
+        return _LlamaCppStructuredRunnable(self, schema)
+
+
+def get_llamacpp_llm(
+    model_name: str = "unsloth/Qwen3.5-0.8B-GGUF:Q6_K",
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+) -> ChatOpenAI:
+    """构造 llama.cpp / llama-server 的客户端。
+
+    三个旋钮的语义（都实测过）：
+
+    * **思考开关**：渠道下发的 ``thinking`` 优先，否则用
+      ``settings.LLAMACPP_ENABLE_THINKING``（默认关）。关掉时请求里带
+      ``chat_template_kwargs={"enable_thinking": false}`` —— 这是 llama.cpp 的
+      模板级开关，**不需要重启服务器**。
+    * **max_tokens**：必须有界。思考链开着时预算要宽得多（思考 + 正文共用），
+      所以有两个上限而不是一个。
+    * **密钥**：本地 server 默认不鉴权，占位 key 即可；server 起了 ``--api-key``
+      时才需要真密钥（渠道下发，或写进 ``.env`` 的 ``LLAMACPP_API_KEY``）。
+    """
+    override = override or ProviderOverride()
+
+    api_key = override.key_or("LLAMACPP_API_KEY", required=False)
+    if api_key is None:
+        # OpenAI SDK 不接受空 api_key；llama server 没起 --api-key 时不校验这个头。
+        api_key = SecretStr("sk-local")
+
+    enable_thinking = override.thinking
+    if enable_thinking is None:
+        enable_thinking = settings.LLAMACPP_ENABLE_THINKING
+
+    max_tokens = (
+        settings.LLAMACPP_MAX_TOKENS_THINKING if enable_thinking else settings.LLAMACPP_MAX_TOKENS
+    )
+
+    client = LlamaCppChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        temperature=temperature,
+        base_url=override.url_or("LLAMACPP_BASE_URL", "http://127.0.0.1:9931/v1"),
+        # 关思考是**必须**的：开着时 content 恒为空，结构化输出必然失败。
+        # 开思考时也显式写 true，别依赖服务端默认 —— 默认值在不同版本上变过。
+        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
+        # 有界：不限长时思考链会一直续写 → 客户端挂死。
+        max_tokens=max_tokens,  # type: ignore[call-arg]  # field aliased to max_completion_tokens
+        # 有界超时 + 一次重试，理由同 get_minimax_llm。
+        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,  # type: ignore[call-arg]  # field aliased to timeout
+        max_retries=1,
+        # 不开这个开关，流式调用的 usage_metadata 是 None，遥测里 token 消耗记不上。
+        stream_usage=True,
+    )
+    return client
+
+
 @overload
 def get_llm(
     ctx: MobileUseContext,
@@ -1054,7 +1221,16 @@ def get_llm(
 
     # 渠道下发的接入参数。没下发时 llm.base_url / api_key 都是 None,
     # ProviderOverride 就是空的,工厂照样落回 settings —— 行为与改动前一致。
-    override = ProviderOverride(api_key=llm.api_key, base_url=llm.base_url)
+    #
+    # 渠道下发的配置 allow_env_fallback=False,于是 strict=True:工厂只认渠道里
+    # 给的值,不再从设备本地的 .env 补 —— 「我明明选了 A,跑起来是 B」不能发生。
+    override = ProviderOverride(
+        api_key=llm.api_key,
+        base_url=llm.base_url,
+        # 渠道下发的「要不要思考」。None = 没下发 = provider 自己的默认。
+        thinking=llm.thinking,
+        strict=not llm.allow_env_fallback,
+    )
     # 温度同理:渠道给了就用渠道的,没给就用各 agent 调用点的硬编码值
     # (hopper=0 / video_analyzer=0.2 / 其余 1)。
     effective_temperature = llm.temperature if llm.temperature is not None else temperature
@@ -1079,6 +1255,8 @@ def get_llm(
         return get_deepseek_llm(llm.model, effective_temperature, override)
     elif llm.provider == "siliconflow":
         return get_siliconflow_llm(llm.model, effective_temperature, override)
+    elif llm.provider == "llamacpp":
+        return get_llamacpp_llm(llm.model, effective_temperature, override)
     elif llm.provider == "minitap":
         return get_minitap_llm(
             trace_id=ctx.trace_id,
@@ -1089,6 +1267,43 @@ def get_llm(
         )
     else:
         raise ValueError(f"Unsupported provider: {llm.provider}")
+
+
+def get_structured_llm(
+    ctx: MobileUseContext,
+    name: AgentNode,
+    schema: type[BaseModel],
+    *,
+    use_fallback: bool = False,
+    temperature: float = 1,
+) -> Runnable:
+    """拿一个「按 schema 出结构化结果」的客户端。
+
+    为什么需要这个入口：executor / reporter 之前**直接** new 一个
+    ``_ToolCallStructuredRunnable``（把 schema 当工具绑），绕过了 ``with_structured_output``。
+    于是「这个 provider 怎么出结构化输出」被写死在那两个角色里 —— 像 llama.cpp 这种
+    「json_schema 语法约束才是可靠路径」的 provider 就吃不到（实测 0.8B 在工具绑定那条路上
+    会不调工具、直接写散文）。
+
+    这里按**客户端自己声明的能力**分派：
+
+    * ``structured_output_strategy == "json_schema"``（llamacpp）→ 走
+      ``llm.with_structured_output(schema)``，即原生语法约束。
+    * 其它（默认）→ 保持原样：``_ToolCallStructuredRunnable(llm, schema)``，与改动前
+      **逐字同构**（同样把 schema 绑成工具、同样 force_tool_choice=True）。
+
+    ⚠️ 不要图省事把 executor / reporter 直接改成 ``llm.with_structured_output(schema)``：
+    DeepSeek 的 ``with_structured_output`` 用
+    ``force_tool_choice=settings.DEEPSEEK_THINKING is False``，而直连
+    ``_ToolCallStructuredRunnable`` 恒为 True —— 直接换会**悄悄改变 DeepSeek 的行为**。
+    """
+    llm = get_llm(ctx=ctx, name=name, use_fallback=use_fallback, temperature=temperature)
+    if getattr(llm, "structured_output_strategy", "tool") == "json_schema":
+        return llm.with_structured_output(schema)
+    # `_ToolCallStructuredRunnable` 的 llm 形参标的是 ChatOpenAI，但 get_llm 返回的
+    # 是 BaseChatModel（anthropic 渠道甚至不是 ChatOpenAI）。它只用到 bind_tools，
+    # 所以这里放宽成 Any —— 不去动 services/llm.py 里那个类的签名。
+    return _ToolCallStructuredRunnable(cast("Any", llm), schema)
 
 
 T = TypeVar("T")

@@ -268,6 +268,32 @@ class AndroidDeviceController(MobileDeviceController):
             logger.error(f"Failed to get UI hierarchy: {e}")
             return []
 
+    async def get_hierarchy_only(self) -> list[dict] | None:
+        """**只要层级树** —— 不截图、不跑 OCR。
+
+        沉降稳定性确认用这条：判定「屏定下来没有」只需要树的内容。
+        走 ``get_screen_data`` 会连带做一次截图（166ms）+ PNG 编码（79ms）
+        + OCR（381ms），而那些在这一步完全用不上。
+
+        实测一次树级 dump 约 150~250ms（Redmi Turbo 4 / Android 16）。
+
+        ⚠️ ``dump_hierarchy`` 自带 waitForIdle —— 屏幕还在动的时候它会
+        **自己等**（实测滚动场景里它等了 609ms）。所以这个方法返回的树
+        一定是「静」的，但不保证「全」（懒加载的控件可能还没挂上）。
+        """
+        from minitap.mobile_use.clients.ui_automator_client import (
+            _parse_hierarchy_xml_to_elements,
+        )
+
+        try:
+            xml = await asyncio.to_thread(self.ui_adb_client.get_hierarchy)
+            if not xml:
+                return None
+            return _parse_hierarchy_xml_to_elements(xml)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to dump hierarchy only: {e}")
+            return None
+
     def find_element(
         self,
         ui_hierarchy: list[dict],

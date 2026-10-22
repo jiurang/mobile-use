@@ -8,6 +8,15 @@
   渠道温度必须能盖掉它 —— 这正是本文件第 4 组用例存在的理由。
 * Google / Vertex 的客户端**没有**端点参数。下发了就必须报出来,静默丢弃会变成
   「配置改了没反应」。
+
+**渠道不许回退到设备本地的 .env。** manager 已经明确指定了用哪个模型、哪个端点、
+哪把密钥,这时 mobile-use 再从 .env 里补一把,症状是「我明明选了 M3.1,跑起来是 .env
+里那个模型」—— 而且它不报错。所以:
+
+* 渠道缺密钥 → 构造配置时直接报错;
+* 渠道没给端点 → 用 provider 自带的默认端点,但**不读** .env 里的
+  ``<PROVIDER>_BASE_URL``;
+* 「没下发渠道」的老路(``llm-config.override.jsonc`` + .env)行为一字不变。
 """
 
 from __future__ import annotations
@@ -17,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
-from minitap.mobile_use.config import LLM, settings
+from minitap.mobile_use.config import LLM, LLMConfig, settings
 from minitap.mobile_use.sdk.utils import llm_config_for_single_model
 from minitap.mobile_use.services.llm import (
     ProviderOverride,
@@ -120,10 +129,38 @@ def test_single_model_config_omits_unset_optional_fields():
     `LLMWithFallback.model_validate` 会走 validate_provider,塞 None 和不塞的
     区别在于:不塞时温度退回各调用点的硬编码值。
     """
-    cfg = llm_config_for_single_model("minimax", "M3.1")
+    cfg = llm_config_for_single_model("minimax", "M3.1", api_key="k")
     assert cfg.cortex.temperature is None
     assert cfg.cortex.base_url is None
+    assert cfg.cortex.api_key is not None
+
+
+def test_channel_without_key_is_rejected():
+    """渠道缺密钥必须报错，而不是回退到设备本地的 .env。
+
+    这条是「manager 下发的模型参数不被 .env 顶掉」的底线：回退的症状是
+    「我明明选了 M3.1，跑起来是 .env 里那个模型」，而且它不报错。
+    """
+    with pytest.raises(ValueError, match="api_key"):
+        llm_config_for_single_model("minimax", "M3.1")
+
+
+def test_channel_config_is_marked_no_env_fallback():
+    """渠道产出的配置必须标上「不许从 .env 补齐」。
+
+    标记丢了，strict 就不会打开，兜底会悄悄回来 —— 而这种回归没有任何症状，
+    只能靠这个断言挡住。
+    """
+    cfg = llm_config_for_single_model("minimax", "M3.1", api_key="k")
+    assert cfg.cortex.allow_env_fallback is False
+    assert cfg.cortex.fallback.allow_env_fallback is False
+
+
+def test_keyless_provider_may_omit_the_key():
+    """azure / vertexai 走服务账号凭据，没有密钥是合法的。"""
+    cfg = llm_config_for_single_model("vertexai", "gemini-2.5-pro")
     assert cfg.cortex.api_key is None
+    assert cfg.cortex.allow_env_fallback is False
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +179,47 @@ def test_channel_credentials_win_over_settings(settings_minimax):
     assert client.openai_api_base == "http://channel/v1"
 
 
-def test_settings_still_used_when_no_channel(settings_minimax):
-    """没下发渠道的部署必须一字不变 —— 否则这是破坏性改动。"""
-    cfg = llm_config_for_single_model("minimax", "M3.1")
+def test_file_config_still_falls_back_to_settings(settings_minimax):
+    """没下发渠道的部署必须一字不变 —— 否则这是破坏性改动。
+
+    「没下发渠道」的老路是配置文件（``llm-config.override.jsonc``，里面只有
+    provider/model）+ .env 里的密钥。渠道那条路（:func:`llm_config_for_single_model`）
+    不再回落，见 :func:`test_channel_without_key_is_rejected`。
+    """
+    def role(model: str = "M3.1"):
+        return {
+            "provider": "minimax",
+            "model": model,
+            "fallback": {"provider": "minimax", "model": "M3"},
+        }
+
+    cfg = LLMConfig.model_validate(
+        {
+            "planner": role(),
+            "orchestrator": role(),
+            "contextor": role(),
+            "cortex": role(),
+            "executor": role(),
+            "utils": {"outputter": role(), "hopper": role()},
+        }
+    )
     client = get_llm(_ctx(cfg), name="cortex")
 
     assert client.openai_api_key is not None
     assert client.openai_api_key.get_secret_value() == "env-key"
     assert client.openai_api_base == "https://env.example.com/v1"
+
+
+def test_channel_does_not_read_the_endpoint_from_env(settings_minimax):
+    """渠道没给端点时，用 provider 自带的默认端点，**不读** .env 里的那个。
+
+    读 .env 意味着「manager 说用 minimax，端点却是设备本地 .env 里那个」——
+    国内 key 发到国际端点是 401，而错误信息完全指不到真正的原因。
+    """
+    cfg = llm_config_for_single_model("minimax", "M3.1", api_key="channel-key")
+    client = get_llm(_ctx(cfg), name="cortex")
+
+    assert client.openai_api_base == "https://api.minimax.io/v1"
 
 
 def test_channel_key_works_with_empty_settings(no_settings_minimax):
@@ -175,13 +245,13 @@ def test_fallback_channel_is_used_when_requested(settings_minimax):
 
 def test_channel_temperature_overrides_call_site_value(settings_minimax):
     """hopper 的调用点传 temperature=0,渠道给 0.7 时必须是 0.7。"""
-    cfg = llm_config_for_single_model("minimax", "M3.1", temperature=0.7)
+    cfg = llm_config_for_single_model("minimax", "M3.1", api_key="k", temperature=0.7)
     client = get_llm(_ctx(cfg), name="hopper", is_utils=True, temperature=0)
     assert client.temperature == pytest.approx(0.7)
 
 
 def test_call_site_temperature_kept_when_channel_silent(settings_minimax):
-    cfg = llm_config_for_single_model("minimax", "M3.1")
+    cfg = llm_config_for_single_model("minimax", "M3.1", api_key="k")
     client = get_llm(_ctx(cfg), name="hopper", is_utils=True, temperature=0)
     assert client.temperature == pytest.approx(0)
 

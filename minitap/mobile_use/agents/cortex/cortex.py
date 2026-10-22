@@ -672,8 +672,11 @@ class CortexNode:
             # `[(2, completed), (13, blocked), (1, completed)]` —— 第一次 2 步就
             # 做成了，重发后那次却瞎转 13 步，重发再重发又 1 步就成了。
             #
-            # ⚠️ 保留历史会让它随重发次数增长，但**增长是有界的**：
-            # 每次尝试的步数受 `MAX_STEPS_PER_SUBGOAL` 限制。
+            # ⚠️ 保留历史会让它随重发次数增长。**增长有界的唯一保证是全局动作步
+            # 预算**（`constants.DEFAULT_MAX_STEPS` → LangGraph 的
+            # `recursion_limit`）—— 单子目标步数上限**默认不限**
+            # （`MAX_STEPS_PER_SUBGOAL = None`，2026-10-22 起），所以这里
+            # **没有**「每次尝试的步数上限」这层保护了。
             # （不做截断 —— 截断历史有把 AIMessage/tool_call 和 ToolMessage
             # 配对拆散的风险，那会变成「孤儿 tool_call → 400」，
             # 和致命 bug 3 同一类。）

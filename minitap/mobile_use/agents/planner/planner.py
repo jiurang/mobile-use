@@ -190,12 +190,73 @@ class PlannerNode:
         llm_fallback = get_llm(
             ctx=self.ctx, name="planner", use_fallback=True
         ).with_structured_output(PlannerOutput)
-        new_subgoals = await with_fallback(
-            main_call=lambda: _invoke_planner(llm, messages, self.ctx),
-            fallback_call=lambda: _invoke_planner(
-                llm_fallback, messages, self.ctx, used_fallback=True
-            ),
-        )
+
+        async def ask_planner(msgs) -> list[Subgoal]:
+            return await with_fallback(
+                main_call=lambda: _invoke_planner(llm, msgs, self.ctx),
+                fallback_call=lambda: _invoke_planner(
+                    llm_fallback, msgs, self.ctx, used_fallback=True
+                ),
+            )
+
+        # 🔴 **韧性**：解析失败不许杀死整个任务。
+        #
+        # 和 cortex 同一个病（`agents/cortex/cortex.py` 的同款形状）：
+        # MiniMax 偶发返回空响应 ⇒ `_parse` 抛 ⇒ **整个任务当场失败**。
+        # `with_fallback` 救不了 —— 本机 override 里 fallback 和主模型是同一个模型。
+        #
+        # ⇒ 失败 → 带 nudge 重试一次 → 仍失败 → **降级**。
+        #
+        # 降级成什么（**不引入任何新的事实断言**）：
+        # * **replan 场景**（有旧计划，且有被标失败的子目标）⇒ **把那个失败的
+        #   子目标重新下发一次**。它「还没做完」，所以重新下发是事实，不是编造；
+        #   这也正是「换招重试」在计划层的形状。
+        # * **首次规划**（没有旧计划）⇒ **没有可退守的东西**，只能抛。
+        #   这条真的无解：没有计划就没有任何可执行的东西。
+        #
+        # ⚠️ **代价（要说清）**：降级后那个子目标可能再失败 ⇒ 又 replan ⇒ 又降级 ⇒
+        # **可能反复重规划直到全局动作步预算耗尽**。全局预算是唯一的兜底。
+        try:
+            new_subgoals = await ask_planner(messages)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[planner] LLM call failed ({type(e).__name__}: {str(e)[:160]}); "
+                "retrying once with a nudge"
+            )
+            nudge = HumanMessage(
+                content=(
+                    "Your last answer could not be read. You must call the "
+                    "PlannerOutput tool with the field (subgoals). Do not write "
+                    "the plan as plain text — a plain-text answer is discarded."
+                )
+            )
+            try:
+                new_subgoals = await ask_planner([*messages, nudge])
+            except Exception as e2:  # noqa: BLE001
+                failed = [
+                    s
+                    for s in state.subgoal_plan
+                    if s.status == SubgoalStatus.FAILURE
+                ]
+                if not failed:
+                    # 首次规划（或没有失败子目标）⇒ 没有可退守的东西，只能抛。
+                    logger.warning(
+                        f"[planner] retry also failed ({type(e2).__name__}: {str(e2)[:160]}) "
+                        "and there is no failed subgoal to re-issue; giving up"
+                    )
+                    raise
+                logger.warning(
+                    f"[planner] retry also failed ({type(e2).__name__}: {str(e2)[:160]}); "
+                    f"degrading to re-issuing {len(failed)} failed subgoal(s)"
+                )
+                new_subgoals = [
+                    Subgoal(
+                        id=generate_id(),
+                        description=s.description,
+                        status=SubgoalStatus.NOT_STARTED,
+                    )
+                    for s in failed
+                ]
         # On replan, the LLM only returns the remaining steps: already completed
         # subgoals are kept as-is so they are never executed a second time.
         completed_subgoals = [

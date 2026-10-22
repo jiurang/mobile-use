@@ -71,6 +71,24 @@ class Settings(BaseSettings):
     # None -> we don't send the parameter at all and DeepSeek's default applies.
     DEEPSEEK_THINKING: bool | None = None
 
+    # ---- llama.cpp / llama-server（本地 OpenAI 兼容端点）----
+    #
+    # 本地 server 默认不鉴权，所以这里**没有**「必须配密钥」这一说。
+    LLAMACPP_BASE_URL: str = "http://127.0.0.1:9931/v1"
+    # 只有 server 起了 `--api-key` 时才需要填；不填时客户端用占位 key。
+    LLAMACPP_API_KEY: SecretStr | None = None
+    # 单次生成的 token 上限。**必须有界**：llama.cpp 的 `n_predict` 默认 -1 = 不限长，
+    # 而开着思考链的模型会一直续写思考 —— 实测不限长时请求直接挂死（20s / 300s 两次超时）。
+    # 关闭思考时实测正常输出只要 46~100 token，1024 有 10 倍余量。
+    LLAMACPP_MAX_TOKENS: int = 1024
+    # 开启思考链时，思考 + 正文**共用**这一个预算，所以要比关闭时宽得多。
+    # （实测思考 ON + 256 token 的结果是 LengthFinishReasonError：思考吃满预算，JSON 没写完。）
+    LLAMACPP_MAX_TOKENS_THINKING: int = 8192
+    # 默认**关闭**思考链。本地小模型默认开着思考，思考会吃光 token 预算、
+    # 让结构化输出的 content 恒为空 —— 这是这类端点最常见的失败原因。
+    # 运行期渠道下发的 `thinking` 开关（见 LLM.thinking）优先于这个默认值。
+    LLAMACPP_ENABLE_THINKING: bool = False
+
     ADB_HOST: str | None = None
     ADB_PORT: int | None = None
 
@@ -149,7 +167,35 @@ LLMProvider = Literal[
     "minimax",
     "deepseek",
     "siliconflow",
+    "llamacpp",
 ]
+#: 这些 provider 不需要 API Key：它们走环境里的服务账号凭据
+#: （azure → DefaultAzureCredential，vertexai → ADC），或者端点根本不鉴权
+#: （llamacpp → 本地 llama-server 默认不校验 Authorization 头）。
+#: 渠道没给密钥是合法的。其余 provider 缺密钥就是缺 —— 见 :func:`provider_requires_api_key`。
+KEYLESS_PROVIDERS: frozenset[str] = frozenset({"azure", "vertexai", "llamacpp"})
+
+#: 这些 provider 的客户端不接受自定义端点（google 的 SDK、vertexai 的 ADC 都没有
+#: 「访问端点」这个旋钮）。渠道给不给 base_url 都一样，所以不强制要求。
+ENDPOINTLESS_PROVIDERS: frozenset[str] = frozenset({"google", "vertexai"})
+
+
+def provider_requires_api_key(provider: str) -> bool:
+    """这个 provider 是不是必须有一把密钥。
+
+    判据只有一条：能不能用服务账号凭据代替。azure 和 vertexai 能，其余不能。
+    """
+    return provider not in KEYLESS_PROVIDERS
+
+
+def provider_supports_endpoint(provider: str) -> bool:
+    """这个 provider 是不是接受自定义访问端点。
+
+    google / vertexai 的客户端没有端点参数，渠道里填了也会被忽略并告警。
+    """
+    return provider not in ENDPOINTLESS_PROVIDERS
+
+
 LLMUtilsNode = Literal["outputter", "hopper", "video_analyzer"]
 LLMUtilsNodeWithFallback = LLMUtilsNode
 AgentNode = Literal[
@@ -196,6 +242,30 @@ class LLM(BaseModel):
     api_key: SecretStr | None = None
     temperature: float | None = None
 
+    #: 「要不要让模型思考」的开关。None = 没指定 = 用该 provider 自己的默认。
+    #:
+    #: 为什么是**布尔**而不是一段自由 JSON：每个 provider 的思考开关在请求体里的
+    #: 形状都不一样（llama.cpp 是 ``chat_template_kwargs.enable_thinking``，
+    #: deepseek 是 ``thinking.type``），那是**provider 的知识**，该待在 provider 的
+    #: 工厂里，不该由渠道去猜。渠道只表达「开」还是「关」。
+    #:
+    #: 目前只有 ``llamacpp`` 消费它（见 ``get_llamacpp_llm``）；其它 provider 收到也
+    #: 忽略 —— 「一个开关对某些供应商无效」比「每个供应商一套请求体形状」好维护。
+    thinking: bool | None = None
+
+    #: 缺密钥 / 缺端点时，允不允许从设备本地的环境（.env）里补。
+    #:
+    #: True = 老行为：settings 兜底（配置文件 ``llm-config.override.jsonc`` 这条路
+    #: 一直如此，它里面的 jsonc 只有 provider/model，密钥只能来自 .env）。
+    #:
+    #: False = **运行期下发的渠道**：manager 明确指定了用哪个模型、哪个端点、
+    #: 哪把密钥，这时再从 .env 里补一把就是「我明明选了 A，跑起来是 B」——
+    #: 症状最难查，因为它不报错。所以渠道这条路必须自带全部接入参数。
+    #:
+    #: 由 :func:`minitap.mobile_use.sdk.utils.llm_config_for_role_overrides` 置为 False；
+    #: 配置文件那条路保持默认 True。
+    allow_env_fallback: bool = True
+
     def _has_api_key(self, attr: str) -> bool:
         """本次解析有没有可用密钥:配置里带了,或者 settings 里有。"""
         if self.api_key:
@@ -240,6 +310,11 @@ class LLM(BaseModel):
             case "siliconflow":
                 if not self._has_api_key("SILICONFLOW_API_KEY"):
                     raise Exception(f"{name} requires SILICONFLOW_API_KEY in .env")
+            case "llamacpp":
+                # **不要求密钥**：本地 llama-server 默认不鉴权（没起 `--api-key` 时
+                # 它不校验 Authorization 头）。端点缺失也放行 —— 工厂自带默认地址。
+                # 加一条「必须有密钥」的校验会把这条渠道整个堵死，而且没有别的解法。
+                pass
 
     def __str__(self):
         return f"{self.provider}/{self.model}"
