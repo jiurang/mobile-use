@@ -35,6 +35,19 @@ legacy OCR 分支因此必须**自带**一段「这里用 ``ocr_index``」的说
 静态提示词只教 ``index`` 时，模型在 iOS / 云设备上每个动作都会被工具
 拒掉（``index=N is not a row in the screen element table (no table)``）。
 
+**三条感知通道，Manager 侧可开关**
+--------------------------------
+``ctx.perception`` 有三个开关（``ui_hierarchy`` / ``ocr`` / ``screenshot``），
+Manager 建 agent 时决定（``sdk/agent.py:722``）。本模块只负责**按开关
+裁 prompt**：
+
+* UI 元素表 —— 关掉 ⇒ 不建表 ⇒ 走 legacy OCR 分支（``ocr_index``）。
+  判据仍然是 ``has_element_table``，提示侧和工具侧共用同一个。
+* OCR —— 关掉 ⇒ **不给 legacy OCR 块**（不是「关了还偷偷给」）。
+* 图片 —— 由 **Executor 自己决定**（``ExecutorOutput.need_screenshot``）：
+  上一轮它举手，这一轮末尾挂当屏截图。通道关着时举手也不给，
+  提示词里会写明「没有图」，免得它一直要一张不会来的图。
+
 **工具结果截断（L5）**
 --------------------
 局部历史是 prompt 里唯一随步数线性增长的一段，而工具结果可能很长
@@ -81,12 +94,16 @@ def _load_template() -> Template:
 def render_executor_system(ctx: MobileUseContext) -> str:
     """渲染 Executor 的 system prompt（静态部分）。
 
-    ``executor.md`` 的模板变量恰好三个：``platform`` / ``executor_tools_list``
-    / ``goal``。
+    ``executor.md`` 的模板变量：``platform`` / ``executor_tools_list`` /
+    ``goal`` / ``perception``。
 
     ⚠️ **``goal`` 故意传空串**：目标是**每子目标**变的，放进 system prompt
     会让整个 system 块在换子目标时全部重算。目标走独立的消息块
     （见 `build_executor_messages` 的 [2]），子目标内它是恒定的。
+
+    ``perception`` 传的是**通道开关状态**（`ctx.perception`）：三条通道
+    开着哪几条，在一次运行里是恒定的 ⇒ 它落在 system prompt 里不会伤缓存，
+    但模型必须知道 —— 否则它会一直举手要一张**永远不会来的**图。
     """
     return _load_template().render(
         platform=ctx.device.mobile_platform.value,
@@ -95,6 +112,7 @@ def render_executor_system(ctx: MobileUseContext) -> str:
             wrappers=list(_executor_wrappers(ctx)),
         ),
         goal="",
+        perception=ctx.perception,
     )
 
 
@@ -121,8 +139,8 @@ def render_device_state(state_lines: list[str]) -> str:
 # `index` —— 而无元素表时 `index` 必然解析失败，每个动作都被工具拒掉。
 _NO_TABLE_NOTE = """\
 NO SCREEN ELEMENT TABLE ON THIS SCREEN.
-The device could not report an element tree, so the OCR block below is the whole
-screen description.
+There is no element table here (the device could not report one, or the UI
+element channel is off), so the OCR block below is the whole screen description.
 
 Address those lines with **`ocr_index`** - the leading `[i]` of the OCR block,
 1-based, copied verbatim. Do NOT use `index` here: with no table there is no row
@@ -433,6 +451,7 @@ def build_executor_messages(
     local_messages: list[AnyMessage],
     device_state_lines: list[str],
     ocr_results: list | None = None,
+    screenshot_message: AnyMessage | None = None,
 ) -> list[BaseMessage]:
     """组装 Executor 每一轮的 prompt。
 
@@ -444,23 +463,25 @@ def build_executor_messages(
         [4] HumanMessage    失败事实清单（每轮变：会增长）
         [5] HumanMessage    设备状态（每轮变：前台 app 会变）
         [6] HumanMessage    屏幕元素表（每轮变：重编号）—— **必须最后**
+        [7] HumanMessage    截图（可选：图通道开着且 Executor 举手了）
 
     ⚠️ **顺序 = 缓存命中率**。前缀缓存只覆盖从头开始的连续前缀：
     任何每轮变的内容排在局部历史**之前**，它之后的整段历史每轮都要满价重算。
     真机实测（2026-10-21）：设备状态和失败清单卡在历史前面时，
     executor 的缓存命中率只有 15.8%（六个 agent 里最差，而它调用量最大）。
 
-    🔴 **2026-10-22 删掉了原来的 [7] 截图块**。Executor 的截图通道整条关掉了
-    （见 `agents/executor/types.py`），prompt 里不再有图。
-    这同时少了一个**永远不可缓存**的块 —— 截图的 base64 长度随画面变，
-    前缀缓存直接失效。
+    🔴 **2026-10-22 改：[7] 截图块回来了，但不再是「同轮二问」。**
+    现在是「Executor 上一轮举手 → 这一轮带图」，**零额外 LLM 调用**。
+    截图块仍然排在**最后**：它是 prompt 里最不可缓存的一块（base64 长度随
+    画面变），排在任何东西前面都会把它之后的全部字节拖成满价重算。
 
     Args:
         ctx: 运行上下文。
         goal: 本次子目标的目标陈述。
         screen_elements: 当屏的元素表（Contextor 建的，**当屏的**）。
-            空 / None 表示本屏**没有**元素表（iOS / 云设备路径），
-            那时改用 legacy OCR 块 + ``ocr_index`` 寻址。
+            空 / None 表示本屏**没有**元素表（iOS / 云设备路径，或
+            ``perception.ui_hierarchy`` 关着），那时改用 legacy OCR 块 +
+            ``ocr_index`` 寻址。
         failures: 跨子目标的失败事实账本。
         local_messages: 本子目标内的局部历史。**发给 LLM 的那份会按需截断
             过长的成功工具结果**（见 :func:`truncate_local_history`），
@@ -468,6 +489,8 @@ def build_executor_messages(
         device_state_lines: 设备状态行。
         ocr_results: OCR 结果。**只在没有元素表时用**（iOS / 云设备路径），
             渲染成 legacy OCR 块，并**带上「用 ocr_index」的说明段**。
+        screenshot_message: 当屏截图消息（多模态）。**由调用方决定要不要给** ——
+            图通道关着、或 Executor 上一轮没举手时传 None。
 
     Returns:
         发给 LLM 的消息列表。
@@ -526,8 +549,19 @@ def build_executor_messages(
         #
         # 说明段（用 `ocr_index` 而不是 `index`）由 render_legacy_ocr_block
         # 负责：静态提示词只教 `index`，没有它模型每个动作都会被工具拒掉。
-        ocr_text = render_legacy_ocr_block(ocr_results)
-        if ocr_text:
-            messages.append(HumanMessage(content=ocr_text))
+        #
+        # ⚠️ **OCR 通道关着时不给这一块** —— Manager 把 `perception.ocr`
+        # 关掉就是要「少一条通道」，不是「关了但还偷偷给」。这时模型手里
+        # 什么都没有，Executor 节点会往 device_state_lines 里加一句告知
+        # （让它如实说「看不见」，而不是瞎猜）。
+        if ctx.perception.ocr:
+            ocr_text = render_legacy_ocr_block(ocr_results)
+            if ocr_text:
+                messages.append(HumanMessage(content=ocr_text))
+
+    # 截图：**最后一块**。它是 prompt 里最不可缓存的一块（base64 长度随画面
+    # 变），放前面会把它之后的全部字节拖成满价重算。
+    if screenshot_message is not None:
+        messages.append(screenshot_message)
 
     return messages

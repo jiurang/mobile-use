@@ -20,9 +20,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from minitap.mobile_use.utils.failed_targets import FailedTarget
 
@@ -65,29 +65,55 @@ class ExecutorOutput(BaseModel):
         default=None,
         description="Why the goal is considered reached. Required when done=true.",
     )
-    # 🔴 **2026-10-22 删掉了 `need_screenshot`。**
+    need_screenshot: bool = Field(
+        default=False,
+        description=(
+            "True when the screen description you were given cannot tell your "
+            "targets apart (you need color, icons, images, or to know what covers "
+            "what). The screenshot of the current screen is then attached to your "
+            "NEXT turn, and the action you gave in this turn is NOT executed - you "
+            "decide again with the picture in front of you."
+        ),
+    )
+    # 🔴 **2026-10-22 改：`need_screenshot` 回来了，但换了一种用法。**
     #
-    # Executor 不再有「要图」这个能力：截图通道整条关掉。
+    # 原来（改造前）：模型说「我要图」→ 同轮补一张 → **再问一次 LLM**。
+    # 那次二问是整整一次 LLM 调用（真机实测 executor 单次决策中位 5,276ms），
+    # 换来的只是「模型偶尔能看见颜色/图标/遮挡」—— 代价和收益不成比例。
     #
-    # 为什么关
-    # --------
-    # 1. **二问的代价是整整一次 LLM 调用**（真机实测 executor 单次决策中位
-    #    5,276ms）—— 收益只是「模型偶尔看不见颜色/图标/遮挡」。
-    # 2. 截图进 prompt 是**唯一永远不可缓存**的那一块（base64 长度随画面变，
-    #    前缀缓存直接失效）—— 实测它占了整个易变尾部的 92%。
-    # 3. `state.latest_screenshot` 的**唯一消费者**就是这条二问路径
-    #    （`agents/executor/executor.py` 的 `_capture_screenshot`）——
-    #    关掉之后截图整条路就没有消费者了。
+    # 现在：模型说「我要图」→ **下一轮**的 prompt 里带上当屏截图。
+    # 循环本来就要继续下一轮 ⇒ **零额外 LLM 调用**。
     #
-    # 代价
-    # ----
-    # 模型从此**看不到画面**，只能靠 UI 元素表 + OCR。颜色、图标、图片内容、
-    # 遮挡关系这些它读不出来。**这是个能力削减，不是纯优化** —— 真机跑完
-    # 要看「步数 / 失败目标数」有没有涨。
+    # 为什么下一轮给的图一定是对的：
+    # - 图和元素表是**同一次抓屏**的产物（`agents/contextor/contextor.py` 在
+    #   同一个节点里抓屏 + 建表），所以图和 `[i]` 编号指的是同一屏；
+    # - 图是 **contextor 刚抓的那一帧**，不是重抓的 —— 重抓会多一次 adb
+    #   往返，还可能拿到不同帧，编号和画面对不上。
     #
-    # 模型如果仍然吐出 `need_screenshot`（旧习惯 / 提示词残留），pydantic
-    # 会**忽略**这个多余的键（extra=ignore），不会报错、也不会触发任何
-    # 额外动作。
+    # 通道开关在 `PerceptionConfig.screenshot`（Manager 侧）：
+    # - `"always"`     → 每轮都带图，模型不必举手；
+    # - `"on_demand"`  → **默认**：模型举手才有图；
+    # - `"off"`        → 永远没有图，**提示词和 schema 里都不留图的痕迹**。
+
+
+def executor_output_schema(*, can_see_screenshot: bool) -> type[BaseModel]:
+    """按「模型能不能看图」返回 Executor 的输出 schema。
+
+    不能看图时**连字段都不给模型** —— 提示词里没有图相关的词，schema 里
+    也不该留 `need_screenshot`：模型看不到的东西，不该让它以为能举手要。
+
+    ⚠️ **工具名必须还是 ``ExecutorOutput``**：模型被教的是「你只能调
+    ``ExecutorOutput``」，解析层也拿这个名字对账（喊错工具名会被拒 ——
+    见 ``services/llm.py`` 的 ``_ToolCallStructuredRunnable._parse``）。
+    """
+    if can_see_screenshot:
+        return ExecutorOutput
+    fields: dict[str, Any] = {
+        name: (info.annotation, info)
+        for name, info in ExecutorOutput.model_fields.items()
+        if name != "need_screenshot"
+    }
+    return create_model("ExecutorOutput", **fields)
 
 
 class ExecutorReport(BaseModel):

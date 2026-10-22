@@ -11,7 +11,7 @@ from typing import Literal
 
 from adbutils import AdbClient
 from openai import BaseModel
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.clients.ios_client import IosClientWrapper
@@ -95,24 +95,33 @@ def _stability_mode_default() -> str:
 class PerceptionConfig(BaseModel):
     """三条感知通道的开关 + 感知前的沉降等待。
 
+    这三个开关是 **Manager 侧**的控制面（`AgentConfig.perception` →
+    `MobileUseContext.perception`，见 `sdk/agent.py:722`）：Manager 建 agent 时
+    决定哪几条通道开着，Executor 每次决策拿到的屏幕描述就按这个裁。
+
     关掉任何一条都是**纯粹减少**该通道带来的信息与开销，不会改变另外两条的
     行为：
 
-    - `screenshot`：Cortex 不再收到截图。视觉模型仍能从 UI 层级树和 OCR 读文字，
-      但看不到颜色、图标、图片内容、遮挡关系。
-    - `ui_hierarchy`：Cortex 不再收到 UI 元素列表，也不再拿它做坐标合法性校验
-      （`tools/bounds_validation.py` 会退化成只看 OCR 框）。
-    - `ocr`：Contextor 不跑 OCR，Cortex 不收到 OCR 文本块，坐标校验退回只看层级树。
+    - `ui_hierarchy`（UI 元素表）：关掉后**不再有元素表**，Executor 只拿到
+      OCR 块，寻址字段从 `index` 变成 `ocr_index`（`agents/executor/prompt.py`
+      的 `has_element_table` 是这条的唯一判据，工具侧 `tools/utils.py`
+      的 `resolve_target` 看的是同一份 `state.latest_screen_elements`）。
+    - `ocr`（OCR 文本）：关掉后 Contextor **根本不跑 OCR**（真机实测 381~443ms
+      /步），Executor 也拿不到 OCR 块。
+    - `screenshot`（图片）：见下面的三态。**关掉时图相关的词一个都不许进
+      prompt**（连 schema 里的 `need_screenshot` 字段都没有）—— 模型看不到的
+      东西，就不该让它以为有。
 
-    `screenshot` 是**三态**：
+    `screenshot` 是**三态**（字符串枚举，不是 bool）：
 
-    - `True` —— 每轮都把截图塞进 prompt（老行为）。
-    - `False` —— 完全不发图。
-    - `"on_demand"` —— **默认不发图**；Cortex 在结构化输出里把 `need_screenshot`
-      置 true 时，才在**同一轮内**补一张图再问一次。
+    - `"on_demand"` —— **默认**：**Executor 自己决定**要不要看图。它在结构化
+      输出里把 `need_screenshot` 置 true，框架就在**它的下一轮**把当屏截图
+      挂进去（不额外再问一次 LLM —— 循环本来就要继续下一轮）。
+    - `"always"` —— 每轮都挂图（模型不用举手）。
+    - `"off"` —— 永远不给图。
 
-    为什么默认改成 `"on_demand"`（2026-10-21 实测）
-    ------------------------------------------------
+    为什么默认是 `"on_demand"`（2026-10-21 / 2026-10-22 实测）
+    -------------------------------------------------------
     截图进 prompt 的代价是**每轮都付、且永远付**：
 
     - 它是**不可缓存**的 —— 在 prompt 末尾，而 provider 的缓存单元建在「用户输入
@@ -122,26 +131,55 @@ class PerceptionConfig(BaseModel):
       （见 `doc/cache-hit-rate-audit-20261020.md` 第 8 节）。
 
     绝大多数决策靠 UI 元素表 + OCR 就够（模型报的是索引，坐标由代码给），
-    图只在「颜色 / 图标 / 遮挡 / 图片内容」这些文字表达不了的地方才需要。
+    图只在「颜色 / 图标 / 遮挡 / 图片内容」这些文字表达不了的地方才需要
+    ⇒ 让**要图的人自己举手**，而不是每轮都付这份钱。
+
+    ⚠️ 老行为（2026-10-22 之前）是「模型说 `need_screenshot` → 同轮补一张 →
+    **再问一次 LLM**」。那一次二问是整整一次 LLM 调用（真机实测 executor 单次
+    决策中位 5,276ms）。现在改成「下一轮就给」：**零额外 LLM 调用**，而且图
+    一定是 contextor 刚抓的那一帧（和元素表同屏，索引契约不受影响）。
     """
 
-    screenshot: bool | Literal["on_demand"] = "on_demand"
+    screenshot: Literal["always", "on_demand", "off"] = "on_demand"
     ui_hierarchy: bool = True
     ocr: bool = True
     ocr_config: OcrConfig = Field(default_factory=OcrConfig)
 
-    @property
-    def screenshot_label(self) -> str:
-        """给 prompt 模板显示用的通道状态文案。
+    @field_validator("screenshot", mode="before")
+    @classmethod
+    def _normalize_screenshot(cls, value: object) -> object:
+        """把老的 bool 收成三态枚举。
 
-        模板不能直接用 `perception.screenshot` 的真假判断 —— `"on_demand"` 是
-        真值，模板会把它显示成「enabled」，模型就以为图已经在手里了。
+        ⚠️ **``True`` 的含义变了**：老代码里 ``True`` 是「每轮都带图」
+        （Cortex 时代的老行为，今天已经没人读它）。Manager-web 的开关是
+        「**能不能看图**」⇒ ``True`` 现在映射成 ``"on_demand"``
+        （能看图，**由 Executor 自己决定**什么时候看）。
+
+        「每轮都带图」仍然做得到，但要**显式**写 ``"always"``。
         """
-        if self.screenshot is True:
-            return "enabled"
-        if self.screenshot is False:
-            return "DISABLED"
-        return "on demand"
+        if value is True:
+            return "on_demand"
+        if value is False:
+            return "off"
+        return value
+
+    @property
+    def screenshot_channel(self) -> Literal["always", "on_demand", "off"]:
+        """图片通道的三态（模板和执行层都用这一个判据）。
+
+        归一化已经在字段校验里做完了 ⇒ 这里直接返回，不会出现
+        「``"on_demand"`` 是真值」那种真假判断陷阱。
+        """
+        return self.screenshot
+
+    @property
+    def can_see_screenshot(self) -> bool:
+        """模型**能不能**看图。
+
+        提示词和 schema 都按这个判：**不能**看图时，一个图相关的词都不许
+        进 prompt，schema 里也不留 `need_screenshot` 字段。
+        """
+        return self.screenshot_channel != "off"
 
     # 动作之后的**沉降等待下限**（毫秒）。
     #

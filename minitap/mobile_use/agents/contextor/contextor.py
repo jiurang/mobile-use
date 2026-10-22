@@ -97,10 +97,15 @@ class ContextorNode:
 
         # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。
         #
-        # ⚠️ **2026-10-22 更正**：这里原来写着「dump_hierarchy 真机要 ~1.2s，
-        # OCR 只要 ~0.4s，整段推理藏进 dump 的等待窗口里」。
-        # **实测那个前提没了**：dump 静态屏只要 134~206ms，OCR 却要 381~443ms
-        # ⇒ 现在是 **OCR 才是关键路径**，dump 反而被藏起来了。
+        # ⚠️ **2026-10-22 改：OCR 通道关掉时，OCR 根本不跑。**
+        # 以前 `perception.ocr` 只管「跑完之后要不要给模型」，OCR 引擎照样
+        # 每步跑一遍 —— 真机实测 **381~443ms/步**，占整段感知的一大截，
+        # 而结果被丢掉。Manager 把通道关掉的意思是「这条链路不要了」，
+        # 不是「照跑但别给」。
+        ocr_enabled = self.ctx.perception.ocr
+        if not ocr_enabled:
+            logger.info("[contextor] OCR channel is OFF; skipping OCR entirely")
+
         ocr_box: list[list[OcrText] | None] = []
         ocr_done = False
 
@@ -145,7 +150,13 @@ class ContextorNode:
         device_date: str = ""
         try:
             try:
-                device_data = await device_controller.get_screen_data(on_screenshot=_run_ocr_inline)
+                if ocr_enabled:
+                    device_data = await device_controller.get_screen_data(
+                        on_screenshot=_run_ocr_inline
+                    )
+                else:
+                    # OCR 通道关着 ⇒ 不挂回调，控制器也就不跑 OCR 引擎。
+                    device_data = await device_controller.get_screen_data()
             except TypeError:
                 # 自定义控制器没跟上新签名时不能整轮挂掉，退回原来的串行路径。
                 logger.warning("Controller does not support on_screenshot; using serial path")
@@ -161,7 +172,7 @@ class ContextorNode:
         if screen_state == "off":
             logger.warning("[contextor] Screen is OFF — agent will be told to wake it up.")
 
-        if not ocr_done:
+        if ocr_enabled and not ocr_done:
             # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
             ocr_box.append(await self._run_ocr(device_data.base64))
 

@@ -103,8 +103,9 @@ class AgentConfig(BaseModel):
         device_platform: Platform of the device to target.
         servers: Custom server configurations.
         video_recording_enabled: Whether video recording tools are enabled.
-        perception: Which perception channels (screenshot / UI hierarchy / OCR) are on.
-            All three are enabled by default.
+        perception: Which perception channels the Executor gets (screenshot /
+            UI hierarchy / OCR). Manager-side switches; see
+            :meth:`AgentConfigBuilder.with_perception`.
         cloud_device_config: Configuration for cloud device provisioning.
         cloud_android_controller: Pre-configured cloud Android controller.
         cloud_ios_controller: Pre-configured cloud iOS controller.

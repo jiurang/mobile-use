@@ -143,6 +143,22 @@ class State(BaseModel):
         "Steps executed so far in the current subgoal (circuit breaker)",
     ] = 0
 
+    # Executor 自己举的手：上一轮它说「我要看图」。
+    #
+    # 为什么存成 state 而不是存在节点实例里：
+    # - Executor 节点**每轮都是同一个 super-step 里的新调用**，节点实例上的
+    #   字段活不过一轮；决定要图的是**上一轮**的模型输出，要影响的是
+    #   **这一轮**的 prompt ⇒ 必须跨轮传递，而跨轮传递的唯一载体是 state。
+    # - 它同时是「Executor 自己决策」的**唯一开关**：图通道关掉时，
+    #   这个字段照样写，但 prompt 侧不挂图（提示词里会告诉模型没有图）。
+    #
+    # 语义：Executor 在第 N 轮说 true ⇒ 第 N+1 轮的 prompt 带上当屏截图。
+    # 每轮被模型的新回答覆盖（模型不再举手 ⇒ 下一轮就没有图）。
+    executor_wants_screenshot: Annotated[
+        bool,
+        "Whether the Executor asked for a screenshot in its previous turn",
+    ] = False
+
     # 全任务累计的**动作步**数（跨子目标累加，换目标时**不**归零）。
     #
     # 为什么不能直接用 `executor_steps`：它是「本子目标内」的步数，Cortex 换目标时

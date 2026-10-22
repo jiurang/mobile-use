@@ -328,10 +328,24 @@ class AgentConfigBuilder:
 
     def with_perception(self, perception: PerceptionConfig) -> "AgentConfigBuilder":
         """
-        Configure which perception channels the Cortex agent receives.
+        Configure which perception channels the Executor receives.
 
-        All three are on by default. Turning one off only removes that channel's
-        information and cost; the other two are unaffected.
+        This is the **Manager-side control surface** for perception: three
+        independent switches, each one only removes that channel's information
+        and cost - the other two are unaffected.
+
+        * ``ui_hierarchy`` - the screen element table. Off => no table, the
+          Executor addresses things by ``ocr_index`` instead.
+        * ``ocr`` - OCR text. Off => Contextor does not run OCR at all
+          (measured 381~443ms per step saved) and the Executor gets no OCR block.
+        * ``screenshot`` - **whether the model can look at the screen at all**:
+          ``"on_demand"`` (default - the **Executor decides**: it raises
+          ``need_screenshot`` and the current screen is attached to its next
+          turn), ``"always"`` (a picture every turn), or ``"off"`` (never).
+
+          With ``"off"`` the picture leaves **no trace**: no image words in the
+          prompt and no ``need_screenshot`` field in the output schema - a
+          model that cannot see images should not be told it can.
 
         Args:
             perception: Screenshot / UI hierarchy / OCR switches, plus the OCR
@@ -342,7 +356,7 @@ class AgentConfigBuilder:
             >>> from minitap.mobile_use.services.ocr import OcrConfig
             >>> config = (Builders.AgentConfig
             ...     .with_perception(PerceptionConfig(
-            ...         screenshot=False,
+            ...         screenshot="off",  # text-only model
             ...         ocr_config=OcrConfig(engine="paddle_onnx"),
             ...     ))
             ...     .build())

@@ -682,6 +682,10 @@ class CortexNode:
             # 和致命 bug 3 同一类。）
             if report is None:
                 update[EXECUTOR_MESSAGES_KEY] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
+                # 「我要看图」这个请求也一起作废：换目标 = 换屏幕场景，
+                # 上一个目标里那句「我需要看图」指的是**那一屏**，
+                # 带过来只会给新目标附一张不相干的图。
+                update["executor_wants_screenshot"] = False
             update["executor_steps"] = 0
             # 没判完成就不该有提名：上一次尝试的提名（如果还没被 Orchestrator 消费）
             # 在这里作废，否则 Orchestrator 会验收一个 Cortex 没判完成的子目标。
