@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     MINIMAX_API_KEY: SecretStr | None = None
     DEEPSEEK_API_KEY: SecretStr | None = None
     MINITAP_API_KEY: SecretStr | None = None
+    SILICONFLOW_API_KEY: SecretStr | None = None
 
     OPENAI_BASE_URL: str | None = None
     AZURE_BASE_URL: str | None = None
@@ -61,6 +62,9 @@ class Settings(BaseSettings):
     # DeepSeek's OpenAI-compatible endpoint (domestic platform, platform.deepseek.com).
     # /v1 is accepted too, so both spellings work; we default to the documented one.
     DEEPSEEK_BASE_URL: str | None = None
+    # SiliconFlow（硅基流动）—— 国内 OpenAI 兼容平台，platform.siliconflow.cn。
+    # 端点两家都能用（.cn / .com），默认走 .cn。
+    SILICONFLOW_BASE_URL: str | None = None
     # DeepSeek models answer in "thinking mode" by default (effort=high): the CoT
     # comes back in `reasoning_content` and costs extra latency + completion tokens
     # on every agent call. Set to false to send {"thinking": {"type": "disabled"}}.
@@ -144,6 +148,7 @@ LLMProvider = Literal[
     "azure",
     "minimax",
     "deepseek",
+    "siliconflow",
 ]
 LLMUtilsNode = Literal["outputter", "hopper", "video_analyzer"]
 LLMUtilsNodeWithFallback = LLMUtilsNode
@@ -153,6 +158,7 @@ AgentNode = Literal[
     "contextor",
     "cortex",
     "executor",
+    "reporter",
 ]
 AgentNodeWithFallback = AgentNode
 
@@ -231,6 +237,9 @@ class LLM(BaseModel):
             case "deepseek":
                 if not self._has_api_key("DEEPSEEK_API_KEY"):
                     raise Exception(f"{name} requires DEEPSEEK_API_KEY in .env")
+            case "siliconflow":
+                if not self._has_api_key("SILICONFLOW_API_KEY"):
+                    raise Exception(f"{name} requires SILICONFLOW_API_KEY in .env")
 
     def __str__(self):
         return f"{self.provider}/{self.model}"
@@ -255,6 +264,11 @@ class LLMConfig(BaseModel):
     contextor: LLMWithFallback
     cortex: LLMWithFallback
     executor: LLMWithFallback
+    # Reporter 是**可选**角色：能单独配 LLM，但不是必填。
+    # 做成必填会打断仓库里 22 处 `LLMConfig(...)` 构造点（probe 脚本 / example / 测试），
+    # 全部变成 ValidationError（doc/executor-autonomy-plan.md 附录 A.1、审计发现 E6）。
+    # None = 没单独配 → get_agent() 回落到 executor 的配置。
+    reporter: LLMWithFallback | None = None
     utils: LLMConfigUtils
 
     def validate_providers(self):
@@ -263,18 +277,26 @@ class LLMConfig(BaseModel):
         self.contextor.validate_provider("Contextor")
         self.cortex.validate_provider("Cortex")
         self.executor.validate_provider("Executor")
+        # Reporter 没配就不校验：它走回落，用的是 executor 那条渠道的密钥。
+        if self.reporter:
+            self.reporter.validate_provider("Reporter")
         self.utils.outputter.validate_provider("Outputter")
         self.utils.hopper.validate_provider("Hopper")
         if self.utils.video_analyzer:
             self.utils.video_analyzer.validate_provider("VideoAnalyzer")
 
     def __str__(self):
+        # Reporter 没单独配时要说清它回落自谁 —— 配置里看不出「谁在跑」是最难查的一类故障。
+        reporter = (
+            self.reporter if self.reporter is not None else f"↩️ Executor fallback ({self.executor})"
+        )
         return f"""
 📃 Planner: {self.planner}
 🎯 Orchestrator: {self.orchestrator}
 🔍 Contextor: {self.contextor}
 🧠 Cortex: {self.cortex}
 🛠️ Executor: {self.executor}
+📰 Reporter: {reporter}
 🧩 Utils:
     🔽 Hopper: {self.utils.hopper}
     📝 Outputter: {self.utils.outputter}
@@ -282,7 +304,13 @@ class LLMConfig(BaseModel):
 """
 
     def get_agent(self, item: AgentNode) -> LLMWithFallback:
-        return getattr(self, item)
+        value = getattr(self, item)
+        # Reporter 是唯一可选的角色（见上面 reporter 字段的注释）。
+        # 没单独配就回落 Executor —— 它只写摘要 + 挑证据，快模型就够
+        # （doc/executor-autonomy-plan.md §2.1.1、附录 A.1）。
+        if value is None:
+            return self.executor
+        return value
 
     def get_utils(self, item: LLMUtilsNode) -> LLMWithFallback:
         value = getattr(self.utils, item)

@@ -1,9 +1,14 @@
 // Override the LLM config here for the agents.
 
-// Supported providers: openai, google, openrouter, xai, vertexai, anthropic, azure, minimax, deepseek
+// Supported providers: openai, google, openrouter, xai, vertexai, anthropic, azure, minimax, deepseek, siliconflow
 // You can use any model as long as it is supported by the provider.
 // MiniMax models: MiniMax-M2.7 (200k context), MiniMax-M2.7-highspeed
 // DeepSeek models: deepseek-v4-pro (1M context, no vision), deepseek-flash (1M context, vision)
+// SiliconFlow models: 这个平台上**没有一个模型能同时做到「看图 + 工具调用 + 结构化输出」**，
+// 所以视觉角色必须拆开（实测 2026-10-21）：
+//   zai-org/GLM-4.5V            视觉 ✔  工具调用 ✔  结构化输出 ✘（不支持 json 模式）→ 给 executor
+//   Qwen/Qwen3-VL-32B-Instruct   视觉 ✔  工具调用 ✘  结构化输出 ✔          → 给 cortex
+//   Qwen/Qwen2.5-72B-Instruct   视觉 ✘  工具调用 ✔  结构化输出 ✔          → 给其余角色
 
 // Do not modify this file directly, instead copy it to llm-config.override.jsonc and modify it there.
 
@@ -32,6 +37,13 @@
     "provider": "",
     "model": ""
   },
+  // Reporter: compresses the executor's log into a report for the supervisor.
+  // Optional — when omitted it falls back to the executor's model (it only
+  // writes a summary, so a fast model is enough). See doc/executor-autonomy-plan.md §2.1.1.
+  // "reporter": {
+  //   "provider": "",
+  //   "model": ""
+  // },
   "contextor": {
     "provider": "",
     "model": ""

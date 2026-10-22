@@ -167,11 +167,28 @@ def _record_usage(
     原始 AIMessage 由客户端侧（generate/agenerate 包装）塞进捕获槽，这里优先用它。
 
     **拿不到就不记**（而不是记 0）：「provider 没报 usage」和「这次调用零消耗」
-    是两件事，记 0 会让成本看起来像免费。2026-10-21 真机实测发现 headless 路径上
-    这里记的**每一行都是 0** —— 因为在 LangGraph 的图里那个捕获槽根本收不到东西
-    （ContextVar 跨不过图的任务上下文）。现在图里的 usage 由
-    `services/usage_bridge.py` 的 graph-config callback 上报，这条路只保留
-    「直接调用」的场景，两边不会重复计数。
+    是两件事，记 0 会让成本看起来像免费。
+
+    ⚠️ **本段曾写着一条假结论，已于 2026-10-21 实测推翻并改写。**
+    原文是：「在 LangGraph 的图里那个捕获槽根本收不到东西（ContextVar 跨不过
+    图的任务上下文），图里的 usage 由 `services/usage_bridge.py` 的 graph-config
+    callback 上报」。两处都是错的：
+
+    1. **`services/usage_bridge.py` 从未存在**（git 全历史无此文件），
+       也从来没有任何 import —— 所谓「图里的 usage 由它上报」是**不存在的机制**。
+    2. **捕获槽跨得过去**。`utils/llm_usage.py` 的槽里装的是**同一个 list
+       对象**（ContextVar 被复制时复制的是引用），所以图里 append 的原始
+       AIMessage 在外面读得到。
+
+    实测证据（真机 graph 运行，2026-10-21）：
+    ``probe_out/executor_e2e.json`` —— executor 21 次调用 / 120,772 input /
+    65,672 cached / 18,114 output，**全是真实非零值**；
+    ``probe_out/device_usage.jsonl`` 里 cortex / hopper / planner 同样非零。
+
+    那次「每一行都是 0」的真因不是 ContextVar，而是**客户端没开
+    ``stream_usage=True``**（provider 压根没报 usage）—— 已在
+    `services/llm.py:778` 修好。**结论：图内 usage 埋点是通的，不要再造
+    usage_bridge。**
     """
     if not agent_name:
         return
@@ -860,6 +877,130 @@ def get_deepseek_llm(
     return client
 
 
+class _SiliconFlowStructuredRunnable(Runnable):
+    """结构化输出走**两条路**：原生 json_schema 为主，工具调用为备。
+
+    为什么必须两条
+    --------------
+    硅基流动上的模型分两类，能力不一样（实测，2026-10-21）：
+
+    ==========================  ==============  ==============  ==============
+    模型                          强制 tool_choice  自动 tool_choice  json_schema
+    ==========================  ==============  ==============  ==============
+    ``Qwen/Qwen3-VL-32B-Instruct``  400 不支持       返回空、无 tool_calls  正常
+    ``Qwen/Qwen3-VL-8B-Instruct``   400 不支持       返回空              正常
+    ``Qwen/Qwen3.5-4B``             正常            正常              正常
+    ``Qwen/Qwen2.5-72B-Instruct``  正常            正常              正常
+    ==========================  ==============  ==============  ==============
+
+    视觉模型在硅基流动上**不支持函数调用**：强制指定函数直接被拒
+    （``400 code 20015 Value error, Specifying functions for tool_choice is not
+    yet supported``），不强制则返回空内容、不带 tool_calls。
+
+    而 ``cortex`` / ``executor`` 必须用视觉模型（它们读截图），所以
+    **json_schema 只能是主路径** —— 它是唯一对所有模型都成立的那条。
+
+    备路径（把 schema 当工具绑上去）在文本模型上更硬：模型必须吐
+    tool_calls，参数由我们自己用 pydantic 校验。它有两个作用：
+    主路径解析失败时的第二次机会，以及给文本模型一条结构更强的路。
+    备路径**不强制** tool_choice —— 强制的会被视觉模型 400，而我们要的
+    是「这条备路在更多模型上能跑」。
+
+    两条都失败时报出**两条**的原始原因，而不是只报最后一条。
+    """
+
+    def __init__(self, llm: ChatOpenAI, schema: type[BaseModel]):
+        self.llm = llm
+        self.schema = schema
+        # 主路径：原生 response_format=json_schema。显式走 ChatOpenAI 的实现，
+        # 绕开 SiliconFlowChatOpenAI 自己的覆盖（否则会无限递归）。
+        self._native = ChatOpenAI.with_structured_output(llm, schema, method="json_schema")
+        # 备路径：schema 当工具绑上去，不强制 tool_choice。
+        self._tool = _ToolCallStructuredRunnable(llm, schema, force_tool_choice=False)
+
+    def _fail(self, native_error: Exception, tool_error: Exception) -> ValueError:
+        return ValueError(
+            f"SiliconFlow returned no parseable {self.schema.__name__}. "
+            f"json_schema path: {type(native_error).__name__}: {native_error}; "
+            f"tool path: {type(tool_error).__name__}: {tool_error}"
+        )
+
+    def invoke(self, input, config=None, **kwargs):
+        try:
+            return self._native.invoke(input, config=config, **kwargs)
+        except Exception as native_error:
+            try:
+                return self._tool.invoke(input, config=config, **kwargs)
+            except Exception as tool_error:
+                raise self._fail(native_error, tool_error) from tool_error
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        try:
+            return await self._native.ainvoke(input, config=config, **kwargs)
+        except Exception as native_error:
+            try:
+                return await self._tool.ainvoke(input, config=config, **kwargs)
+            except Exception as tool_error:
+                raise self._fail(native_error, tool_error) from tool_error
+
+
+class SiliconFlowChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
+    """ChatOpenAI variant for SiliconFlow (硅基流动).
+
+    **Do not simplify this back to plain ``ChatOpenAI`` without a live call.**
+    The platform's model families differ in what they support, and the naive
+    ``with_structured_output`` default is wrong for the one family that
+    matters most here — see :class:`_SiliconFlowStructuredRunnable` for the
+    measured capability table and why the schema goes out as
+    ``response_format`` first.
+
+    Tool calling, JSON mode, streaming and vision all work as expected on
+    the models that support them.
+    """
+
+    def with_structured_output(self, schema=None, **kwargs):  # type: ignore[override]
+        if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+            kwargs.setdefault("method", "function_calling")
+            return super().with_structured_output(schema, **kwargs)
+        return _SiliconFlowStructuredRunnable(self, schema)
+
+
+def get_siliconflow_llm(
+    model_name: str = "Qwen/Qwen2.5-72B-Instruct",
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+) -> ChatOpenAI:
+    """SiliconFlow (硅基流动) on its OpenAI-compatible endpoint.
+
+    Two platforms serve the same API (``api.siliconflow.cn`` and
+    ``api.siliconflow.com``); we default to the ``.cn`` one and let
+    ``SILICONFLOW_BASE_URL`` / a pushed channel point at either.
+
+    ``temperature`` is passed through unchanged: the endpoint accepts 0..2
+    (verified live for 0, 0.01 and 2), so the ``0`` that ``hopper`` hardcodes
+    for reproducibility keeps working.
+    """
+    override = override or ProviderOverride()
+    api_key = override.key_or("SILICONFLOW_API_KEY")
+    assert api_key is not None
+    client = SiliconFlowChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        temperature=temperature,
+        base_url=override.url_or("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
+        # 必须显式开：不开的话流式调用的 usage_metadata 是 None，遥测里 token
+        # 消耗和缓存命中率都记不上（实测：不带这个参数时 astream 回来的
+        # usage_metadata 就是 None）。openai 分支一直没开这个开关。
+        stream_usage=True,
+        # 有界超时 + 一次重试，理由同 get_minimax_llm：不设的话 SDK 等 600s
+        # 且重试两次，一次挂掉的连接会把整个 agent 拖住 30 分钟且只打印
+        # "Waiting for LLM call response..."。
+        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=1,
+    )
+    return client
+
+
 @overload
 def get_llm(
     ctx: MobileUseContext,
@@ -936,6 +1077,8 @@ def get_llm(
         return get_minimax_llm(llm.model, effective_temperature, override)
     elif llm.provider == "deepseek":
         return get_deepseek_llm(llm.model, effective_temperature, override)
+    elif llm.provider == "siliconflow":
+        return get_siliconflow_llm(llm.model, effective_temperature, override)
     elif llm.provider == "minitap":
         return get_minitap_llm(
             trace_id=ctx.trace_id,

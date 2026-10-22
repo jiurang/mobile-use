@@ -1,6 +1,12 @@
 // Here is the default config that will be used if no override is provided.
 {
   "default": {
+    // Reporter **故意不写**：这一份是所有用户 override 文件的合并底座。
+    // 底座上写死 reporter = openai 的话，任何「按老模板抄的、没写 reporter 的」override
+    // 都会让 reporter 独自留在 openai 上（而 executor 已经换到别的供应商），
+    // validate_providers() 会直接索要 OPENAI_API_KEY —— 部署起不来。
+    // 不写 = 走回落（get_agent("reporter") → executor），永远跟着 executor 的渠道走。
+    // 要显式配就在这个对象里加 "reporter": { ... }，另外 4 个 preset 里都有写法示例。
     "planner": {
       "provider": "openai",
       "model": "gpt-5-nano",
@@ -9,12 +15,14 @@
         "model": "gpt-5-mini"
       }
     },
+    // Orchestrator 是看门狗：每子目标判一次「计划还走得通吗」，是高层判断 → 升到强模型
+    // （doc/executor-autonomy-plan.md §2.1.1）。频次低（每子目标 1 次），所以成本可控。
     "orchestrator": {
       "provider": "openai",
-      "model": "gpt-5-nano",
+      "model": "gpt-5",
       "fallback": {
         "provider": "openai",
-        "model": "gpt-5-mini"
+        "model": "o4-mini"
       }
     },
     "cortex": {
@@ -106,6 +114,15 @@
         "model": "claude-sonnet-4-6"
       }
     },
+    // Reporter：只写摘要 + 挑证据，快模型就够 —— 与 executor 同档（§2.1.1）。
+    "reporter": {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001",
+      "fallback": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6"
+      }
+    },
     "contextor": {
       "provider": "anthropic",
       "model": "claude-haiku-4-5-20251001",
@@ -168,6 +185,18 @@
           "model": "MiniMax-M3.1-Flash-Preview"
         }
       },
+      // Reporter：只写摘要 + 挑证据，快模型就够（§2.1.1）。
+      // 这个 preset 里快/慢的方向和别的角色相反（别的角色是 M3 主、Flash 兜底）：
+      // Reporter 摆快模型在前 —— 它是本 preset 里要求最低、却每子目标都要跑一次的角色，
+      // 主模型失败时再由 M3 接手。
+      "reporter": {
+        "provider": "minimax",
+        "model": "MiniMax-M3.1-Flash-Preview",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3"
+        }
+      },
       "contextor": {
         "provider": "minimax",
         "model": "MiniMax-M3",
@@ -209,9 +238,12 @@
         "model": "deepseek-flash"
       }
     },
+    // Orchestrator 是看门狗（每子目标判一次「计划还走得通吗」），是高层判断 → 升到强模型
+    // deepseek-v4-pro。兜底仍是 flash：orchestrator 只读计划与汇报，不看屏幕，
+    // 文本模型够用，万一 v4-pro 不可用还能继续跑。
     "orchestrator": {
       "provider": "deepseek",
-      "model": "deepseek-flash",
+      "model": "deepseek-v4-pro",
       "fallback": {
         "provider": "deepseek",
         "model": "deepseek-flash"
@@ -226,6 +258,15 @@
       }
     },
     "executor": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "fallback": {
+        "provider": "deepseek",
+        "model": "deepseek-flash"
+      }
+    },
+    // Reporter：只写摘要 + 挑证据，快模型就够（§2.1.1）→ 与 preset 里其它角色同档。
+    "reporter": {
       "provider": "deepseek",
       "model": "deepseek-flash",
       "fallback": {
@@ -261,6 +302,103 @@
       }
     }
   },
+  // SiliconFlow preset – 硅基流动（国内 OpenAI 兼容平台，platform.siliconflow.cn）。
+  // To use it, copy the contents of this object into llm-config.override.jsonc.
+  //
+  // ⚠️ 这个平台**没有一个模型能同时做到「看图 + 发工具调用 + 结构化输出」**，
+  // 所以视觉角色必须拆开（能力矩阵都是对着真实 API 核过的，2026-10-21）：
+  //
+  //   模型                        视觉   工具调用   json_schema 结构化输出
+  //   zai-org/GLM-4.5V            ✔      ✔          ✘ 400「Json mode is not supported」
+  //   Qwen/Qwen3-VL-32B-Instruct   ✔      ✘ 空内容   ✔
+  //   Qwen/Qwen3-VL-8B-Instruct    ✔      ✘ 空内容   ✔
+  //   Qwen/Qwen2.5-72B-Instruct    ✘      ✔          ✔
+  //   Qwen/Qwen2.5-7B-Instruct     ✘      ✔          ✔
+  //
+  // 于是：**executor 走 GLM-4.5V**（它要点击，必须能看图 + 调工具），
+  // **cortex 走 Qwen3-VL**（它要读屏 + 回结构化决策），其余角色走文本模型。
+  // 把 cortex 和 executor 指到同一个模型上必然有一边瞎掉。
+  //
+  // 另外两点实测结论：
+  //   - 视觉模型不支持**强制** tool_choice（400「Specifying functions for
+  //     tool_choice is not yet supported」），所以结构化输出走 response_format；
+  //   - temperature 0..2 都收，hopper 写死的 0 不用改。
+  "siliconflow": {
+    "planner": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-72B-Instruct",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-7B-Instruct"
+      }
+    },
+    // Orchestrator 是看门狗（每子目标判一次「计划还走得通吗」），是高层判断 → 强模型。
+    "orchestrator": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-72B-Instruct",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-7B-Instruct"
+      }
+    },
+    // Cortex 要读屏 + 回结构化决策 → 视觉 + json_schema ⇒ Qwen3-VL。
+    // （不能指到 GLM-4.5V：它不支持 json 模式。）
+    "cortex": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-32B-Instruct",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-72B-Instruct"
+      }
+    },
+    // Executor 是唯一看屏幕**并点击**的角色 → 视觉 + 工具调用 ⇒ GLM-4.5V。
+    // 指到 Qwen3-VL 会拿到空内容（模型不调工具），executor 直接卡死。
+    "executor": {
+      "provider": "siliconflow",
+      "model": "zai-org/GLM-4.5V",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-72B-Instruct"
+      }
+    },
+    // Reporter：只写摘要 + 挑证据，快模型就够（§2.1.1）→ 与 executor 同档。
+    "reporter": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-72B-Instruct"
+      }
+    },
+    "contextor": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-72B-Instruct"
+      }
+    },
+    "utils": {
+      // Hopper 的温度被调用点写死成 0（可复现），这里别去覆盖它。
+      "hopper": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "fallback": {
+          "provider": "siliconflow",
+          "model": "Qwen/Qwen2.5-72B-Instruct"
+        }
+      },
+      "outputter": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "fallback": {
+          "provider": "siliconflow",
+          "model": "Qwen/Qwen2.5-72B-Instruct"
+        }
+      },
+      "video_analyzer": null
+    }
+  },
   // This is the config we recommend.
   // To use it, copy it to llm-config.override.jsonc, following llm-config.override.template.jsonc.
   "recommended": {
@@ -272,12 +410,14 @@
         "model": "meta-llama/llama-4-maverick"
       }
     },
+    // Orchestrator 是看门狗（每子目标判一次「计划还走得通吗」），是高层判断 → 升到强模型，
+    // 与 cortex 同档（§2.1.1）。兜底也跟 cortex 一致。
     "orchestrator": {
       "provider": "minitap",
-      "model": "openai/gpt-oss-120b",
+      "model": "google/gemini-3-pro-preview",
       "fallback": {
         "provider": "minitap",
-        "model": "meta-llama/llama-4-maverick"
+        "model": "google/gemini-2.5-pro"
       }
     },
     "cortex": {
@@ -289,6 +429,15 @@
       }
     },
     "executor": {
+      "provider": "minitap",
+      "model": "meta-llama/llama-3.1-70b-instruct",
+      "fallback": {
+        "provider": "minitap",
+        "model": "openai/gpt-5-mini"
+      }
+    },
+    // Reporter：只写摘要 + 挑证据，快模型就够（§2.1.1）→ 与 executor 同档。
+    "reporter": {
       "provider": "minitap",
       "model": "meta-llama/llama-3.1-70b-instruct",
       "fallback": {
