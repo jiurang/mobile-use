@@ -213,7 +213,7 @@ class TestPerceptionConfig:
         assert p.ui_hierarchy and p.ocr
 
     def test_screenshot_defaults_to_on_demand(self):
-        """截图默认**按需**（2026-10-21 改）。
+        """截图默认**按需**（2026-10-21 改，2026-10-22 改成显式枚举）。
 
         截图是最贵的一块，而且永远不可缓存：它在 prompt 末尾，base64 长度随
         画面变 → 请求总长每轮都变 → provider 的缓存单元匹配不上 → 归零。
@@ -221,11 +221,18 @@ class TestPerceptionConfig:
         """
         p = PerceptionConfig()
         assert p.screenshot == "on_demand"
-        assert p.screenshot_label == "on demand"
+        assert p.screenshot_channel == "on_demand"
+        assert p.can_see_screenshot is True
 
     def test_channels_are_independent(self):
-        p = PerceptionConfig(screenshot=False)
-        assert not p.screenshot and p.ui_hierarchy and p.ocr
+        """关掉一条不影响另外两条 —— 而且「关掉」是**字符串**不是假值。
+
+        ⚠️ 以前 `screenshot` 是 bool，`not p.screenshot` 判的就是「关着」；
+        现在它是枚举字符串（`"off"` 是**真值**）⇒ 用 `can_see_screenshot` 判。
+        """
+        p = PerceptionConfig(screenshot="off")
+        assert p.can_see_screenshot is False
+        assert p.ui_hierarchy and p.ocr
 
     def test_ocr_config_is_not_shared_between_instances(self):
         """default_factory 而非可变默认值 —— 否则改一个会污染所有实例。"""

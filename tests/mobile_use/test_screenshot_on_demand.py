@@ -1,22 +1,32 @@
-"""图片按需取（③）的行为锁定。
+"""图片通道：**Executor 自己决定要不要看图**（2026-10-22 改）。
 
-🔴 **2026-10-22 变更：Executor 的截图通道整条关掉了。**
+🔴 **2026-10-22 语义整个换掉了。**
 
-原来 Executor 能说「我需要看图」→ 同轮补一张 → **再问一次 LLM**。
-实测那次二问就是整整一次 LLM 调用（executor 单次决策中位 5,276ms），
-换来的只是「模型偶尔能看见颜色/图标/遮挡」。现在 Executor 只靠
-**UI 元素表 + OCR** 决策。
+* 改造前：Executor 整条通道**没有图**（`need_screenshot` 被删，提示词写着
+  "There is no screenshot"）。理由是原来的「模型要图 → 同轮补一张 →
+  **再问一次 LLM**」要烧整整一次 LLM 调用（真机实测 executor 单次决策中位
+  5,276ms），收益只有「模型偶尔看见颜色/图标/遮挡」。
+* 现在：`ExecutorOutput.need_screenshot` **回来了**，但用法不一样 ——
+  **Executor 自己举手**，框架在**下一轮**把当屏截图挂进 prompt。
+  **零额外 LLM 调用**（循环本来就要继续下一轮），而且图是 contextor 刚抓的
+  那一帧 ⇒ 图和元素表同屏，`[i]` 编号契约不受影响。
 
-这个文件锁的是三件事：
+🔴 **2026-10-22 再改：三态显式枚举 + 「关掉就一个字都不提」。**
 
-1. **通道三态** —— `True`（每轮带图）/ `False`（不带）/ `"on_demand"`（按需）。
-   配置项本身还在（`PerceptionConfig.screenshot`），但 Executor 不用它了。
-2. **截图通道已关** —— `ExecutorOutput` 没有 `need_screenshot`；模型硬吐这个
-   键也被静默忽略。
-3. **prompt 渲染** —— `executor.md` 必须说清「**没有截图**」+ 息屏唤醒。
+* `PerceptionConfig.screenshot` 从混型 `bool | "on_demand"` 改成字符串枚举
+  `"always" / "on_demand" / "off"`（老 bool 在校验器里被收：`True` →
+  `"on_demand"`、`False` → `"off"`）。
+* **模型不能看图时，提示词里一个图相关的词都不许有，schema 里也不留
+  `need_screenshot` 字段** —— 模型看不到的东西，不该让它以为有。
 
-⚠️ 改造前这个文件测的是 cortex 的 `should_request_screenshot`，
-那套机制随 Cortex 不再看屏一起删掉了（`cortex.py` 里不再有这个函数）。
+这个文件锁住四件事：
+
+1. **通道三态** —— 显式枚举，归一化在字段校验里做（不再有「`"on_demand"` 是
+   真值」的真假判断陷阱）。
+2. **决策字段在** —— 能看图时 `ExecutorOutput.need_screenshot` 存在；
+   **不能看图时连字段都没有**。
+3. **提示词按开关渲染** —— 能看图才写图怎么用；不能看图时**零图词**。
+4. **OCR / UI 开关也生效** —— 关掉的通道不出现（不是「关了还偷偷给」）。
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from pathlib import Path
 import pytest
 from jinja2 import Environment, StrictUndefined
 
-from minitap.mobile_use.agents.executor.types import ExecutorOutput
+from minitap.mobile_use.agents.executor.types import ExecutorOutput, executor_output_schema
 from minitap.mobile_use.context import PerceptionConfig
 
 EXECUTOR_MD = (
@@ -38,64 +48,99 @@ EXECUTOR_MD = (
     / "executor.md"
 )
 
+#: 「跟图有关的词」—— 通道关掉时，渲染出来的 prompt 里一个都不该有。
+IMAGE_WORDS = (
+    "screenshot",
+    "picture",
+    "image",
+    "need_screenshot",
+    "color",
+    "icon",
+)
+
 
 class TestScreenshotMode:
     def test_default_is_on_demand(self):
-        """默认按需 —— 截图是最贵且永不缓存的一块。"""
+        """默认按需 —— **Executor 自己决定**要不要看图。"""
         assert PerceptionConfig().screenshot == "on_demand"
 
-    def test_bool_values_stay_bool(self):
-        """别让 pydantic 把 True/False 变成字符串。"""
-        assert PerceptionConfig(screenshot=True).screenshot is True
-        assert PerceptionConfig(screenshot=False).screenshot is False
-
-    def test_on_demand_stays_string(self):
-        assert PerceptionConfig(screenshot="on_demand").screenshot == "on_demand"
-
     @pytest.mark.parametrize(
-        ("value", "label"),
+        ("value", "expected"),
         [
-            (True, "enabled"),
-            (False, "DISABLED"),
-            ("on_demand", "on demand"),
+            ("always", "always"),
+            ("on_demand", "on_demand"),
+            ("off", "off"),
         ],
     )
-    def test_label(self, value, label):
-        assert PerceptionConfig(screenshot=value).screenshot_label == label
+    def test_three_states(self, value, expected):
+        assert PerceptionConfig(screenshot=value).screenshot == expected
+
+    def test_legacy_bool_true_means_executor_decides(self):
+        """老代码里 ``True`` 是「每轮都带图」（Cortex 时代的老行为）。
+
+        Manager-web 的开关是「**能不能看图**」⇒ ``True`` 现在映射成
+        ``"on_demand"``（能看图，**由 Executor 自己决定**什么时候看）。
+        """
+        assert PerceptionConfig(screenshot=True).screenshot == "on_demand"
+
+    def test_legacy_bool_false_means_off(self):
+        assert PerceptionConfig(screenshot=False).screenshot == "off"
+
+    def test_can_see_screenshot(self):
+        assert PerceptionConfig(screenshot="always").can_see_screenshot is True
+        assert PerceptionConfig(screenshot="on_demand").can_see_screenshot is True
+        assert PerceptionConfig(screenshot="off").can_see_screenshot is False
 
     def test_other_channels_untouched(self):
         p = PerceptionConfig(screenshot="on_demand")
         assert p.ui_hierarchy and p.ocr
 
+    def test_screenshot_channel_is_the_normalized_value(self):
+        """归一化在字段校验里做完了 —— 属性直接返回，不会各判各的。"""
+        assert PerceptionConfig(screenshot=True).screenshot_channel == "on_demand"
+        assert PerceptionConfig(screenshot=False).screenshot_channel == "off"
 
-class TestExecutorScreenshotChannelIsOff:
-    """🔴 2026-10-22：Executor 的截图通道**整条关掉**。
 
-    原来是「要图 → 同轮补一张 → **再问一次 LLM**」。实测那次二问就是
-    整整一次 LLM 调用（executor 单次决策中位 5,276ms），换来的只是
-    「模型偶尔能看见颜色/图标/遮挡」。
+class TestSchemaFollowsTheSwitch:
+    """不能看图 ⇒ schema 里连字段都没有。"""
 
-    关掉之后：
-    * `ExecutorOutput` 没有 `need_screenshot` ⇒ 模型不会再提这件事；
-    * 模型仍然吐这个键 ⇒ pydantic 静默忽略 ⇒ 不报错、不触发额外动作。
-    """
+    def test_schema_has_the_field_when_the_model_can_see(self):
+        schema = executor_output_schema(can_see_screenshot=True)
+        assert "need_screenshot" in schema.model_fields
 
-    def test_executor_output_has_no_need_screenshot(self):
-        """Executor 的输出模型**不带** `need_screenshot`。"""
-        assert "need_screenshot" not in ExecutorOutput.model_fields
+    def test_schema_drops_the_field_when_the_model_cannot_see(self):
+        schema = executor_output_schema(can_see_screenshot=False)
+        assert "need_screenshot" not in schema.model_fields
+        # 其它字段一个都不能少
+        for field in ("actions", "agent_thought", "done", "done_reason"):
+            assert field in schema.model_fields
 
-    def test_stray_need_screenshot_is_ignored_not_fatal(self):
-        """模型要是仍然吐这个键，必须**静默忽略**，不能让整轮挂掉。
+    def test_tool_name_stays_executor_output(self):
+        """工具名不能变 —— 模型被教的是「你只能调 ExecutorOutput」，
+        解析层也拿这个名字对账（喊错名字会被拒）。"""
+        from langchain_core.utils.function_calling import convert_to_openai_tool
 
-        2026-10-21 真机踩出来的教训反过来用在这里：解析层的任何一次
-        硬失败都会让 agent 在原地白烧步数（实测 51 步没跑完）。
-        """
-        out = ExecutorOutput(actions=[], need_screenshot=True)  # type: ignore[call-arg]
-        assert out.actions == []
-        assert not hasattr(out, "need_screenshot")
+        for can_see in (True, False):
+            schema = executor_output_schema(can_see_screenshot=can_see)
+            assert convert_to_openai_tool(schema)["function"]["name"] == "ExecutorOutput"
 
-    def test_cortex_no_longer_owns_the_screenshot_channel(self):
-        """Cortex 已经不看屏了，不该再有 `need_screenshot` 字段。"""
+
+class TestExecutorDecidesTheScreenshot:
+    """Executor 自己举手要图。"""
+
+    def test_need_screenshot_exists(self):
+        assert "need_screenshot" in ExecutorOutput.model_fields
+
+    def test_need_screenshot_defaults_to_false(self):
+        """默认不举手 —— 绝大多数轮次靠元素表 + OCR 就够。"""
+        assert ExecutorOutput(actions=[]).need_screenshot is False
+
+    def test_model_can_raise_the_hand(self):
+        out = ExecutorOutput(actions=[], need_screenshot=True)
+        assert out.need_screenshot is True
+
+    def test_cortex_still_does_not_own_the_channel(self):
+        """Cortex 不看屏，截图通道归 Executor。"""
         from minitap.mobile_use.agents.cortex.types import CortexOutput
 
         assert "need_screenshot" not in CortexOutput.model_fields
@@ -103,32 +148,58 @@ class TestExecutorScreenshotChannelIsOff:
 
 
 class TestPromptRendering:
-    def _render(self) -> str:
+    def _render(self, perception: PerceptionConfig | None = None) -> str:
         env = Environment(undefined=StrictUndefined, autoescape=False)
         return env.from_string(EXECUTOR_MD.read_text(encoding="utf-8")).render(
             platform="android",
             executor_tools_list="tap",
             goal="读出当前连接的 Wi-Fi 名称",
+            perception=perception or PerceptionConfig(),
         )
 
-    def test_prompt_says_there_is_no_screenshot(self):
-        """必须说清「**没有截图**」—— 否则模型会以为图在手里。"""
-        out = self._render()
-        assert "There is no screenshot" in out
-        assert "need_screenshot" not in out
+    def test_on_demand_tells_the_model_it_has_to_ask(self):
+        """默认档：模型必须知道「图不会自己来，要举手」。"""
+        out = self._render(PerceptionConfig(screenshot="on_demand"))
+        assert "you have to ask for it" in out
+        assert "need_screenshot" in out
 
-    def test_prompt_keeps_the_two_remaining_channels(self):
-        """UI 元素 + OCR 这两个通道必须留着。"""
+    def test_always_says_the_picture_is_attached_every_turn(self):
+        out = self._render(PerceptionConfig(screenshot="always"))
+        assert "attached to **every**" in out
+
+    def test_off_has_no_image_words_at_all(self):
+        """🔴 **模型不能看图 ⇒ 提示词里一个图相关的词都不许有。**
+
+        留一个词，模型就会以为自己能看到：要么在 `agent_thought` 里说
+        「我看到有个红色的按钮」（它根本看不到），要么每轮举手要一张
+        永远不会来的图。
+        """
+        out = self._render(PerceptionConfig(screenshot="off")).lower()
+        for word in IMAGE_WORDS:
+            assert word not in out, f"关掉图片通道后，提示词里不该出现「{word}」"
+
+    def test_off_does_not_teach_the_field(self):
+        out = self._render(PerceptionConfig(screenshot="off"))
+        assert "`need_screenshot`" not in out
+
+    def test_ui_off_is_declared(self):
+        """UI 通道关掉 ⇒ 提示词要说清「没有元素表、只能按 ocr_index 寻址」。"""
+        out = self._render(PerceptionConfig(ui_hierarchy=False))
+        assert "UI elements are OFF" in out
+        assert "ocr_index" in out
+
+    def test_ocr_off_is_declared(self):
+        out = self._render(PerceptionConfig(ocr=False))
+        assert "OCR is OFF" in out
+
+    def test_keeps_the_two_text_channels(self):
+        """默认档：UI 元素 + OCR 这两个通道必须留着。"""
         out = self._render()
         assert "UI elements" in out
         assert "OCR" in out
 
     def test_prompt_explains_the_screen_may_be_asleep(self):
-        """息屏时截图全黑、元素表只剩残留 —— 必须告诉模型怎么应对。"""
+        """息屏时元素表只剩残留 —— 必须告诉模型怎么应对。"""
         out = self._render()
         assert "wake_screen" in out
-        assert "OFF" in out or "asleep" in out
-
-    def test_output_table_does_not_list_the_removed_field(self):
-        out = self._render()
-        assert "need_screenshot" not in out
+        assert "asleep" in out

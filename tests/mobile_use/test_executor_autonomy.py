@@ -543,33 +543,35 @@ def test_t11b_single_element_array_works():
 # ---------------------------------------------------------------------------
 
 
-def test_t13_executor_output_has_no_need_screenshot():
-    """🔴 2026-10-22：Executor 的**截图通道整条关掉了**。
+def test_t13_executor_output_lets_the_model_ask_for_a_picture():
+    """🔴 2026-10-22：图片通道**回来了**，但语义换成「Executor 自己举手」。
 
     原来这个字段让模型能说「我需要看图」→ 同轮补一张 → **再问一次 LLM**
     （真机实测 executor 单次决策中位 5,276ms，那一次二问就是白白多花的）。
 
     现在：
-    * 字段**不在** schema 里 ⇒ 模型不会再提这件事；
-    * 模型如果仍然吐出这个键（提示词残留 / 旧习惯），pydantic 忽略它，
-      **不会报错、也不会触发任何额外动作**。
+    * 字段**在** schema 里 ⇒ 模型能说「我需要看图」；
+    * 但**不再二问** —— 框架在**下一轮**把当屏截图挂进 prompt，
+      循环本来就要继续下一轮 ⇒ **零额外 LLM 调用**；
+    * 图和元素表是**同一次抓屏**的产物 ⇒ 编号契约不受影响。
     """
-    assert "need_screenshot" not in ExecutorOutput.model_fields
+    assert "need_screenshot" in ExecutorOutput.model_fields
 
-    # 多余的键必须被静默忽略，不能让整轮挂掉
-    out = ExecutorOutput(actions=[], need_screenshot=True)  # type: ignore[call-arg]
-    assert out.actions == []
-    assert not hasattr(out, "need_screenshot")
+    # 默认不举手（绝大多数轮次靠元素表 + OCR 就够）
+    assert ExecutorOutput(actions=[]).need_screenshot is False
+    # 举手 ⇒ 状态被记住（它决定的是下一轮的 prompt）
+    assert ExecutorOutput(actions=[], need_screenshot=True).need_screenshot is True
 
 
 def test_t13b_executor_prompt_mentions_screenshot_and_wake():
-    """executor.md 必须说清「**没有截图**」+ 息屏唤醒。"""
+    """executor.md 必须说清「**图片通道怎么用**」+ 息屏唤醒。"""
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
-    # 截图通道已关 ⇒ 不能再教模型要图
-    assert "need_screenshot" not in text
-    assert "There is no screenshot" in text
+    # 要教模型怎么要图（默认档：Executor 自己决定）
+    assert "need_screenshot" in text
+    # 三种通道状态都要有分支（always / on_demand / off）
+    assert "perception.screenshot_channel" in text
     # 息屏唤醒必须留着（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）
     assert "wake_screen" in text
 
