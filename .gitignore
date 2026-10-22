@@ -19,3 +19,6 @@ probe_out/
 
 # mermaid 渲染的临时产物（_mmd_*.mmd / .svg / .png / _puppeteer_config.json）
 v/
+
+# 本地 ACL 工具的备份/报告产物（.acl-report/）
+.acl-report/
