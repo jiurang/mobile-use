@@ -32,6 +32,28 @@
 7. **id 尾段只在必要行上给**：没有文字的行（id 是它唯一的描述），
    或者本屏标签重复的行（id 是区分它们的唯一线索）。
    实测这两类只占全部 id 行的 70%，省下来的却是全部 id 字段的绝大部分。
+8. **纯装饰行不裁**：「不可交互 + 无文字」的行**留着**。看着像纯浪费，
+   但真机逐个点过之后发现它们里有一截是真能点的，裁不得。
+   实测（Redmi Turbo 4，12 个 App 页面，126 行「装饰候选」逐个 adb 点）：
+   **17 行（13.5%）点了之后屏幕真的变了**。命中的都是模型会想点的东西：
+   小米天气的 7 天预报图标（`daily_forecast_item_icon`，点了进详情页，
+   屏幕变化 98.5%）、城市切换块（`main_city_indicator_container`）、
+   淘宝的搜索框（`search_view`）、小红书的卡片。
+   原因很直白：这些 App 用 Canvas / 自定义 View 画可点区域，
+   uiautomator 的 dump 里**既没有 clickable、也没有文字**，
+   「没有交互标记」根本推不出「点它没反应」。
+   而它们**全部有 resource_id**（82/82），id 尾段正是模型认出
+   「这是个可点的东西」的唯一线索（`id/send`、`id/search_input`）。
+   三个「退一步」的收窄判据实测下来**各裁 0 行**（82 行候选里
+   最小面积 845px²，没有一个「小到不可能是点击目标」；
+   82 行全都带 id；层级树拍平后没有一行是别人的几何父容器），
+   也就是说不存在「只裁一部分」的落点。
+   ⇒ 结论：**别裁**。要省这块 token，得先让 `find_element` 支持
+   尾段匹配（工具契约变更），让模型拿 id 也能定位到东西；
+   顺序反过来就是静默地弄坏所有 id 定位。
+   复现脚本：`scripts/probe_decorative_clickable.py`（逐行实点）、
+   `scripts/probe_decorative_crop_impact.py`（token 账）、
+   `scripts/probe_decorative_analyze.py`（逐判据复算）。
 """
 
 from __future__ import annotations
@@ -39,7 +61,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -142,7 +164,7 @@ def _element_from_tree_row(row: dict) -> ScreenElement | None:
 
 
 def build_screen_elements(
-    tree_rows: list[dict] | None,
+    tree_rows: list[dict[str, Any]] | None,
     ocr_results: list[OcrText] | None = None,
     foreground_package: str | None = None,
 ) -> list[ScreenElement]:

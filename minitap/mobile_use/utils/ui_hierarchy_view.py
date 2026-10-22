@@ -336,7 +336,7 @@ def _node_to_dict(node: _Node) -> dict:
     }
 
 
-def normalize_hierarchy(elements: list[dict] | None) -> list[dict] | None:
+def normalize_hierarchy(elements: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """归一化 + 裁剪层级树，返回可复用的节点列表。
 
     这是 `render_hierarchy_and_labels` 的内核，单独暴露出来是为了让

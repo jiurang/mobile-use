@@ -1,9 +1,10 @@
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.graph import add_messages
 from pydantic import BaseModel
 
+from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
 from minitap.mobile_use.context import MobileUseContext
@@ -114,6 +115,75 @@ class State(BaseModel):
     executor_messages: Annotated[list[AnyMessage], "Sequential Executor messages", add_messages]
     cortex_last_thought: Annotated[str | None, "Last thought of the cortex for the executor"]
 
+    # ---- Executor 自主执行（方案 v2，doc/executor-autonomy-plan.md §8）----
+    #
+    # 语义变化：`executor_messages` 从「Cortex 每轮清空」变成
+    # 「**Cortex 下发新子目标时**清空」—— 它现在是 Executor 在**本子目标内**的
+    # 局部历史（动作 + 工具反馈交替）。工具层写这个 key 的代码**不用改**
+    # （`EXECUTOR_MESSAGES_KEY` 常量不变），清空责任从 Cortex 转移到 Cortex 的
+    # 「下发目标」那一刻。
+
+    # 本次子目标的目标陈述（Cortex → Executor）。Cortex 每次下发新目标时，
+    # 同时清空 executor_messages，让 Executor 的局部历史从零开始。
+    executor_goal: Annotated[
+        str | None,
+        "The goal statement for the current subgoal, issued by Cortex",
+    ] = None
+
+    # Executor 本轮认为目标已达成。Executor 节点写，graph 的条件边读：
+    # True → 走 Reporter 收尾；False → 走 executor_tools 执行动作。
+    executor_done: Annotated[
+        bool,
+        "Whether the executor believes the current subgoal is achieved",
+    ] = False
+
+    # 本子目标已执行的步数（熔断用）。Executor 节点每轮 +1。
+    executor_steps: Annotated[
+        int,
+        "Steps executed so far in the current subgoal (circuit breaker)",
+    ] = 0
+
+    # 全任务累计的**动作步**数（跨子目标累加，换目标时**不**归零）。
+    #
+    # 为什么不能直接用 `executor_steps`：它是「本子目标内」的步数，Cortex 换目标时
+    # 把它归零（`agents/cortex/cortex.py:429`），跨子目标会重置 —— 拿它当
+    # 「整个任务跑了多少步」，读到的永远是 0~12 这种小数字。
+    #
+    # 为什么不能退回 `len(agents_thoughts)`：改造后 **Contextor 每个动作步写 1 条
+    # thought**（`agents/contextor/contextor.py:191`），Cortex / Orchestrator 每个子目标
+    # 再各写几条 —— thoughts 的**条数**是「感知 + 监督的次数」，和「跑了多少个动作步」
+    # 根本不是一个东西（方案 §11.5 M13）。thoughts 仍然是「推理过程」的载体，
+    # 口径不能混用。
+    #
+    # 口径：**executor 节点每跑一轮 +1**，和 `executor_steps` 的增量严格一致
+    # （同一个节点、同一个时机写），所以恒有
+    # `total_steps` ≡ Σ(各子目标的 `executor_steps`)。
+    #
+    # reducer 是 `take_last`（覆盖语义），累加由节点自己算 —— 和 `agents_thoughts`
+    # 一个模式（那个字段的追加也是在节点的 `asanitize_update` 里算的）。
+    total_steps: Annotated[
+        int,
+        "Cumulative action steps executed across all subgoals (never reset)",
+        take_last,
+    ] = 0
+
+    # 失败事实账本（append-only，**与 failed_targets 熔断账本分开**）。
+    #
+    # 为什么分开：`failed_targets` 的语义是「同屏同目标连续失败」的即时保护，
+    # 它**成功即清**（tools/mobile/tap.py:227）且**换键即整表替换**
+    # （utils/failed_targets.py:99-115）—— 跨子目标的事实留不住。
+    # 这个字段只增不减，承载「跨子目标的失败事实」。
+    executor_failures: Annotated[
+        list[dict],
+        "Append-only ledger of failed targets across subgoals (facts, never rewritten)",
+    ] = []
+
+    # Reporter 的产出（Reporter → Cortex / Orchestrator）。
+    executor_report: Annotated[
+        ExecutorReport | None,
+        "The report of the last subgoal attempt",
+    ] = None
+
     # common keys
     agents_thoughts: Annotated[
         list[str],
@@ -131,9 +201,9 @@ class State(BaseModel):
     async def asanitize_update(
         self,
         ctx: MobileUseContext,
-        update: dict,
+        update: dict[str, Any],
         agent: AgentNode | None = None,
-    ):
+    ) -> dict[str, Any]:
         """
         Sanitizes the state update to ensure it is valid and apply side effect logic where required.
         The agent is required if the update contains the "agents_thoughts" key.

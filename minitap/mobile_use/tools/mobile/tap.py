@@ -19,6 +19,7 @@ from minitap.mobile_use.tools.utils import (
     check_failure_breaker,
     has_valid_selectors,
     record_target_failure,
+    record_target_failure_fact,
     resolve_target,
     target_label,
     validate_coordinates_bounds,
@@ -221,6 +222,7 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                 attempts.append({"selector": selector_info, "error": str(e)})
 
         # Build result message
+        failure_details = ""  # 成功时用不到，但要在分支外可见
         if success:
             agent_outcome = tap_wrapper.on_success_fn(successful_selector)
             # 成功即清账：模型已经换了目标，「连续失败」这件事到此为止。
@@ -230,6 +232,17 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
             failure_details = "; ".join([f"{a['selector']}: {a['error']}" for a in attempts])
             agent_outcome = tap_wrapper.on_failure_fn(failure_details)
             failed_targets = record_target_failure(
+                state=state,
+                target=target,
+                reason=failure_details[:200],
+            )
+
+        # 跨子目标的失败事实（只增不减）：熔断账本成功时会清空，
+        # 而汇报要交给 Cortex 的「失败事实」恰恰发生在子目标成功收尾的时候。
+        if success:
+            executor_failures = state.executor_failures
+        else:
+            executor_failures = record_target_failure_fact(
                 state=state,
                 target=target,
                 reason=failure_details[:200],
@@ -248,6 +261,7 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
                     "agents_thoughts": [agent_thought, agent_outcome],
                     EXECUTOR_MESSAGES_KEY: [tool_message],
                     "failed_targets": failed_targets,
+                    "executor_failures": executor_failures,
                 },
                 agent="executor",
             ),

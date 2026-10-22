@@ -131,6 +131,82 @@ def breaker_reason(streak: list[FailedTarget] | None, key: str) -> str | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# 跨子目标的失败事实（append-only）
+# ---------------------------------------------------------------------------
+#
+# 为什么要和上面的熔断账本分开
+# --------------------------
+# `record_failure`（上面那个）的语义是「**连续**失败」：
+#
+#   - 同键 → count + 1
+#   - **换键 → 整表替换**（`items = [新条目]`，旧的清掉）
+#   - 而且任何一次**成功点击**都会把整个账本清空（`tools/mobile/tap.py` 的成功分支）
+#
+# 也就是说它是「**当下**这个目标连着失败了几次」的即时保护，
+# 换个目标失败一次，之前那条就没了 —— 连熔断都会失效。
+#
+# 但「跨子目标的失败事实」要的是另一回事：
+# 「刚才那个子目标里，索引 48 的 like 按钮点不到，它已经不在屏上了」——
+# 这个事实必须活过子目标边界，让下一个子目标的 Executor 知道别再报它。
+#
+# 所以这里用**只增不减**的账本，和熔断账本物理隔开。
+# 熔断器继续读 `state.failed_targets`（行为一个字没改），
+# 汇报的事实层读这个新账本。
+
+
+def append_failure(
+    streak: list[dict] | None,
+    *,
+    key: str,
+    index: int | None = None,
+    resource_id: str | None = None,
+    label: str | None = None,
+    reason: str = "",
+) -> list[dict]:
+    """把一次失败**追加**到事实账本，返回新的账本。
+
+    和 `record_failure` 的区别就是**不换键替换、不清空**：
+    每一条失败都留着，跨子目标可见。
+
+    条目用普通 dict 而不是 `FailedTarget`：`FailedTarget` 的 `count`
+    表达的是「连续失败次数」，而这里的每条都是**独立的一次失败事件**，
+    语义不同，混用会读错。
+    """
+    items = list(streak or [])
+    items.append(
+        {
+            "key": key,
+            "index": index,
+            "resource_id": resource_id,
+            "label": label or "",
+            "reason": reason,
+        }
+    )
+    return items
+
+
+def render_failure_facts(streak: list[dict] | None) -> str:
+    """把事实账本渲染成给模型看的一行（空账本返回空串）。
+
+    和 `render_failures` 的区别：那条是给「**当下**的熔断」用的，
+    只显示最后一条（因为熔断只看最后一次失败）。
+    这里要把**全部**失败列出来 —— 模型要据此避开所有试过失败的目标。
+    """
+    items = streak or []
+    if not items:
+        return ""
+    bits = [
+        f"{describe(t.get('index'), t.get('resource_id'), t.get('label'))}"
+        f" ({t.get('reason', '')[:80]})"
+        for t in items
+    ]
+    return (
+        "Targets that already failed in this task — do not reuse them, "
+        "pick a different element: " + "; ".join(bits)
+    )
+
+
 def render_failures(streak: list[FailedTarget] | None) -> str:
     """渲染成给模型看的一行。空账本返回空串。"""
     items = streak or []

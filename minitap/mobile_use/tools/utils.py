@@ -14,6 +14,7 @@ from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.utils.failed_targets import (
     FailedTarget,
+    append_failure,
     breaker_reason,
     describe,
     make_key,
@@ -41,9 +42,23 @@ logger = get_logger(__name__)
 
 
 def target_key(target: Target) -> str:
-    """给一个 target 算账本键：索引 + 元素身份。"""
+    """给一个 target 算账本键：索引 + 元素身份。
+
+    ⚠️ **必须把 ``ocr_index`` 也算进去**（2026-10-21 补）。
+
+    没有统一元素表时（iOS / 云设备 / `perception.ui_hierarchy=False`），
+    模型只能填 ``Target.ocr_index`` —— 工具侧的 ``resolve_target`` 就是按它
+    索引 ``latest_ocr_results`` 的。
+
+    而如果这里只读 ``target.index``，那条路径下 ``index`` 恒为 None，
+    键会退化成 ``text=...`` 或 ``"unknown"``：
+    * 熔断账本把「同一个 ocr_index 连着失败」判成「换了目标」→ 连续失败计数失效；
+    * ``render_failure_facts`` 渲染成 ``[unknown] "点赞"`` → 模型看不到是第几行。
+
+    ⇒ 取 ``index or ocr_index``：两条路径下键都稳定。
+    """
     return make_key(
-        index=target.index,
+        index=target.index if target.index is not None else target.ocr_index,
         resource_id=target.resource_id,
         label=target.text or None,
     )
@@ -51,7 +66,11 @@ def target_key(target: Target) -> str:
 
 def target_label(target: Target) -> str:
     """给人看的目标描述。"""
-    return describe(target.index, target.resource_id, target.text)
+    return describe(
+        target.index if target.index is not None else target.ocr_index,
+        target.resource_id,
+        target.text,
+    )
 
 
 def check_failure_breaker(state: State, target: Target) -> str | None:
@@ -69,9 +88,37 @@ def record_target_failure(
     target: Target,
     reason: str,
 ) -> list[FailedTarget]:
-    """记一次失败，返回新的账本。"""
+    """记一次失败，返回新的账本（熔断用：换键即替换、成功即清）。"""
     return record_failure(
         state.failed_targets,
+        key=target_key(target),
+        index=target.index,
+        resource_id=target.resource_id,
+        label=target.text,
+        reason=reason,
+    )
+
+
+def record_target_failure_fact(
+    state: State,
+    target: Target,
+    reason: str,
+) -> list[dict]:
+    """记一次失败到**跨子目标的事实账本**（只增不减）。
+
+    和 `record_target_failure` 的区别：
+
+    * 熔断账本（`state.failed_targets`）是「**当下**这个目标连着失败了几次」
+      的即时保护 —— 换键即替换、成功即清。
+    * 这个事实账本（`state.executor_failures`）是「**整个任务里**哪些目标
+      试过失败了」的历史记录 —— 只增不减，跨子目标可见。
+
+    为什么必须分开：熔断账本在一次成功点击后就被清空了，
+    而汇报要交给 Cortex 的「失败事实」恰恰发生在子目标**成功收尾**的时候 ——
+    从熔断账本里取会取到空。
+    """
+    return append_failure(
+        state.executor_failures,
         key=target_key(target),
         index=target.index,
         resource_id=target.resource_id,

@@ -20,6 +20,7 @@ from minitap.mobile_use.tools.utils import (
     focus_element_if_needed,
     move_cursor_to_end_if_bounds,
     record_target_failure,
+    record_target_failure_fact,
     resolve_target,
 )
 from minitap.mobile_use.utils.logger import get_logger
@@ -93,6 +94,9 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                         "failed_targets": record_target_failure(
                             state=state, target=target, reason=breaker[:200]
                         ),
+                        "executor_failures": record_target_failure_fact(
+                            state=state, target=target, reason=breaker[:200]
+                        ),
                     },
                     agent="executor",
                 ),
@@ -116,6 +120,9 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                         "agents_thoughts": [agent_thought, error_message],
                         EXECUTOR_MESSAGES_KEY: [tool_message],
                         "failed_targets": record_target_failure(
+                            state=state, target=target, reason=error_message[:200]
+                        ),
+                        "executor_failures": record_target_failure_fact(
                             state=state, target=target, reason=error_message[:200]
                         ),
                     },
@@ -169,6 +176,16 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                         []
                         if result.ok
                         else record_target_failure(
+                            state=state,
+                            target=target,
+                            reason=str(result.error or "input failed")[:200],
+                        )
+                    ),
+                    # 跨子目标的失败事实（只增不减）：成功时**不清**。
+                    "executor_failures": (
+                        state.executor_failures
+                        if result.ok
+                        else record_target_failure_fact(
                             state=state,
                             target=target,
                             reason=str(result.error or "input failed")[:200],

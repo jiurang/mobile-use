@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
@@ -10,7 +10,7 @@ from minitap.mobile_use.utils.video import VideoRecordingResult
 
 class ScreenDataResponse(BaseModel):
     base64: str
-    elements: list
+    elements: list[dict[str, Any]]
     width: int
     height: int
     platform: str

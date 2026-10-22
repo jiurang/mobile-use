@@ -17,6 +17,7 @@ from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.tools.utils import (
     check_failure_breaker,
     record_target_failure,
+    record_target_failure_fact,
     resolve_target,
     target_label,
 )
@@ -218,6 +219,18 @@ def get_long_press_on_tool(ctx: MobileUseContext) -> BaseTool:
             )
         )
 
+        # 跨子目标的失败事实（只增不减）：熔断账本成功时会清空，
+        # 而汇报要交给 Cortex 的「失败事实」恰恰发生在子目标成功收尾的时候。
+        executor_failures = (
+            state.executor_failures
+            if not has_failed
+            else record_target_failure_fact(
+                state=state,
+                target=target,
+                reason=str((error_obj or {}).get("error", ""))[:200],
+            )
+        )
+
         tool_message = ToolMessage(
             tool_call_id=tool_call_id,
             content=agent_outcome,
@@ -231,6 +244,7 @@ def get_long_press_on_tool(ctx: MobileUseContext) -> BaseTool:
                     "agents_thoughts": [agent_thought, agent_outcome],
                     EXECUTOR_MESSAGES_KEY: [tool_message],
                     "failed_targets": failed_targets,
+                    "executor_failures": executor_failures,
                 },
                 agent="executor",
             ),
