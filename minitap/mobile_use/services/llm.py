@@ -87,7 +87,8 @@ class ProviderOverride:
     strict: bool = False
 
     #: 渠道下发的「要不要思考」开关。None = 没下发 = 用 provider / settings 的默认。
-    #: 只有 llamacpp 消费它（见 :func:`get_llamacpp_llm`）。
+    #: 消费它的是 ``llamacpp``（见 :func:`get_llamacpp_llm`）和 ``minimax``
+    #: （见 :func:`get_minimax_llm`）；能不能真关掉由 provider 自己判断。
     thinking: bool | None = None
 
     def key_or(self, attr: str, required: bool = True) -> SecretStr | None:
@@ -155,9 +156,7 @@ async def invoke_llm_with_timeout_message[T](
         llm_task = asyncio.create_task(llm_call)
         waiter_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
 
-        done, _ = await asyncio.wait(
-            {llm_task, waiter_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, _ = await asyncio.wait({llm_task, waiter_task}, return_when=asyncio.FIRST_COMPLETED)
 
         if llm_task in done:
             # The LLM call has finished before the timeout, cancel the timer
@@ -575,6 +574,46 @@ def get_azure_llm(
     return client
 
 
+class StructuredOutputError(ValueError):
+    """结构化输出解析失败，带一段**能直接回灌给模型**的理由。
+
+    为什么要有这个类
+    --------------
+    解析失败只有两种常见形态，而它们要**告诉模型的话完全不同**：
+
+    * **喊错了工具名** —— 真机实测（2026-10-22，Redmi Turbo 4 / 快手极速版，
+      执行 812）：executor 66 次调用里有 **37 次**喊的是 prompt「工具表」里的
+      真实工具名（``focus_and_input_text`` / ``tap`` / ``wait_for_delay`` …），
+      而不是唯一绑定的 ``ExecutorOutput``。
+      ⚠️ **病因不是「模型不听话」**：``tool_choice`` 当时是**强制**的，模型照样
+      喊错 —— 因为**局部历史在教它模仿**（历史里 assistant 消息的 tool_calls
+      带着设备工具名）。修历史在
+      ``agents/executor/prompt.py:rewrite_history_tool_calls``；这里只是**兜底**，
+      防止漏网的那个把动作吞掉。
+    * **回了一堆散文** —— 压根没调工具，直接写了一段话。
+
+    以前这两种都变成同一句笼统的「读不懂」，模型不知道错在哪 → 连着重犯
+    （实测：同一处打字动作连着 8 轮零动作，每次都是同一条无关的拒绝理由）。
+
+    ⇒ ``reason`` 是**给模型**的（短、能照着改），``facts`` 是**可进日志的摘要**
+    （工具名、finish_reason —— 不含屏幕原文），``detail`` 是**完整诊断**
+    （含模型原文，只在异常 message 里，不外传）。
+
+    为什么要分三层：模型的原文里可能有**屏幕上的文字**（用户数据）。日志是要
+    长期留存的，把原文抄进去等于把用户数据存到日志系统里。遥测那边早有同款
+    约定（见 ``agents/cortex/dispatcher.py`` 的 ``_rejection_code``：只放代码，
+    不放理由原文）。
+
+    继承 ``ValueError``：老代码按 ``ValueError`` 抓的地方不用改。
+    """
+
+    def __init__(self, reason: str, facts: str = "", detail: str = ""):
+        super().__init__(f"{reason} [detail: {detail}]" if detail else reason)
+        self.reason = reason
+        self.facts = facts
+        self.detail = detail
+
+
 class _ToolCallStructuredRunnable(Runnable):
     """Bind a Pydantic schema as a tool and parse the AIMessage ourselves.
 
@@ -597,7 +636,12 @@ class _ToolCallStructuredRunnable(Runnable):
 
     So we bind the schema as a tool ourselves and parse the response:
 
-    1. If ``tool_calls`` are present, validate the first one's ``args``.
+    1. If a ``tool_call`` **whose name is the schema's own tool name** is
+       present, validate its ``args``.  The name check is **not** optional:
+       a model may ignore ``tool_choice`` and call a different tool, and
+       validating that call's args against the schema would silently
+       succeed (every field has a default) and swallow the action.  See
+       :meth:`_parse`.
     2. Otherwise strip ```json fences from ``content`` and validate (covers
        providers that answer in markdown JSON instead of calling the tool).
 
@@ -629,8 +673,12 @@ class _ToolCallStructuredRunnable(Runnable):
         # parse in ``_parse``. We disable parallel tool calls to keep the choice
         # deterministic.
         bind_kwargs: dict[str, Any] = {"parallel_tool_calls": False}
+        # 绑定的工具名。**解析时必须拿它对账**（见 `_parse`）：模型可以去调别的
+        # 工具名（真机实测 2026-10-22，executor 上 66 次调用里有 37 次喊的是
+        # 局部历史里的设备工具名）—— 哪怕 ``tool_choice`` 是强制的也一样。
+        tool_name = convert_to_openai_tool(schema)["function"]["name"]
+        self._tool_name = tool_name
         if force_tool_choice:
-            tool_name = convert_to_openai_tool(schema)["function"]["name"]
             bind_kwargs["tool_choice"] = tool_name
         self._bound = llm.bind_tools([schema], **bind_kwargs)
 
@@ -697,9 +745,23 @@ class _ToolCallStructuredRunnable(Runnable):
         # "id", "type"}`` dicts where ``args`` is already parsed into a Python
         # object, NOT a JSON string. So we use ``model_validate`` (dict) or
         # ``model_validate_json`` (str) depending on the type we actually get.
+        #
+        # ⚠️ **必须核对工具名**。模型可以去调别的工具（真机实测：它照着**局部
+        # 历史**里 assistant 消息的设备工具名学，见
+        # ``agents/executor/prompt.py:rewrite_history_tool_calls``），
+        # 而这里以前**不查名字**、直接拿 args 去 validate —— schema 的字段
+        # 全都有默认值（``actions`` 默认 ``[]``）、pydantic 默认 ``extra='ignore'``，
+        # **校验会「通过」**，于是产出一个空动作的假结果：动作被静默吞掉，
+        # 外面只看见「你返回了空动作列表」，模型不知道自己错在哪 → 连着重犯。
+        # （真机实测：执行 812 的 executor 66 次调用里 37 次这样，浪费 243 秒。）
+        wrong_tools: list[str] = []
         for tc in msg.tool_calls or []:
+            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
             args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
             if args is None:
+                continue
+            if name != self._tool_name:
+                wrong_tools.append(str(name))
                 continue
             try:
                 if isinstance(args, str):
@@ -710,17 +772,12 @@ class _ToolCallStructuredRunnable(Runnable):
 
         # 2) content 路径 (M3 thinking 关 / Markdown JSON 兜底)
         content = msg.content if isinstance(msg.content, str) else ""
-        if not content.strip():
-            raise ValueError(
-                f"MiniMax response had no tool_calls and no content. "
-                f"finish_reason={getattr(msg, 'response_metadata', {}).get('finish_reason')!r}"
-            )
 
-        stripped = self._strip_markdown_json(content)
+        stripped = self._strip_markdown_json(content) if content.strip() else ""
         # 2a) 整段就是 JSON
         # 2b) JSON 被包在一堆解释性文字里（"好的，我来…" / "[orchestrator] …"）——
         #     整段当 JSON 解析必然失败，退回提取第一个配平的 {..} 块。
-        for candidate in (stripped, self._extract_json_object(stripped)):
+        for candidate in (stripped, self._extract_json_object(stripped) if stripped else None):
             if not candidate:
                 continue
             try:
@@ -728,15 +785,34 @@ class _ToolCallStructuredRunnable(Runnable):
             except ValidationError:
                 continue
 
-        # 两条路都失败。这里必须自己抛：pydantic 的 json_invalid 会把 input_value
-        # 截断成 '...'，现场根本看不出模型到底说了什么，而 with_fallback 正是靠这条
-        # message 上报给用户的。带上原文才算可诊断。
-        raise ValueError(
-            f"MiniMax returned no parseable {self.schema.__name__} "
-            f"(tool_calls={len(msg.tool_calls or [])}, "
-            f"finish_reason={getattr(msg, 'response_metadata', {}).get('finish_reason')!r}). "
-            f"content[:1000]={content[:1000]!r}"
+        # 两条路都失败。抛**带理由**的错，让上层能把「错在哪」讲回模型 ——
+        # 光说「读不懂」模型只会换个姿势再犯（这是执行 812 空转 42 轮的根因）。
+        #
+        # facts 是**可进日志的摘要**：工具名、finish_reason —— 不含屏幕原文。
+        # detail 带上原文：pydantic 的 json_invalid 会把 input_value 截断成
+        # '...'，现场根本看不出模型到底说了什么，而 with_fallback 正是靠这条
+        # message 上报给用户的。带上原文才算可诊断 —— 但它只进异常 message，
+        # 不进日志（原文里可能有屏幕上的文字）。
+        facts = (
+            f"tool_calls={len(msg.tool_calls or [])}, "
+            f"wrong_tools={sorted(set(wrong_tools))}, "
+            f"finish_reason={getattr(msg, 'response_metadata', {}).get('finish_reason')!r}"
         )
+        detail = f"{facts}, content[:1000]={content[:1000]!r}"
+        if wrong_tools:
+            listed = ", ".join(f"'{n}'" for n in sorted(set(wrong_tools)))
+            reason = (
+                f"you called the tool {listed} but the only tool you may call "
+                f"is '{self._tool_name}' — call '{self._tool_name}' instead"
+            )
+        elif content.strip():
+            reason = (
+                f"your answer was not readable as {self.schema.__name__} — call the "
+                f"'{self._tool_name}' tool instead of writing prose"
+            )
+        else:
+            reason = f"your answer was empty — call the '{self._tool_name}' tool"
+        raise StructuredOutputError(reason=reason, facts=facts, detail=detail)
 
 
 class MiniMaxChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
@@ -784,6 +860,71 @@ def resolve_minimax_effort() -> str | None:
     return None
 
 
+def minimax_model_family(model_name: str) -> str:
+    """从模型名里取出家族号：``MiniMax-M3.1-Flash-Preview`` -> ``m3.1``。
+
+    MiniMax 的模型名是 ``MiniMax-<家族><.小版本>[-后缀]``：``MiniMax-M3``、
+    ``MiniMax-M3.1-Flash``、``MiniMax-M2.7-highspeed``。取 ``MiniMax-`` 之后
+    到下一个 ``-`` 为止的部分就是家族号。
+    """
+    name = (model_name or "").strip().lower()
+    if name.startswith("minimax-"):
+        name = name[len("minimax-") :]
+    return name.split("-", 1)[0]
+
+
+#: **实测**能把思考真正关掉的家族（``thinking.type=disabled`` 生效且不 400）。
+#:
+#: 2026-10-22 真机实测，OpenAI 兼容端点 ``https://api.minimaxi.com/v1``
+#: （探针：mobile-manager/scripts/probe_minimax_thinking.py）：
+#:
+#: ============  =========  ==========================  ======================
+#: 家族          默认        ``thinking.type=disabled``   ``thinking.type=adaptive``
+#: ============  =========  ==========================  ======================
+#: ``m2.x``      思考开      200，但**无效**（思考照旧）   200
+#: ``m3``        思考开      ✅ 200，思考真的关掉了       200
+#: ``m3.1``      强制开      ❌ 400（"requires adaptive"） 200
+#: ============  =========  ==========================  ======================
+#:
+#: 另外 ``thinking.type=enabled``（M2 时代的写法）在 **M3 上直接 400** ——
+#: 只有 ``adaptive`` 和 ``disabled`` 两种取值是 M3 认的。
+#:
+#: 官方文档只覆盖 Anthropic 兼容端点（那里写「MiniMax-M3 省略 thinking 时默认
+#: 关闭」）。本项目用的是 **OpenAI 兼容**端点，实测**默认是开的** —— 以实测为准。
+MINIMAX_THINKING_DISABLEABLE_FAMILIES = frozenset({"m3"})
+
+
+def resolve_minimax_thinking(model_name: str, requested: bool | None) -> dict[str, Any] | None:
+    """把「要不要思考」翻译成 MiniMax 请求体里的 ``thinking`` 片段。
+
+    返回 ``None`` 表示**不发**这个字段（走服务端默认）。
+
+    为什么不能把渠道的开关直接透传给 API：**M3.1 发 ``disabled`` 是硬 400**
+    （每个请求都 400，agent 直接死），M2.x 发 ``disabled`` 是「接受了但没生效」
+    （用户以为关掉了，实际还在思考）。所以这里先看模型家族再决定发不发。
+
+    关不掉的时候**不硬拦**（照常跑），但要**报出来** —— 静默忽略会变成
+    「我明明拨了开关，模型还在思考」。
+    """
+    if requested is None:
+        return None
+    if requested:
+        # ``adaptive`` 是三个家族都认的写法（M3.1 只认 adaptive）。
+        return {"type": "adaptive"}
+
+    family = minimax_model_family(model_name)
+    if family in MINIMAX_THINKING_DISABLEABLE_FAMILIES:
+        return {"type": "disabled"}
+
+    llm_logger.warning(
+        f"渠道里把 {model_name!r} 的思考模式关了，但这个模型关不掉："
+        f"它属于 {family!r} 家族，官方强制开启思考"
+        f"（发 disabled 会直接 400，所以这次没发）。"
+        f"想省 token 得换 MiniMax-M3 —— M3 实测能关。"
+    )
+    return None
+
+
 def get_minimax_llm(
     model_name: str = "MiniMax-M2.7",
     temperature: float = 1,
@@ -791,17 +932,25 @@ def get_minimax_llm(
 ) -> ChatOpenAI:
     """构造 MiniMax 客户端。
 
-    下发 ``output_config.effort``（默认 ``max``）。M3.1-Flash-Preview **关不掉**思考
+    下发 ``output_config.effort``（默认 ``max``）。M3.1-Flash **强制**思考
     （官方：always thinks），只能调深度；这个值决定思考花多少 token 和多少时间。
 
-    这里**不下发** ``thinking`` 参数。M3.1 官方明确 "If type is sent it must be
-    adaptive; disabled returns HTTP 400"，M2.x 则是 "disabled is accepted but
-    ignored" —— 两边都是死开关，发它只会制造 400 风险，没有任何收益。
+    **思考开关**：渠道下发（``thinking``）优先，否则用 ``settings.MINIMAX_THINKING``，
+    都没有就不发这个字段。能不能真关掉**看模型家族**（实测表见
+    :data:`MINIMAX_THINKING_DISABLEABLE_FAMILIES`）：
+
+    * ``MiniMax-M3`` —— **能关**：发 ``{"thinking": {"type": "disabled"}}``，
+      实测 200、回答里没有 ``<think>``、``reasoning_tokens`` 也没有了。
+      顺带把「M3 的思考块写进 content 且经常不闭合」这个解析杀手也解决了。
+    * ``MiniMax-M3.1-Flash`` / ``M2.x`` —— **关不掉**：前者发 ``disabled`` 直接
+      400（"model requires adaptive thinking"），后者接受了也不生效。
+      这两种情况照常跑（不硬拦），但会打一条 warning 说明「这次没关成」。
 
     为什么非要换到 M3.1：真机同批 prompt n=16 实测，M3 会把思考内容写进
     ``content`` 且经常不闭合，``_ToolCallStructuredRunnable._parse`` 靠 ``</think>``
     剥不掉 -> 没有 tool_calls -> "returned no parseable CortexOutput" -> 整个
     goal 崩。M3.1 的思考走独立字段，16 次 ``content`` 里 0 次混入 <think>。
+    （M3 也能解这个问题：把思考关掉就行 —— 见上面的开关。）
     """
     override = override or ProviderOverride()
     api_key = override.key_or("MINIMAX_API_KEY")
@@ -812,6 +961,17 @@ def get_minimax_llm(
     effort = resolve_minimax_effort()
     if effort is not None:
         extra_body["output_config"] = {"effort": effort}
+
+    # 思考开关：渠道下发的优先，其次 settings，再都没有就不发这个字段。
+    # isinstance 检查是为了挡住「settings 被测试打桩成 MagicMock」这种情况 ——
+    # 那时 ``settings.MINIMAX_THINKING`` 是个对象而不是 bool，当作「没设置」。
+    requested_thinking = override.thinking
+    if requested_thinking is None:
+        configured = getattr(settings, "MINIMAX_THINKING", None)
+        requested_thinking = configured if isinstance(configured, bool) else None
+    thinking = resolve_minimax_thinking(model_name, requested_thinking)
+    if thinking is not None:
+        extra_body["thinking"] = thinking
 
     client = MiniMaxChatOpenAI(
         model=model_name,
@@ -951,10 +1111,19 @@ class _SiliconFlowStructuredRunnable(Runnable):
         self._tool = _ToolCallStructuredRunnable(llm, schema, force_tool_choice=False)
 
     def _fail(self, native_error: Exception, tool_error: Exception) -> ValueError:
-        return ValueError(
-            f"SiliconFlow returned no parseable {self.schema.__name__}. "
-            f"json_schema path: {type(native_error).__name__}: {native_error}; "
-            f"tool path: {type(tool_error).__name__}: {tool_error}"
+        # 保住 tool 路径那条路的**可回灌理由**（模型喊错工具名时最关键），
+        # 同时把两条路的原因都留在 detail 里 —— 测试要断言两条都在。
+        reason = getattr(tool_error, "reason", None) or (
+            f"the model did not return a parseable {self.schema.__name__}"
+        )
+        facts = getattr(tool_error, "facts", "") or f"tool path: {type(tool_error).__name__}"
+        return StructuredOutputError(
+            reason=reason,
+            facts=f"{facts}, json_schema path: {type(native_error).__name__}",
+            detail=(
+                f"json_schema path: {type(native_error).__name__}: {native_error}; "
+                f"tool path: {type(tool_error).__name__}: {tool_error}"
+            ),
         )
 
     def invoke(self, input, config=None, **kwargs):
@@ -1072,10 +1241,18 @@ class _LlamaCppStructuredRunnable(Runnable):
         self._tool = _ToolCallStructuredRunnable(llm, schema, force_tool_choice=False)
 
     def _fail(self, native_error: Exception, tool_error: Exception) -> ValueError:
-        return ValueError(
-            f"llama.cpp returned no parseable {self.schema.__name__}. "
-            f"json_schema path: {type(native_error).__name__}: {native_error}; "
-            f"tool path: {type(tool_error).__name__}: {tool_error}"
+        # 同 SiliconFlow：保住 tool 路径那条路的可回灌理由，detail 里留两条路的原因。
+        reason = getattr(tool_error, "reason", None) or (
+            f"the model did not return a parseable {self.schema.__name__}"
+        )
+        facts = getattr(tool_error, "facts", "") or f"tool path: {type(tool_error).__name__}"
+        return StructuredOutputError(
+            reason=reason,
+            facts=f"{facts}, json_schema path: {type(native_error).__name__}",
+            detail=(
+                f"json_schema path: {type(native_error).__name__}: {native_error}; "
+                f"tool path: {type(tool_error).__name__}: {tool_error}"
+            ),
         )
 
     def invoke(self, input, config=None, **kwargs):

@@ -41,6 +41,7 @@ from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import (
+    StructuredOutputError,
     get_structured_llm,
     invoke_llm_with_timeout_message,
 )
@@ -134,9 +135,7 @@ class ExecutorNode:
                 ctx=self.ctx,
                 update={
                     "executor_done": True,
-                    "executor_messages": [
-                        AIMessage(content="no goal was provided, cannot act")
-                    ],
+                    "executor_messages": [AIMessage(content="no goal was provided, cannot act")],
                 },
                 agent="executor",
             )
@@ -183,8 +182,7 @@ class ExecutorNode:
             return await emit(
                 AIMessage(
                     content=(
-                        f"step limit of {MAX_STEPS_PER_SUBGOAL} reached; "
-                        "stopping and reporting"
+                        f"step limit of {MAX_STEPS_PER_SUBGOAL} reached; stopping and reporting"
                     )
                 ),
                 done=True,
@@ -209,9 +207,7 @@ class ExecutorNode:
         # （独立验收 2026-10-21 查出的致命 bug 1）。
         if response.done:
             return await emit(
-                AIMessage(
-                    content=response.done_reason or response.agent_thought or "goal reached"
-                ),
+                AIMessage(content=response.done_reason or response.agent_thought or "goal reached"),
                 done=True,
             )
 
@@ -328,7 +324,7 @@ class ExecutorNode:
         # 其它 provider 保持原样（schema 当工具绑）—— 见 `get_structured_llm`。
         runner = get_structured_llm(ctx=self.ctx, name="executor", schema=ExecutorOutput)
 
-        response = await self._invoke(runner, messages)
+        response, failure_reason = await self._invoke(runner, messages)
 
         # ---- 解析失败 → 带 nudge 重试一次 ----
         #
@@ -343,23 +339,38 @@ class ExecutorNode:
         # ⇒ 这里自己重试一次，并把「你必须调用工具」明确告诉模型；
         # 还不行就降级成「空动作 + 说明」，让流程继续（Reporter 会看到它，
         # 汇报成 failed，Cortex 换招重来）—— 绝不因为一次格式失误就杀掉整个任务。
+        #
+        # 🔴 **2026-10-22：nudge 必须带上「错在哪」。**
+        #
+        # 以前这句是笼统的「Your last answer could not be read」—— 模型不知道自己
+        # 错在哪，就会**换个姿势再犯同一个错**。真机实测（执行 812，快手极速版）：
+        # 模型喊错工具名（`focus_and_input_text` 而不是 `ExecutorOutput`）→ 被
+        # 解析成空动作 → 回灌笼统理由 → **连着 8 轮零动作**，每轮回灌的都是
+        # 同一条无关理由（"you returned an empty action list"）。
+        #
+        # 现在 `failure_reason` 是解析层给的**具体**理由（喊错了哪个工具名 /
+        # 写了散文 / 答案为空），模型能照着改。
         if response is None:
-            logger.warning("[executor] LLM returned no parseable output; retrying once")
+            logger.warning(
+                f"[executor] LLM returned no parseable output ({failure_reason}); retrying once"
+            )
             retry_messages = [
                 *messages,
                 HumanMessage(
                     content=(
-                        "Your last answer could not be read. You must call the "
+                        f"Your last answer could not be used: {failure_reason}. "
+                        "You must call the "
                         "ExecutorOutput tool with the fields (actions, agent_thought, "
                         "done, done_reason). Do not write the output "
                         "as plain text — a plain-text answer is discarded."
                     )
                 ),
             ]
-            response = await self._invoke(runner, retry_messages)
+            response, retry_reason = await self._invoke(runner, retry_messages)
             if response is None:
                 logger.warning(
-                    "[executor] Still unparseable after retry; degrading to an empty "
+                    "[executor] Still unparseable after retry "
+                    f"({retry_reason}); degrading to an empty "
                     "action list so the loop can continue"
                 )
                 response = ExecutorOutput(
@@ -393,11 +404,15 @@ class ExecutorNode:
 
         return response
 
-    async def _invoke(self, runner, messages) -> ExecutorOutput | None:
-        """调一次 LLM；解析失败返回 None（不抛）。
+    async def _invoke(self, runner, messages) -> tuple[ExecutorOutput | None, str | None]:
+        """调一次 LLM；解析失败返回 ``(None, 原因)``（不抛）。
 
-        `with_fallback` 在这里没用：它切到 fallback 模型，但本机 override 里
+        ``with_fallback`` 在这里没用：它切到 fallback 模型，但本机 override 里
         fallback 和主模型常常是同一个模型，重试结果一样。
+
+        第二个返回值是**给模型看的**失败原因（短、能照着改）：解析层已经能分清
+        「喊错了工具名」「写了散文」「答案为空」，这里原样带上去 ——
+        上层才能把它讲回模型，而不是笼统地说「读不懂」。
         """
         try:
             response = await invoke_llm_with_timeout_message(
@@ -405,10 +420,17 @@ class ExecutorNode:
                 agent_name="executor",
                 task_id=self.ctx.trace_id,
             )
+        except StructuredOutputError as e:
+            # 只记 facts（工具名 / finish_reason），**不记 detail** ——
+            # detail 里有模型的原文，屏幕上的文字就是用户数据，不该进日志。
+            logger.warning(f"[executor] structured output unusable: {e.reason} | {e.facts}")
+            return None, e.reason
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[executor] LLM call failed: {type(e).__name__}: {str(e)[:200]}")
-            return None
-        return response if isinstance(response, ExecutorOutput) else None
+            return None, f"{type(e).__name__}: {str(e)[:200]}"
+        if not isinstance(response, ExecutorOutput):
+            return None, f"the answer was not an {ExecutorOutput.__name__} object"
+        return response, None
 
     # 🔴 **2026-10-22 删掉了 `_capture_screenshot`。**
     #
@@ -418,4 +440,3 @@ class ExecutorNode:
     #
     # 现在截图通道整条关掉（见 `agents/executor/types.py` 的说明），
     # 这条路没有消费者了。
-

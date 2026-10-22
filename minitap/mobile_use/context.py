@@ -75,6 +75,23 @@ class ExecutionSetup(BaseModel):
 IsReplan = bool
 
 
+#: 稳定性判据的合法取值。
+_STABILITY_MODES = ("fingerprint", "structural")
+
+
+def _stability_mode_default() -> str:
+    """稳定性判据的默认值 —— 环境变量 ``MOBILE_USE_STABILITY_MODE`` 优先。
+
+    为什么走环境变量：这个开关要能**在不改代码、不改 manager 那一侧**的前提下
+    做真机 A/B（``MOBILE_USE_STABILITY_MODE=structural`` 跑一次，改回去再跑一次）。
+    环境变量里写了非法值就当没写（回落到现行行为），不因为一个环境变量让整轮挂掉。
+    """
+    import os
+
+    value = (os.environ.get("MOBILE_USE_STABILITY_MODE") or "").strip().lower()
+    return value if value in _STABILITY_MODES else "fingerprint"
+
+
 class PerceptionConfig(BaseModel):
     """三条感知通道的开关 + 感知前的沉降等待。
 
@@ -165,6 +182,29 @@ class PerceptionConfig(BaseModel):
     # 最快，但导航场景大概率拿到残缺的表。
     settle_max_retries: int = Field(default=2, ge=0)
 
+    # 稳定性判据用哪一套。
+    #
+    # * ``"fingerprint"``（默认，现行）—— 连续两次**全量树**的指纹相同才算稳。
+    #   指纹含 ``text`` ⇒ 在**视频页**上点赞数/倒计时每秒都在变 ⇒ 永远不等 ⇒
+    #   每次都跑满重试次数，最后还是「判定不稳，照用」。
+    # * ``"structural"`` —— 只比**可交互元素的身份+位置**（不看 text）。
+    #   依据是本仓库已有的结论（``tools/live_target.py``）：
+    #   「OCR 的**内容会变**（点赞数在跳、时钟在走）… **位置比内容稳**」。
+    #
+    # 另：``structural`` 模式把**稳定性采样和建表采样合并**成两次 dump
+    # （现行是 2~3 次稳定性 dump + 1 次建表 dump）。
+    #
+    # 默认值走环境变量 ``MOBILE_USE_STABILITY_MODE`` —— A/B 不用改代码，
+    # 也不用先在 manager 那一侧加字段（runner 那边直接带环境变量就行）。
+    stability_mode: Literal["fingerprint", "structural"] = Field(
+        default_factory=_stability_mode_default
+    )
+
+    # ``structural`` 模式下，两次采样不一致时**额外**补采几次。
+    #
+    # 0 = 不补，直接用最新的一次（最省）。补采也只是「再等一个下限再采一次」，
+    # 因为建表用的截图+OCR 已经和那棵树配对了（索引契约），换树就得重截+重 OCR。
+    stability_extra_dumps: int = Field(default=0, ge=0)
 
     # 是否压缩发给 LLM 的 thoughts 历史。
     #

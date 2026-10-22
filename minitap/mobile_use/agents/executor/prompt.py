@@ -324,6 +324,106 @@ def truncate_local_history(messages: list[AnyMessage]) -> list[AnyMessage]:
     return result
 
 
+#: 模型**唯一**能调用的工具（结构化输出 schema 绑上去的那个）。
+_EXECUTOR_OUTPUT_TOOL = "ExecutorOutput"
+
+
+def rewrite_history_tool_calls(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """把局部历史里 assistant 消息的 tool_calls 改写成「模型当初调的是 ExecutorOutput」。
+
+    为什么必须改
+    ------------
+    **历史是模型下一轮模仿的对象。** 以前历史里的 assistant 消息带着
+    ``{"name": "tap"}`` 这样的**设备工具名** —— 而模型唯一能调的工具是
+    ``ExecutorOutput``。它照着历史学，就学会了喊 ``tap``。
+
+    真机实测（2026-10-22，执行 812 / 快手极速版 / Redmi Turbo 4）：
+    executor 66 次调用里 **37 次**喊错了工具名（tap / wait_for_delay /
+    swipe_percentages / focus_and_input_text …），动作被解析层吞成空动作 →
+    回灌一条无关的拒绝理由 → **连着 8 轮零动作**。
+    对照组：历史里**还没有**设备工具名的那几次，**一次都没错**。
+
+    ⇒ 从源头改写历史，比事后纠正便宜得多（事后纠正 = 多烧一次 LLM 调用）。
+
+    改写后模型看到的是它自己当初的形状::
+
+        assistant: ExecutorOutput(actions=[{"action": "tap", ...}], agent_thought=...)
+        tool:      "Tap on element ... was successful."
+
+    **tool_call_id 一律不动** —— 它是 OpenAI 兼容端点把 AIMessage 和
+    ToolMessage 配对的依据，动了会 400（见 `truncate_local_history` 的说明）。
+    ToolMessage 的 ``name`` 跟着改成同一个名字（配对的是 id，但同名更不容易
+    被端点挑刺）；设备工具名本身没丢 —— 它在 assistant 那边的 ``action`` 里，
+    工具结果正文里也写着。
+    """
+    renamed_ids: set[str] = set()
+    result: list[AnyMessage] = []
+    for message in messages:
+        calls = getattr(message, "tool_calls", None) or []
+        if not calls:
+            result.append(message)
+            continue
+        new_calls: list[dict] = []
+        changed = False
+        for call in calls:
+            name = call.get("name")
+            if not name or name == _EXECUTOR_OUTPUT_TOOL:
+                new_calls.append(call)
+                continue
+            args = dict(call.get("args") or {})
+            thought = args.get("agent_thought") or ""
+            # ``agent_thought`` 只在**顶层**留一份。模型自己产出的
+            # ExecutorOutput 就是这个形状（actions 条目里没有 agent_thought），
+            # 历史必须和它长得一模一样 —— 历史是给模型模仿的，长得不一样
+            # 就是在教它另一种格式。
+            action = {
+                "action": name,
+                **{k: v for k, v in args.items() if k != "agent_thought"},
+            }
+            new_calls.append(
+                {
+                    **call,
+                    "name": _EXECUTOR_OUTPUT_TOOL,
+                    "args": {
+                        "actions": [action],
+                        "agent_thought": thought,
+                    },
+                }
+            )
+            if call.get("id"):
+                renamed_ids.add(call["id"])
+            changed = True
+        if not changed:
+            result.append(message)
+            continue
+        # ⚠️ **同时清掉 additional_kwargs 里的原始 tool_calls**。
+        #
+        # provider 解析出来的 AIMessage 会在 `additional_kwargs["tool_calls"]`
+        # 里留一份**原始**副本。langchain 的转换器优先用 `message.tool_calls`
+        # （见 langchain_openai 的 `_convert_message_to_dict`），所以留着它
+        # 现在不会出错 —— 但那是**两份真值来源**，改一份忘一份就是真 bug。
+        # 改写完就把这份陈旧副本删掉：改写后的 `tool_calls` 是唯一真值。
+        additional = dict(getattr(message, "additional_kwargs", None) or {})
+        additional.pop("tool_calls", None)
+        # model_copy 而不是新建：artifact / response_metadata 都原样带过去，
+        # 不在这里丢信息。
+        result.append(
+            message.model_copy(update={"tool_calls": new_calls, "additional_kwargs": additional})
+        )
+
+    if not renamed_ids:
+        return result
+    # ToolMessage 的 name 跟 assistant 那边的工具名对齐。
+    return [
+        (
+            m.model_copy(update={"name": _EXECUTOR_OUTPUT_TOOL})
+            if isinstance(m, ToolMessage) and (m.tool_call_id or "") in renamed_ids
+            else m
+        )
+        for m in result
+    ]
+
+
 def build_executor_messages(
     *,
     ctx: MobileUseContext,
@@ -381,7 +481,11 @@ def build_executor_messages(
     #
     # 工具结果在这一步按需截断（L5）：局部历史是唯一随步数线性增长的一段，
     # 而过长的一条结果能把这整段历史撑爆。**只截成功结果，错误逐字保留。**
-    messages.extend(truncate_local_history(local_messages))
+    #
+    # ⚠️ **顺序：先截断，后改写。** 截断要靠**原工具名**判断载荷豁免
+    # （`_PAYLOAD_TOOLS`），改写之后名字变成 `ExecutorOutput`，豁免就失效了
+    # —— 载荷类工具的结果会被截掉，等于把模型要读的东西本身丢了。
+    messages.extend(rewrite_history_tool_calls(truncate_local_history(local_messages)))
 
     # ↓↓↓ 这三个块都是「每轮变」的，必须排在局部历史之后 ↓↓↓
     #

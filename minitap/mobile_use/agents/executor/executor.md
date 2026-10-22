@@ -154,6 +154,11 @@ as plain text - a text answer is rejected and the round is wasted. Fields:
 `actions` (always a list, required unless `done`), `agent_thought`, `done`,
 `done_reason` (when `done`).
 
+**`ExecutorOutput` is the only tool you can call.** The device tools listed
+above are not callable by you - their names go INSIDE an `actions` entry as
+`"action": "<tool name>"`. Calling `tap` (or any other name from the table)
+directly is wrong: that call is discarded and the whole round is wasted.
+
 When the goal is reached - note that `actions` is empty and the reason carries
 the evidence:
 
@@ -165,8 +170,9 @@ the evidence:
 ```
 
 If you cannot decide what to do next, say so honestly in `agent_thought` and
-leave `actions` empty - but still call the tool. An empty `actions` is a valid
-answer; a text paragraph is not.
+still call the tool - but put a concrete action in it. An empty `actions` list
+with `done` false is treated as "you did not decide" and comes straight back
+to you; a text paragraph is not accepted either.
 
 ---
 

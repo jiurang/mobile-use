@@ -54,10 +54,18 @@ class Settings(BaseSettings):
     #
     # 只对 M3.1-Flash-Preview 有意义；M2.x 会忽略，M3 不认这个字段。
     MINIMAX_EFFORT: str | None = "max"
-    # 注意这里**没有** thinking 开关。M3.1 是 always thinks，官方明确
-    # "If type is sent it must be adaptive; disabled returns HTTP 400" ——
-    # 留一个能设成 disabled 的旋钮就是个地雷：谁设了就是每个请求 400。
-    # M2.x 那边官方写 "disabled is accepted but ignored"，同样是死开关。
+    # 「要不要思考」。None = 不下发 = 走模型自己的默认。
+    #
+    # **能不能真关掉看模型家族**（2026-10-22 真机实测，OpenAI 兼容端点）：
+    #   MiniMax-M3       → 能关：发 ``{"thinking": {"type": "disabled"}}``，
+    #                       实测 200、回答里没有 <think>、reasoning_tokens 归零。
+    #   MiniMax-M3.1-Flash → 关不掉：官方强制思考，发 disabled 直接 400
+    #                       （"model requires adaptive thinking"）。
+    #   M2.x              → 关不掉：disabled 被接受但不生效。
+    # 完整实测表见 services/llm.py 的 MINIMAX_THINKING_DISABLEABLE_FAMILIES。
+    #
+    # 渠道下发的 thinking 优先于它（见 services/llm.py 的 ProviderOverride）。
+    MINIMAX_THINKING: bool | None = None
 
     # DeepSeek's OpenAI-compatible endpoint (domestic platform, platform.deepseek.com).
     # /v1 is accepted too, so both spellings work; we default to the documented one.
@@ -246,11 +254,13 @@ class LLM(BaseModel):
     #:
     #: 为什么是**布尔**而不是一段自由 JSON：每个 provider 的思考开关在请求体里的
     #: 形状都不一样（llama.cpp 是 ``chat_template_kwargs.enable_thinking``，
-    #: deepseek 是 ``thinking.type``），那是**provider 的知识**，该待在 provider 的
+    #: minimax 是 ``thinking.type``），那是**provider 的知识**，该待在 provider 的
     #: 工厂里，不该由渠道去猜。渠道只表达「开」还是「关」。
     #:
-    #: 目前只有 ``llamacpp`` 消费它（见 ``get_llamacpp_llm``）；其它 provider 收到也
-    #: 忽略 —— 「一个开关对某些供应商无效」比「每个供应商一套请求体形状」好维护。
+    #: 消费它的 provider：``llamacpp``（见 ``get_llamacpp_llm``）和 ``minimax``
+    #: （见 ``get_minimax_llm``，只有 MiniMax-M3 真能关，M3.1 / M2.x 关不掉）。
+    #: 其它 provider 收到也忽略 —— 「一个开关对某些供应商无效」比「每个供应商
+    #: 一套请求体形状」好维护。
     thinking: bool | None = None
 
     #: 缺密钥 / 缺端点时，允不允许从设备本地的环境（.env）里补。

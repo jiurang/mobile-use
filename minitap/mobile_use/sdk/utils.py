@@ -129,7 +129,8 @@ def llm_config_for_single_model(
             .env，症状是「我明明选了 A，跑起来是 B」且不报错。
         temperature: 温度。None 表示沿用各 agent 调用点的硬编码值。
         thinking: 「要不要思考」。None 表示沿用该 provider 自己的默认。
-            只有 llamacpp 这类「思考链会吃光 token 预算」的 provider 消费它。
+            llama.cpp 和 minimax 消费它（MiniMax 那边只有 MiniMax-M3 真能关，
+            M3.1 / M2.x 官方强制思考、关不掉）。
 
     Raises:
         ValueError: provider/model 缺失，或 provider 需要密钥而 api_key 为空。

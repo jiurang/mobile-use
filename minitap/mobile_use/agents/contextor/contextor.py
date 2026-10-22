@@ -25,7 +25,12 @@ from minitap.mobile_use.utils.screen_elements import (
     build_screen_elements,
     foreground_package_from_tree,
 )
-from minitap.mobile_use.utils.screen_stability import is_stable, tree_fingerprint
+from minitap.mobile_use.utils.screen_stability import (
+    is_stable,
+    structural_change_count,
+    structural_digest,
+    tree_fingerprint,
+)
 from minitap.mobile_use.utils.ui_hierarchy_view import normalize_hierarchy
 
 logger = get_logger(__name__)
@@ -69,7 +74,26 @@ class ContextorNode:
         # 一样（91 个元素）但 228 才是完整的 ⇒ 稳定确认**会漏判**这种情况。
         # 这是已知代价，验收看「步数 / 失败目标数」，不看「点错率」。
         await self._wait_for_settle(state)
-        await self._confirm_tree_stable(device_controller, state)
+
+        # ---- 稳定性采样 ----
+        #
+        # * ``fingerprint``（默认，现行）：连续两次**全量树** dump 比指纹。
+        # * ``structural``：**只采一次**，这次采样当「结构基线」；真正的比对放在
+        #   建表那次 dump 之后（``get_screen_data`` 自带一次树 dump）⇒
+        #   常态 **2 次 dump**（现行 3~4 次）。
+        #
+        # 为什么要合并：现行路径把稳定性确认的采样**扔掉**，然后 ``get_screen_data``
+        # 又 dump 一次建表 —— 同一棵屏被抓两遍。视频页上更贵：全量指纹含 text，
+        # 点赞数每秒在跳 ⇒ 永远判不稳 ⇒ 3 次采样全跑满，最后还是「照用」。
+        stability_sample: list[dict] | None = None
+        if self._structural_mode():
+            stability_sample = await device_controller.get_hierarchy_only()
+            if not stability_sample:
+                logger.warning(
+                    "[contextor] Structural stability: could not sample the tree; skipping check"
+                )
+        else:
+            await self._confirm_tree_stable(device_controller, state)
 
         # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。
         #
@@ -140,6 +164,16 @@ class ContextorNode:
         if not ocr_done:
             # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
             ocr_box.append(await self._run_ocr(device_data.base64))
+
+        # 结构稳定性判定（``structural`` 模式）：基线 = 上面那次采样，
+        # 当前 = 建表用的这棵树（``get_screen_data`` 自带的那次 dump）。
+        if stability_sample is not None:
+            await self._verify_structural_stability(
+                device_controller=device_controller,
+                state=state,
+                baseline=stability_sample,
+                current=cast(list[dict], device_data.elements),
+            )
 
         # 前台包名：**从刚抓回来的树里推**，不再单独跑一次
         # `dumpsys window | grep mCurrentFocus`（那是 127ms 的串行 adb 往返，
@@ -249,6 +283,79 @@ class ContextorNode:
         )
         await asyncio.sleep(remaining)
         return remaining
+
+    def _structural_mode(self) -> bool:
+        """走不走「结构摘要」这套 video-safe 判据。"""
+        return getattr(self.ctx.perception, "stability_mode", "fingerprint") == "structural"
+
+    async def _verify_structural_stability(
+        self,
+        *,
+        device_controller,
+        state: State,
+        baseline: list[dict],
+        current: list[dict],
+    ) -> bool:
+        """结构摘要判稳（video-safe）。
+
+        为什么视频页必须换判据
+        ----------------------
+        现行指纹含 ``text``。**视频页每秒都在变** —— 点赞数、倒计时、进度、
+        推荐流内容 ⇒ 指纹**永远不相等** ⇒ ``_confirm_tree_stable`` 每次都跑满
+        重试次数，最后还是「判定不稳，照用」：**三倍的 dump，换同一个结果**。
+
+        新判据只比「**可交互元素的身份 + 位置**」，**不看内容**。依据是本仓库
+        已经写下的结论（``tools/live_target.py``）：
+
+            OCR 的**内容会变**（点赞数在跳、时钟在走）
+            **位置比内容稳**
+
+        视频页上这套判据会怎么判
+        ----------------------
+        * 点赞数 / 倒计时在跳 → 那些 text 变了，但**身份+位置没变** → **判稳** ✓
+        * 视频画面在动 → 画面不是可交互元素 → 摘要不变 → **判稳** ✓
+        * 弹窗 / 翻页 → 可交互元素增删或位移 → 摘要变 → **判不稳** ✓
+          （要挡的正是这个 —— 过渡态的按钮位置还没最终确定）
+        * 懒加载控件挂上 → 可交互元素变多 → 摘要变 → **判不稳** → 补采一次 ✓
+
+        判不稳时为什么可以照用
+        --------------------
+        执行时是**按 resource-id 重新定位**的（``tools/live_target.py``）：元素
+        挪了位置也能点对；元素真没了，live_target 会给出精确失败原因（"不再在屏
+        上"而不是"指错了"），让模型重读屏幕。所以「位置没定下来」不是致命的，
+        致命的是「模型报了一个屏上根本没有的东西」—— 那和稳不稳无关。
+        """
+        changed = structural_change_count(baseline, current)
+        if changed == 0:
+            logger.info(
+                "[contextor] Structure stable (video-safe digest): "
+                f"{len(current)} elements, interactive structure unchanged"
+            )
+            return True
+
+        extra = getattr(self.ctx.perception, "stability_extra_dumps", 0)
+        previous = current
+        for attempt in range(extra):
+            delay_ms = self.ctx.perception.settle_delay_ms
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
+            sample = await device_controller.get_hierarchy_only()
+            if not sample:
+                break
+            if structural_change_count(previous, sample) == 0:
+                logger.info(
+                    f"[contextor] Structure stable after {attempt + 1} extra dump(s) "
+                    f"({changed} interactive element(s) had changed)"
+                )
+                return True
+            previous = sample
+
+        logger.info(
+            "[contextor] Interactive structure still changing "
+            f"({changed} element(s)); proceeding with the latest capture "
+            "(execution re-resolves by resource-id)"
+        )
+        return False
 
     async def _confirm_tree_stable(self, device_controller, state: State) -> bool:
         """确认这一屏已经定下来 —— 连续两次树级 dump 的指纹相同。
