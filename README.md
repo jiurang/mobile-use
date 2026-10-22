@@ -106,6 +106,28 @@ Mobile-use runs on your own Android or iOS device with your choice of supported 
     >
     > `temperature` only has an effect in non-thinking mode.
 
+    **Using SiliconFlow (硅基流动):**
+
+    [SiliconFlow](https://cloud.siliconflow.cn/) serves Qwen / DeepSeek / GLM / Kimi and other models over an OpenAI-compatible API at `https://api.siliconflow.cn/v1`. To use it:
+
+    1. Set `SILICONFLOW_API_KEY` in your `.env` (optionally `SILICONFLOW_BASE_URL` to point at `https://api.siliconflow.com/v1` instead)
+    2. Copy the contents of the `siliconflow` preset object from `llm-config.defaults.jsonc` into your `llm-config.override.jsonc`, or set `"provider": "siliconflow"` on individual agent nodes.
+
+    > [!IMPORTANT]
+    > **This platform has no model that can do all three at once** — see the screenshot, call a tool, *and* answer with a structured object. The capability matrix below was measured against the live API (2026-10-21):
+    >
+    > | model | sees images | tool calls | `json_schema` output |
+    > |---|---|---|---|
+    > | `zai-org/GLM-4.5V` | ✅ | ✅ | ❌ `400 Json mode is not supported` |
+    > | `Qwen/Qwen3-VL-32B-Instruct` | ✅ | ❌ empty answer | ✅ |
+    > | `Qwen/Qwen3-VL-8B-Instruct` | ✅ | ❌ empty answer | ✅ |
+    > | `Qwen/Qwen2.5-72B-Instruct` | ❌ | ✅ | ✅ |
+    > | `Qwen/Qwen2.5-7B-Instruct` | ❌ | ✅ | ✅ |
+    >
+    > So the vision roles have to be split: **`executor` → `GLM-4.5V`** (it clicks, so it needs eyes *and* tool calls), **`cortex` → `Qwen3-VL`** (it reads the screen and answers with a structured decision), everything else → a text model. Pointing both at the same model breaks one of them.
+    >
+    > Two more measured facts: the vision models reject a **forced** `tool_choice` (`400 Specifying functions for tool_choice is not yet supported`) — which is why structured output goes out as `response_format` first, with a tool-call retry as the second path; and `temperature` accepts 0..2, so `hopper`'s hardcoded `0` keeps working.
+
     **Using Anthropic Claude:**
 
     [Anthropic](https://www.anthropic.com/) provides Claude — a capable, safety-focused model family. To use it:
