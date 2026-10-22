@@ -107,7 +107,7 @@ flowchart TD
 | **Orchestrator** | 验收里程碑、决定重规划 | `subgoal_plan` `complete_subgoals_by_ids` `agents_thoughts` | `subgoal_plan` `complete_subgoals_by_ids`(清空) `agents_thoughts` | ✅ | 只在有完成上报时 |
 | **Contextor** | 看屏（感知） | `last_action_at` | `latest_screen_elements` `latest_ocr_results` `latest_screenshot` `latest_ui_hierarchy` `screen_state` `focused_app_info` `device_date` | ❌（仅 app-lock 分支会） | ✅ 每轮 |
 | **Cortex** | 决定下一步动作 | 感知块 + `agents_thoughts` + `subgoal_plan_log` + `executor_messages` | `structured_decisions` `complete_subgoals_by_ids` `agents_thoughts` `cortex_last_thought` | ✅ | ✅ 每轮 |
-| **Executor** | 把决策落成工具调用 | `structured_decisions` `cortex_last_thought` `executor_messages` | `executor_messages` `cortex_last_thought` | ⚠️ 默认**不调**（直连），兜底才调 | ✅ 每轮 |
+| **Executor** | 把决策落成工具调用 | `structured_decisions` `cortex_last_thought` `executor_messages` `latest_screen_elements` `latest_ocr_results` `latest_screenshot` | `executor_messages` `cortex_last_thought` `executor_wants_screenshot` | ⚠️ 默认**不调**（直连），兜底才调 | ✅ 每轮 |
 | **Summarizer** | 裁剪历史 | `messages` | `messages` | ❌ | ✅ 每轮 |
 | **Outputter** | 生成最终结构化输出 | `initial_goal` `agents_thoughts` `messages` | —（不改 State） | ✅ | ❌ 图外 |
 | **Hopper** | 把人类可读 app 名 → 真机包名 | — | — | ✅ | ❌ 被 `launch_app` 工具内部调用 |
@@ -355,7 +355,8 @@ Cortex decided"。
 | `latest_screen_elements` | contextor→cortex→executor | **不清空**（索引契约，见下） |
 | `latest_ocr_results` | contextor→cortex→executor | **不清空**（同上） |
 | `latest_ui_hierarchy` | contextor→cortex | **清空**（工具侧现取即可） |
-| `latest_screenshot` | contextor→cortex | **清空**（不重复传 base64） |
+| `latest_screenshot` | contextor→executor | **不清空**（Executor 的图片通道要它；图和元素表是同一次抓屏的产物） |
+| `executor_wants_screenshot` | executor→executor | **换子目标时清空**（Cortex 下发新目标时）—— 上一目标那句「我要看图」指的是那一屏 |
 | `failed_targets` | 工具层 | 熔断器 + 提示词素材 |
 
 **"索引契约"是一处精妙的设计**（`cortex.py:422-433` 的注释）：Cortex 看到的元素表里

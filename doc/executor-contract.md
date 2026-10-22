@@ -357,8 +357,19 @@ ExecutorNode.__call__(state):
      用 _ToolCallStructuredRunnable(llm, ExecutorOutput) 拿结构化输出
      （**不要** bind_tools 那 16 个设备工具！详见 services/llm.py:529）
   4. response: ExecutorOutput
-  5. if response.need_screenshot and 没截过图:
-        抓图 → 追加截图消息 → **同一轮再问一次**（照搬 cortex.py:392-398 的做法）
+  5. if response.need_screenshot:
+        **先扣下这一轮的动作**（它此刻只有元素表+OCR，给出的动作是猜的，
+        猜错的那一下可能是「确认支付」）→ 回灌一条 HumanMessage，
+        graph 走 retry 边回 executor（屏幕没变 ⇒ 不重新抓屏）
+        记进 `state.executor_wants_screenshot` ⇒ **下一轮**的 prompt 末尾
+        附当屏截图（**不是**同一轮再问一次 —— 那次二问要白烧一次 LLM 调用）
+        图和元素表是同一次抓屏的产物 ⇒ 编号契约不受影响
+        图通道由 Manager 侧 `perception.screenshot` 控制（**三态字符串枚举**）：
+        `"on_demand"`（默认，Executor 自己决定）/ `"always"`（每轮都带）/ `"off"`（永远不给）。
+        ⚠️ `"off"` 时**图不留任何痕迹**：提示词里没有图相关的词，schema 里也没有
+        `need_screenshot` 字段（模型看不到的东西，不该让它以为有）。
+        老 bool 仍收：`True` → `"on_demand"`、`False` → `"off"`。
+        ⚠️ 「看过图还举手」= 图没帮上忙 ⇒ 不再扣动作（否则无限循环）
   6. 动作转换：
         decisions_json = json.dumps(response.actions, ensure_ascii=False)
         tool_calls = dispatch_decisions(decisions_json, default_thought=response.agent_thought, tools=tools)
@@ -639,7 +650,7 @@ class ReporterSummary(BaseModel):
 | T10 | dispatcher 拒绝理由回灌 | Executor 输出未知工具名 → 拒绝理由出现在下一轮 prompt 里 |
 | T11 | dispatcher 只吃数组 | `actions` 恒为 list；单元素数组也能直连 |
 | **T12** | **元素表在 prompt 末尾** | 断言 Executor prompt 里元素表出现在局部历史**之后** |
-| **T13** | **感知通道没丢** | ExecutorOutput 有 `need_screenshot`；`executor.md` 含截图说明 + 设备状态 |
+| **T13** | **感知通道没丢** | ExecutorOutput 有 `need_screenshot`；`executor.md` 含截图说明 + 设备状态；三条通道由 `perception` 开关控制 |
 
 ---
 
