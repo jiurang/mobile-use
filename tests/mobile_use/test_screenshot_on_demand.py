@@ -4,9 +4,14 @@
 
 1. **通道三态** —— `True`（每轮带图）/ `False`（不带）/ `"on_demand"`（按需）。
    默认是 `"on_demand"`：截图是最贵、且**永远不可缓存**的那一块。
-2. **要不要补图** —— 纯函数 `should_request_screenshot`。
-3. **prompt 渲染** —— 三种模式下给模型看的「当前通道」文案必须对；
-   `"on_demand"` 不能显示成 `enabled`（模型会以为图已经在手里）。
+2. **谁来要图** —— 2026-10-21「Executor 自主执行」改造后，要图的是
+   **Executor**（`ExecutorOutput.need_screenshot`），不再是 Cortex。
+   Cortex 已经不看屏了（感知全部下沉给 Executor），所以它没有这个字段。
+3. **prompt 渲染** —— `executor.md` 必须说清「什么时候要图」和「要了会给图」。
+
+⚠️ 改造前这个文件测的是 cortex 的 `should_request_screenshot`，
+那套机制随 Cortex 不再看屏一起删掉了（`cortex.py` 里不再有这个函数）。
+截图按需的能力**没有丢**，只是换了主人 —— 现在在 Executor 侧。
 """
 
 from __future__ import annotations
@@ -16,17 +21,16 @@ from pathlib import Path
 import pytest
 from jinja2 import Environment, StrictUndefined
 
-from minitap.mobile_use.agents.cortex.cortex import should_request_screenshot
-from minitap.mobile_use.agents.cortex.types import CortexOutput
+from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import PerceptionConfig
 
-CORTEX_MD = (
+EXECUTOR_MD = (
     Path(__file__).resolve().parents[2]
     / "minitap"
     / "mobile_use"
     / "agents"
-    / "cortex"
-    / "cortex.md"
+    / "executor"
+    / "executor.md"
 )
 
 
@@ -59,121 +63,65 @@ class TestScreenshotMode:
         assert p.ui_hierarchy and p.ocr
 
 
-class TestShouldRequestScreenshot:
-    def _resp(self, *, need: bool = True, decisions: str | None = None) -> CortexOutput:
-        return CortexOutput(need_screenshot=need, decisions=decisions)
+class TestExecutorOwnsTheScreenshotChannel:
+    """要图的能力搬到了 Executor 侧 —— 锁住它没丢。"""
 
-    def test_asks_again_when_model_cannot_decide(self):
-        assert should_request_screenshot(self._resp(), on_demand=True, has_screenshot=True)
+    def test_executor_output_has_need_screenshot(self):
+        """Executor 的输出模型必须带 `need_screenshot`。"""
+        assert "need_screenshot" in ExecutorOutput.model_fields
 
-    def test_no_ask_when_model_already_decided(self):
-        """模型给出了动作就别补图 —— 补了只会打乱它的判断。"""
-        assert not should_request_screenshot(
-            self._resp(decisions='[{"action":"tap"}]'), on_demand=True, has_screenshot=True
-        )
+    def test_need_screenshot_defaults_to_false(self):
+        """默认不要图 —— 图是最贵的一块，不能每轮都带。"""
+        assert ExecutorOutput(actions=[]).need_screenshot is False
 
-    def test_no_ask_when_model_did_not_request(self):
-        assert not should_request_screenshot(
-            self._resp(need=False), on_demand=True, has_screenshot=True
-        )
+    def test_need_screenshot_alone_is_a_legal_answer(self):
+        """「我要图」是**合法应答**，不是错误。
 
-    def test_no_ask_in_always_screenshot_mode(self):
-        """老模式每轮都带图，没有「再问一次」这回事。"""
-        assert not should_request_screenshot(self._resp(), on_demand=False, has_screenshot=True)
+        2026-10-21 真机踩出来的：模型只置 `need_screenshot`、没给动作时，
+        旧 cortex 的空响应校验会直接抛 "empty response" → 整轮失败 →
+        agent 在原地白烧步数（实测 51 步没跑完）。
 
-    def test_no_ask_without_a_screenshot(self):
-        """contextor 没抓到图，补不了。"""
-        assert not should_request_screenshot(self._resp(), on_demand=True, has_screenshot=False)
+        新架构里 `ExecutorOutput` 是 pydantic 模型，`need_screenshot=True`
+        + 空 actions 是**合法构造**，不会抛。
+        """
+        out = ExecutorOutput(actions=[], need_screenshot=True)
+        assert out.need_screenshot is True
+        assert out.actions == []
 
+    def test_cortex_no_longer_owns_the_screenshot_channel(self):
+        """Cortex 已经不看屏了，不该再有 `need_screenshot` 字段。"""
+        from minitap.mobile_use.agents.cortex.types import CortexOutput
 
-class TestEmptyResponseIsNotAnErrorWhenAskingForScreenshot:
-    """「我要图」是**合法应答**，不是空响应错误。
-
-    这条是 2026-10-21 真机踩出来的：模型只置 `need_screenshot`、没给决策也没给
-    理由时，`_invoke_cortex` 的空响应校验会直接抛 "Cortex LLM returned an empty
-    response" → 整轮失败 → agent 在原地白烧步数（实测 51 步没跑完）。
-    """
-
-    def test_need_screenshot_alone_is_not_empty(self):
-        from minitap.mobile_use.agents.cortex.cortex import _invoke_cortex
-
-        class _Ctx:
-            trace_id = "t1"
-
-        class _Resp:
-            decisions = None
-            decisions_reason = None
-            goals_completion_reason = None
-            complete_subgoals_by_ids = []
-            need_screenshot = True
-
-        class _Llm:
-            async def ainvoke(self, messages, **kwargs):
-                return _Resp()
-
-        import asyncio
-
-        result = asyncio.run(
-            _invoke_cortex(_Llm(), [], _Ctx(), set())  # type: ignore[arg-type]
-        )
-        assert result.need_screenshot is True
-
-    def test_truly_empty_response_still_raises(self):
-        """真·空响应（连图都不要）仍然要报错。"""
-        from minitap.mobile_use.agents.cortex.cortex import _invoke_cortex
-
-        class _Ctx:
-            trace_id = "t1"
-
-        class _Resp:
-            decisions = None
-            decisions_reason = None
-            goals_completion_reason = None
-            complete_subgoals_by_ids = []
-            need_screenshot = False
-
-        class _Llm:
-            async def ainvoke(self, messages, **kwargs):
-                return _Resp()
-
-        import asyncio
-        import pytest as _pytest
-
-        with _pytest.raises(ValueError, match="empty response"):
-            asyncio.run(
-                _invoke_cortex(_Llm(), [], _Ctx(), set())  # type: ignore[arg-type]
-            )
+        assert "need_screenshot" not in CortexOutput.model_fields
+        assert "decisions" not in CortexOutput.model_fields
 
 
 class TestPromptRendering:
-    def _render(self, perception) -> str:
+    def _render(self) -> str:
         env = Environment(undefined=StrictUndefined, autoescape=False)
-        return env.from_string(CORTEX_MD.read_text(encoding="utf-8")).render(
+        return env.from_string(EXECUTOR_MD.read_text(encoding="utf-8")).render(
             platform="android",
             executor_tools_list="tap",
-            locked_app_package=None,
-            perception=perception,
+            goal="读出当前连接的 Wi-Fi 名称",
         )
 
-    def test_on_demand_is_labelled_correctly(self):
-        out = self._render(PerceptionConfig(screenshot="on_demand"))
-        assert "Screenshot: on demand" in out
-        # 绝不能显示成 enabled —— 模型会以为图已经在手里
-        assert "Screenshot: enabled" not in out
+    def test_prompt_explains_the_on_demand_mechanism(self):
+        """必须说清：什么时候置 need_screenshot、要了会给图。"""
+        out = self._render()
+        assert "need_screenshot" in out
+        assert "asked again" in out or "asked once more" in out or "given one screenshot" in out
 
-    def test_enabled_and_disabled_labels(self):
-        assert "Screenshot: enabled" in self._render(PerceptionConfig(screenshot=True))
-        assert "Screenshot: DISABLED" in self._render(PerceptionConfig(screenshot=False))
+    def test_prompt_explains_the_screen_may_be_asleep(self):
+        """息屏时截图全黑、元素表只剩残留 —— 必须告诉模型怎么应对。"""
+        out = self._render()
+        assert "wake_screen" in out
+        assert "OFF" in out or "asleep" in out
 
-    def test_on_demand_explains_the_mechanism(self):
-        out = self._render(PerceptionConfig(screenshot="on_demand"))
-        assert "Need Screenshot" in out
-        assert "on demand" in out
+    def test_prompt_tells_the_model_not_to_ask_every_round(self):
+        """「Ask for it only when you really cannot decide」—— 不能每轮都要图。"""
+        out = self._render()
+        assert "Ask for it only" in out or "only when" in out
 
-    def test_output_table_lists_the_new_field(self):
-        out = self._render(PerceptionConfig(screenshot="on_demand"))
-        assert "**Need Screenshot**" in out
-
-    def test_always_mode_does_not_mention_on_demand_section(self):
-        out = self._render(PerceptionConfig(screenshot=True))
-        assert "You will then be given\none screenshot" not in out
+    def test_output_table_lists_the_field(self):
+        out = self._render()
+        assert "need_screenshot" in out

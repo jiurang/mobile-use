@@ -9,12 +9,19 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
+from langgraph.graph import END, START, StateGraph
 
 from minitap.mobile_use.services import llm as llm_module
-from minitap.mobile_use.utils.llm_usage import extract_usage
+from minitap.mobile_use.utils.llm_usage import extract_usage, record_raw_response
+
+
+class _GraphState(TypedDict):
+    """最小 graph state —— 只为测「节点边界」。"""
+
+    value: int
 
 
 class _Obj:
@@ -123,17 +130,21 @@ class TestInvokeRecordsUsage:
         契约变更（2026-10-21）
         --------------------
         原来这里记 0，理由是「provider 根本没回报 usage，不是我们丢的」。但
-        **「provider 没报」和「我们没拿到」在实现上分不开**，而在 headless
-        路径上后者是常态：`_record_usage` 在 LangGraph 的图里压根收不到响应
-        （ContextVar 跨不过图的任务上下文），于是**每一行都记成 0** ——
-        「成本核算的唯一数据源」于是把每次调用都算成免费。
+        **「provider 没报」和「我们没拿到」在实现上分不开**，所以改成
+        **读不到就不报这一行**。
+
+        ⚠️ 2026-10-21 更正：本段原来写着「`_record_usage` 在 LangGraph 的图里
+        压根收不到响应（ContextVar 跨不过图的任务上下文）」「图里的 usage 由
+        `services/usage_bridge.py` 的 graph-config callback 上报」——
+        **两处都是假的**：`usage_bridge.py` 从未存在；捕获槽装的是同一个 list
+        对象，跨图可见。真机 graph 实测（`probe_out/executor_e2e.json`）：
+        executor 21 次调用 / 120,772 input / 65,672 cached，全是真实非零值。
+        当时「每一行都是 0」的真因是客户端没开 `stream_usage=True`，
+        已在 `services/llm.py` 修好。
 
         现在的口径与 manager 一致（`manager-server` 的 api-contract.md：
         「整次执行没有上报过 usage 时这些字段全是 null——『没上报』不等于
         『零消耗』」）：**读不到就不报这一行**。
-
-        图里的 usage 由 `services/usage_bridge.py` 的 graph-config callback
-        上报（那条路在 TUI / 安卓服务 / manager 上都已验证可行）。
         """
 
         async def call():
@@ -174,3 +185,98 @@ class TestInvokeRecordsUsage:
         assert result is not None
         assert len(captured) == 1
         assert captured[0]["duration_seconds"] >= 0
+
+
+class TestUsageSurvivesGraphBoundary:
+    """**图内的 LLM 调用也必须上报真实 token**（不许记 0）。
+
+    这条锁的是一个被反复转述、却从没被验证过的结论。仓库里曾到处写着：
+
+        「在 LangGraph 的图里那个捕获槽根本收不到东西（ContextVar 跨不过图的
+         任务上下文），图里的 usage 由 `services/usage_bridge.py` 的 graph-config
+         callback 上报。」
+
+    两处都是假的：
+
+    * `services/usage_bridge.py` **从未存在**（git 全历史无此文件）；
+    * 捕获槽**跨得过去** —— 槽里装的是**同一个 list 对象**，LangGraph 的节点
+      任务继承父 context，append 外面看得到。
+
+    当时「每一行都记成 0」的真因是客户端没开 ``stream_usage=True``
+    （provider 压根没报 usage），不是 ContextVar。
+
+    代价很实在：照那条结论去实现，图里的成本数据全是 0 ⇒ 缓存命中率算不出来
+    ⇒ §11.2 的验收判据直接失效。所以这里用最小 LangGraph 把它钉死。
+
+    真机侧佐证：`probe_out/executor_e2e.json`（真机 graph 运行）里
+    executor 21 次调用 / 120,772 in / 65,672 cached / 18,114 out 全是真实值。
+    """
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        events: list[dict] = []
+
+        def fake_capture(**kwargs):
+            events.append(kwargs)
+
+        monkeypatch.setattr(llm_module.telemetry, "capture_llm_usage", fake_capture)
+        return events
+
+    @staticmethod
+    def _raw_response() -> Any:
+        """一条带 usage 的原始响应（provider 的真实形状）。"""
+        return _Obj(usage_metadata={"input_tokens": 1234, "output_tokens": 56})
+
+    def test_graph_node_records_real_tokens(self, captured):
+        """节点里经 graph 调 LLM ⇒ 上报**非零** token。"""
+
+        async def call():
+            record_raw_response(self._raw_response())
+            # 返回体**身上没有** usage —— 和 with_structured_output 一样，
+            # usage 只藏在原始响应里。这正是最容易被误判成「读不到」的那一格。
+            return {"parsed": "yes"}
+
+        async def node(state):
+            await llm_module.invoke_llm_with_timeout_message(
+                call(), agent_name="executor", task_id="t1"
+            )
+            return {"value": state["value"] + 1}
+
+        async def run():
+            g = StateGraph(_GraphState)
+            g.add_node("n", node)
+            g.add_edge(START, "n")
+            g.add_edge("n", END)
+            await g.compile().ainvoke({"value": 0}, config={"recursion_limit": 10})
+
+        asyncio.run(run())
+
+        assert len(captured) == 1, "图内调用没有上报 —— 埋点在图边界上断了"
+        assert captured[0]["input_tokens"] == 1234
+        assert captured[0]["output_tokens"] == 56
+        assert captured[0]["agent"] == "executor"
+
+    def test_graph_node_records_real_tokens_when_result_carries_usage(self, captured):
+        """结果自带 usage_metadata 时同样上报（对照形态）。"""
+
+        async def call():
+            record_raw_response(self._raw_response())
+            return self._raw_response()
+
+        async def node(state):
+            await llm_module.invoke_llm_with_timeout_message(
+                call(), agent_name="cortex", task_id="t1"
+            )
+            return {"value": state["value"] + 1}
+
+        async def run():
+            g = StateGraph(_GraphState)
+            g.add_node("n", node)
+            g.add_edge(START, "n")
+            g.add_edge("n", END)
+            await g.compile().ainvoke({"value": 0}, config={"recursion_limit": 10})
+
+        asyncio.run(run())
+
+        assert len(captured) == 1
+        assert captured[0]["input_tokens"] == 1234

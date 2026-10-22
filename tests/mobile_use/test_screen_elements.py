@@ -13,7 +13,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from minitap.mobile_use.services.ocr.types import OcrText
+from minitap.mobile_use.tools.types import Target
+from minitap.mobile_use.tools.utils import resolve_target
 from minitap.mobile_use.utils.screen_elements import (
     build_screen_elements,
     render_screen_elements,
@@ -354,3 +358,244 @@ def test_rendered_id_is_absent_for_unique_labelled_rows():
     )
     rendered = render_screen_elements(build_screen_elements(tree, None))
     assert "id=" not in rendered.splitlines()[-1]
+
+
+# --------------------------------------------------------------------------
+# 8. 「纯装饰行」裁不裁？（降本：元素表是 executor prompt 里最大的不可缓存块）
+#
+# 候选判据：「不可交互（flags 里没有 C/L/F/K/S）+ 无文字（label 和 text 都空）」
+# 的行看着像纯浪费 —— 实测 113 行的屏里 42% 是这种。
+#
+# **实测结论：不裁。** 真机逐个点过（Redmi Turbo 4，12 个 App 页面，
+# 126 行候选逐个 adb 点）：**17 行（13.5%）点了之后屏幕真的变了**。
+# 命中的都是模型会想点的东西 —— 小米天气的 7 天预报图标、城市切换块、
+# 淘宝的搜索框、小红书的卡片。原因很直白：那些 App 用 Canvas / 自定义 View
+# 画可点区域，dump 里既没有 clickable 也没有文字，
+# 「没有交互标记」根本推不出「点它没反应」。
+#
+# 三个「退一步」的收窄判据实测下来**各裁 0 行**（82 行候选里最小面积
+# 845px²，没有一个「小到不可能是点击目标」；82 行全都带 id；
+# 层级树拍平后没有一行是别人的几何父容器）—— 不存在「只裁一部分」的落点。
+#
+# 所以下面这几条不是「裁剪的实现」，是**把「不裁」这个决定锁住**，
+# 免得以后有人凭直觉再加一次裁剪。细节见
+# `utils/screen_elements.py` 的模块文档不变量 #8。
+# --------------------------------------------------------------------------
+
+
+def _decor_node(resource_id: str = "com.app:id/decor_container", bounds: str = "[0,60][100,110]"):
+    """一行「纯装饰」：有 id、有坐标，但没文字、也没任何交互标记。"""
+    return _node(text="", resource_id=resource_id, bounds=bounds)
+
+
+def test_decorative_row_is_not_dropped():
+    """T26：不可交互 + 无文字的行**不裁**。
+
+    真机实测：这类行里有 13.5% 是真能点的（Canvas / 自定义 View 画的可点区域，
+    dump 里既没有 clickable 也没有文字）。裁掉等于让模型点不到它们。
+
+    这条测试的作用是**锁住「不裁」这个决定**。
+    """
+    tree = normalize_hierarchy(
+        [
+            _node(text="热门", resource_id="com.app:id/tab", bounds="[0,0][100,50]"),
+            _decor_node(),
+        ]
+    )
+    elements = build_screen_elements(tree, None)
+
+    assert len(elements) == 2
+    assert any(e.resource_id == "com.app:id/decor_container" for e in elements)
+    # 它还在提示里 —— 而且 id 尾段是模型认出「这是个可点的东西」的唯一线索
+    assert "decor_container" in render_screen_elements(elements)
+    assert [
+        e.display_id for e in elements if e.resource_id.endswith("decor_container")
+    ] == ["decor_container"]
+
+
+def test_interactive_row_without_text_is_kept():
+    """没有文字但**可交互**的行必须留着 —— 图标按钮就是这种。
+
+    它是模型唯一能点的目标，裁掉等于让图标按钮点不到。
+    """
+    tree = normalize_hierarchy(
+        [
+            _node(
+                text="",
+                resource_id="com.app:id/icon_btn",
+                bounds="[0,60][100,110]",
+                clickable="true",
+            )
+        ]
+    )
+    elements = build_screen_elements(tree, None)
+
+    assert len(elements) == 1
+    assert elements[0].resource_id == "com.app:id/icon_btn"
+    assert "C" in elements[0].flags
+
+
+def test_scrollable_row_without_text_is_kept():
+    """R（scrollable）算可交互。
+
+    `agents/executor/executor.md` 里给模型的说明写着
+    「`R` scrollable (**use its bounds for swipes**)」—— 模型靠 R 行的
+    bounds 决定往哪划。R 行往往没有文字（那是个纯滚动容器），
+    当装饰裁掉就等于把「这片能滚」和它的边界一起删了。
+    """
+    # RecyclerView 在 uiautomator 里是 scrollable=true
+    raw = [
+        {
+            "text": "",
+            "content-desc": "",
+            "resource-id": "com.app:id/list",
+            "class": "androidx.recyclerview.widget.RecyclerView",
+            "bounds": "[0,60][100,110]",
+            "clickable": "false",
+            "long-clickable": "false",
+            "focusable": "false",
+            "checkable": "false",
+            "selected": "false",
+            "scrollable": "true",
+            "enabled": "true",
+            "visible-to-user": "true",
+        }
+    ]
+    elements = build_screen_elements(normalize_hierarchy(raw), None)
+
+    assert len(elements) == 1
+    assert "R" in elements[0].flags
+
+
+def test_non_interactive_row_with_text_is_kept():
+    """T27：不可交互但**有文字**的行要留着 —— 它是模型的上下文。
+
+    模型靠这些行读懂屏幕（「热门」「同城」是标签还是按钮）。
+    裁掉它们等于让模型看不见屏幕上的字。
+    """
+    tree = normalize_hierarchy(
+        [
+            _node(text="热门", resource_id="com.app:id/a", bounds="[0,0][100,50]"),
+            _node(text="同城", resource_id="com.app:id/b", bounds="[0,60][100,110]"),
+        ]
+    )
+    elements = build_screen_elements(tree, None)
+
+    assert [e.label for e in elements] == ["热门", "同城"]
+    # 它们确实不可交互（没有 C/L/F/K/S/R）
+    assert all(not (set(e.flags) & set("CLFKSR")) for e in elements)
+
+
+def test_ocr_row_is_never_dropped():
+    """T28：OCR 行永远不裁。
+
+    OCR 引擎不给交互标记（flags 恒空），所以「flags 空 = 不可交互」
+    这条推论**对 OCR 行是错的**。它有文字，本来就留得住 —— 但这里
+    显式守住，免得以后的改动一脚踩进来。
+    """
+    tree = normalize_hierarchy(
+        [
+            _decor_node(),
+            _node(text="热门", resource_id="com.app:id/a", bounds="[0,120][100,170]"),
+        ]
+    )
+    elements = build_screen_elements(tree, [_ocr("热搜", 0, 200)])
+
+    ocr_rows = [e for e in elements if e.kind == "ocr"]
+    assert len(ocr_rows) == 1
+    assert ocr_rows[0].text == "热搜"
+    # OCR 行没有交互标记 —— 正因为如此，它绝不能被当成装饰
+    assert ocr_rows[0].flags == ""
+
+
+def test_index_is_consistent_with_the_table():
+    """T29：编号自洽 —— 表里的 `[i]` 和表里的第 i 行对得上。
+
+    模型报 `[i]`、工具 `resolve_target` 按同一个下标找元素，
+    两边看的必须是**同一张表**（`state.latest_screen_elements`）。
+    """
+    tree = normalize_hierarchy(
+        [
+            _decor_node(bounds="[0,0][100,50]"),
+            _node(text="热门", resource_id="com.app:id/a", bounds="[0,60][100,110]"),
+            _decor_node(resource_id="com.app:id/decor2", bounds="[0,120][100,170]"),
+            _node(text="同城", resource_id="com.app:id/b", bounds="[0,180][100,230]"),
+        ]
+    )
+    elements = build_screen_elements(tree, [_ocr("热搜", 0, 260)])
+    rendered = render_screen_elements(elements)
+
+    # 编号连续、1-based、不跳号
+    assert [e.index for e in elements] == list(range(1, len(elements) + 1))
+
+    for element in elements:
+        # 渲染出来的 [i] 就是这一行的编号
+        assert f"[{element.index}]" in rendered
+        # 工具侧按同一个编号解析回**同一个**元素
+        assert resolve_screen_index(elements, element.index) is element
+        # 解析到别的行 = 编号错位
+        if element.index > 1:
+            assert resolve_screen_index(elements, element.index - 1) is not element
+
+
+def test_resolve_target_uses_the_same_numbering_as_the_rendered_table():
+    """T29 续：模型报 `[i]` → 工具 `resolve_target` 解析到同一个元素。"""
+    tree = normalize_hierarchy(
+        [
+            _decor_node(bounds="[0,0][100,50]"),
+            _node(text="热门", resource_id="com.app:id/a", bounds="[0,60][100,110]"),
+        ]
+    )
+    elements = build_screen_elements(tree, None)
+    state = SimpleNamespace(latest_screen_elements=elements, latest_ocr_results=[])
+
+    # 装饰行也在表里（不裁）→ 它按阅读顺序排在第 1 行，「热门」是第 2 行
+    assert [e.label for e in elements] == ["", "热门"]
+
+    target, error = resolve_target(state, Target(index=2))
+    assert error is None
+    assert target.text == "热门"
+    assert target.bounds == elements[1].bounds
+
+    # 越界仍然不静默
+    _, error = resolve_target(state, Target(index=3))
+    assert error is not None
+    assert "index=3" in error
+
+
+def test_ocr_index_branch_is_unaffected():
+    """T30：`resolve_target` 的 `ocr_index` 分支不受元素表裁剪的影响。
+
+    两条路径：
+    1. 有元素表 → `ocr_index` 是 `index` 的别名（同一个编号空间）
+    2. 没有元素表（iOS / 云设备）→ `ocr_index` 索引 `latest_ocr_results`，
+       这是改造前的行为，元素表怎么裁都碰不到它
+    """
+    # ---- 路径 1：有表 ----
+    tree = normalize_hierarchy(
+        [
+            _decor_node(bounds="[0,0][100,50]"),
+            _node(text="热门", resource_id="com.app:id/a", bounds="[0,60][100,110]"),
+        ]
+    )
+    elements = build_screen_elements(tree, [_ocr("热搜", 0, 120)])
+    state = SimpleNamespace(latest_screen_elements=elements, latest_ocr_results=[])
+
+    # 装饰行、UI 行、OCR 行共用一套编号：1 / 2 / 3
+    assert [e.label for e in elements] == ["", "热门", "热搜"]
+
+    target, error = resolve_target(state, Target(ocr_index=3))
+    assert error is None
+    assert target.text == "热搜"
+
+    # ---- 路径 2：没有表 ----
+    ocr = [
+        OcrText(text="9:33", score=0.9, bounds=ElementBounds(x=79, y=16, width=99, height=94)),
+        OcrText(text="热搜", score=0.8, bounds=ElementBounds(x=10, y=20, width=50, height=20)),
+    ]
+    legacy_state = SimpleNamespace(latest_screen_elements=None, latest_ocr_results=ocr)
+
+    target, error = resolve_target(legacy_state, Target(ocr_index=2))
+    assert error is None
+    assert target.text == "热搜"
+    assert target.bounds == ocr[1].bounds

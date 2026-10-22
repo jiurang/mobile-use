@@ -91,18 +91,23 @@ def test_single_model_helper_is_the_same_as_base_without_overrides():
 
 
 def test_all_role_names_matches_the_config_shape():
-    """角色清单和 LLMConfig 的形状必须对得上：少一个就有一个角色落回默认模型。"""
+    """角色清单和 LLMConfig 的形状必须对得上：少一个就有一个角色落回默认模型。
+
+    2026-10-21：新增 `reporter`（Executor 自主执行改造的汇报角色，
+    见 doc/executor-autonomy-plan.md §2.1.1）。
+    """
     assert set(ALL_ROLE_NAMES) == {
         "planner",
         "orchestrator",
         "contextor",
         "cortex",
         "executor",
+        "reporter",
         "outputter",
         "hopper",
         "video_analyzer",
     }
-    assert len(ALL_ROLE_NAMES) == 8
+    assert len(ALL_ROLE_NAMES) == 9
 
 
 # ---------------------------------------------------------------------------
