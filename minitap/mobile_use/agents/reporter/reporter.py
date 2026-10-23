@@ -68,7 +68,11 @@ REPORTER_PROMPT_PATH = Path(__file__).parent / "reporter.md"
 # ⚠️ 2026-10-21 从 400 提到 1600：证据现在有**两段**（动作结果 + 屏幕可见文字），
 # 400 装不下屏幕那一段 —— 装不下就等于没给（而「没给」正是重发的根因）。
 # Cortex 的 prompt 本来只有 ~1,341 tok，多这 ~400 tok 完全扛得住。
-MAX_EVIDENCE_LEN = 1600
+#
+# ⚠️ 2026-10-24 从 1600 提到 2400：屏幕那一段现在最多 1600 字符
+# （`MAX_SCREEN_EVIDENCE_CHARS`），动作结果那截也得留得下 ——
+# 两段加起来超了要**砍动作结果，不砍屏幕文字**（见 `compose_evidence`）。
+MAX_EVIDENCE_LEN = 2400
 
 # 动作参数在汇报里最多留多长（同一个理由）。
 MAX_ARGS_LEN = 200
@@ -507,8 +511,86 @@ def last_tool_result(messages: list[AnyMessage] | None) -> str | None:
 # ⇒ 修法：**零成本、零 LLM、零额外抓屏** —— 只是把已经在手边的文字搬进汇报。
 
 
-MAX_SCREEN_EVIDENCE_CHARS = 900
-MAX_SCREEN_EVIDENCE_LINES = 25
+# 证据里「屏幕可见文字」最多留多长。
+#
+# 🔴 **2026-10-24：去掉了「前 N 行」的截断**（原来是
+# ``MAX_SCREEN_EVIDENCE_LINES = 25``，只取元素表的**头 25 行**）。
+#
+# 真机实测（mobile-manager execution 853，Redmi Turbo 4）：小米应用商城
+# 「番茄畅听」详情页的元素表有 **152 行**，主按钮「打开」在**第 141 行**
+# ⇒ 前 25 行里根本没有它 ⇒ 汇报给 Cortex 的证据里没有「打开」
+# ⇒ Cortex 读不到「按钮显示打开」，**正确地拒绝**了这次汇报（它原话：
+# "it never shows the detail-page button reading 打开/已安装… The 安装 text
+# visible belongs to the recommended app 番茄音乐"）⇒ 改下一个**难十倍**的
+# 子目标（去全部应用列表找图标）⇒ 执行器掉进 MIUI 看点浮层陷阱
+# ⇒ 原地打转 16 分钟、67.9 万 token。
+#
+# ⚠️ 那一屏实测：84 个带文字的元素、去重后 75 条、**全量只有 827 字符** ——
+# **字符预算（900）本来就装得下，砍掉的其实是行数。** ⇒ 按字符定预算就够。
+# ���在留 1600 是给更长的页留余量。
+MAX_SCREEN_EVIDENCE_CHARS = 1600
+
+
+def _screen_texts(state: State) -> list[str]:
+    """这一屏所有**看得见且不重复**的文字，按屏序（从上到下）。
+
+    ⚠️ 去重按**原文**：「打开」和「打开 」是两条不同的视觉事实，合并掉就是丢事实。
+    """
+    lines: list[str] = []
+    for element in state.latest_screen_elements or []:
+        text = (element.label or element.text or "").strip()
+        if text and text not in lines:
+            lines.append(text)
+
+    if not lines:
+        for ocr in state.latest_ocr_results or []:
+            text = (ocr.text or "").strip()
+            if text and text not in lines:
+                lines.append(text)
+
+    return lines
+
+
+def _join_within_budget(lines: list[str], budget: int, sep: str = " | ") -> str:
+    """把若干段文字拼起来；超预算就**保首尾**、中段省略。
+
+    ⚠️ **砍尾巴是错的**（2026-10-24，execution 853）：主操作按钮几乎总在**屏底**
+    （那一屏的「打开」在第 141/152 行）。砍掉尾巴 = 证据里没有主按钮 =
+    supervisor 核实不了 = 它拒绝并换一个更难的目标 = 执行器掉进死胡同。
+
+    ⇒ 宁可中间少几行，也**必须保住尾部**，并且**明说**省略了多少条
+    （不装成「全都看到了」）。
+
+    Args:
+        lines: 要拼的片段（按顺序）。
+        budget: 字符预算。
+        sep: 片段之间的分隔符。
+    """
+    joined = sep.join(lines)
+    if len(joined) <= budget:
+        return joined
+
+    def take(source: list[str], from_end: bool, room: int) -> list[str]:
+        picked: list[str] = []
+        used = 0
+        for line in reversed(source) if from_end else source:
+            cost = len(line) + len(sep)
+            if used + cost > room:
+                break
+            picked.append(line)
+            used += cost
+        return list(reversed(picked)) if from_end else picked
+
+    room = max(budget - 40, 1)  # 给省略标记留位置
+    head = take(lines, False, room // 2)
+    tail = take([ln for ln in lines if ln not in head], True, room - room // 2)
+    if not head and not tail:
+        # 一条就超预算（极端情况）⇒ 只能硬切，但至少保住尾巴
+        return joined[-budget:]
+
+    omitted = len(lines) - len(head) - len(tail)
+    marker = f"{sep}…（中间 {omitted} 条省略）…{sep}"
+    return f"{sep.join(head)}{marker}{sep.join(tail)}"
 
 
 def visible_screen_text(state: State) -> str | None:
@@ -516,27 +598,16 @@ def visible_screen_text(state: State) -> str | None:
 
     优先用元素表里的 ``label``（UI 节点的可见文字），没有就用 OCR 的 ``text``。
     两边都空才返回 None（那说明这一屏确实没文字可报，比如纯图标界面）。
+
+    🔴 **取「屏上有什么」，不取「前 N 行」**（2026-10-24，execution 853）：
+    按行数截会把**屏底的主操作按钮**砍掉 —— supervisor 因此核实不了、
+    拒绝汇报、换一个更难的目标，执行器就掉进死循环。详见
+    :data:`MAX_SCREEN_EVIDENCE_CHARS` 上面那段。
     """
-    lines: list[str] = []
-    for element in state.latest_screen_elements or []:
-        text = (element.label or element.text or "").strip()
-        if text and text not in lines:
-            lines.append(text)
-        if len(lines) >= MAX_SCREEN_EVIDENCE_LINES:
-            break
-
-    if not lines:
-        for ocr in state.latest_ocr_results or []:
-            text = (ocr.text or "").strip()
-            if text and text not in lines:
-                lines.append(text)
-            if len(lines) >= MAX_SCREEN_EVIDENCE_LINES:
-                break
-
+    lines = _screen_texts(state)
     if not lines:
         return None
-    joined = " | ".join(lines)
-    return joined[:MAX_SCREEN_EVIDENCE_CHARS]
+    return _join_within_budget(lines, MAX_SCREEN_EVIDENCE_CHARS)
 
 
 def compose_evidence(action_result: str | None, screen_text: str | None) -> str | None:
@@ -544,11 +615,19 @@ def compose_evidence(action_result: str | None, screen_text: str | None) -> str 
 
     两段都要：**动作结果**说「我做了什么」，**屏幕文字**说「因此看到了什么」。
     只给前者，Cortex 判不了（见上面的根因）。
+
+    ⚠️ 超预算时**只砍动作结果那截**，屏幕文字那段一个字节都不动 ——
+    主按钮在屏底（execution 853），砍它等于把「按钮显示打开」从证据里抹掉。
     """
     parts = [p for p in (action_result, screen_text) if p]
     if not parts:
         return None
-    return "\n".join(parts)[:MAX_EVIDENCE_LEN]
+    joined = "\n".join(parts)
+    if len(joined) <= MAX_EVIDENCE_LEN:
+        return joined
+    room = MAX_EVIDENCE_LEN - len(screen_text or "")
+    head = (action_result or "")[: max(room, 0)]
+    return "\n".join([head, screen_text or ""]).strip()
 
 
 def _normalize(text: str) -> str:

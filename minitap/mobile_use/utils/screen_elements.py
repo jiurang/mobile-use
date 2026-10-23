@@ -351,3 +351,57 @@ def resolve_screen_index(
         )
         return None
     return elements[index - 1]
+
+
+# ---------------------------------------------------------------------------
+# 「这一屏上看得见什么」的两个原语（2026-10-24）
+# ---------------------------------------------------------------------------
+#
+# 为什么需要：执行器的**局部历史**里只有「调用」和「工具回执」
+# （「Key Home pressed successfully.」），**没有「结果」** —— 屏幕长什么样、
+# 前台 app 是谁，一概没记。执行器于是每轮只能拿当屏去和自己脑子里的几十条
+# 记忆比，靠「我刚才按了 Home，画面变了吗」这种回忆来判断自己有没有在原地
+# 打转。实测（execution 853）：它把 Home 按了 13 次，每一次都以为 Home 会
+# 回到桌面。
+#
+# ⇒ 把「结果」搬进历史。这里的两个原语就是搬它要用的那两样东西。
+
+
+def visible_texts(elements: list[ScreenElement] | None) -> list[str]:
+    """这一屏**看得见且不重复**的文字，按屏序（从上到下）。
+
+    ⚠️ 去重按**原文**：「打开」和「打开 」是两条不同的视觉事实，合并掉就是丢事实。
+    """
+    out: list[str] = []
+    for element in elements or []:
+        text = (element.label or element.text or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+#: **纯数字/标点的短文本** —— 状态栏的时钟（``2:24``）、电量（``96 4``）这类
+#: **自己就会变**的东西。不归一的话，「内容变了」永远成立，任何「没进展」的
+#: 判据都不会触发。
+#:
+#: ⚠️ **只认纯数字标点，绝不碰带文字的**（2026-10-24 实测踩过）：
+#: 一开始把**所有**数字都归一成 ``#``，结果「视频标题1 → 视频标题2」也被归成
+#: 同一个 ⇒ **刷短视频（正常浏览）被误判成「屏幕内容没变」**。
+#: ⇒ 归一的范围必须窄到只覆盖真正的噪音。
+_NOISE_ONLY = re.compile(r"^[\d\s:：%/.\-+]{1,8}$")
+
+
+def is_noise_text(text: str) -> bool:
+    """这段文字是不是「自己会变」的噪音（时钟/电量/百分比）。"""
+    return bool(_NOISE_ONLY.match(text.strip()))
+
+
+def screen_fingerprint(elements: list[ScreenElement] | None) -> frozenset[str]:
+    """这一屏的**内容指纹** —— 用来判断「内容和上一屏比变了没」。
+
+    只有**纯数字/标点的短文本**被归一（见 :func:`is_noise_text`）；
+    带文字的一律按**原文**算（「视频标题1」和「视频标题2」是不同的内容）。
+    """
+    return frozenset(
+        "#noise#" if is_noise_text(text) else text for text in visible_texts(elements)
+    )

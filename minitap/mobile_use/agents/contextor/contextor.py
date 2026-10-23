@@ -38,6 +38,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from minitap.mobile_use.agents.contextor.types import AppLockVerificationOutput, ContextorOutput
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.controllers.controller_factory import create_device_controller
 from minitap.mobile_use.controllers.platform_specific_commands_controller import (
     get_device_date,
@@ -54,6 +55,9 @@ from minitap.mobile_use.utils.screen_elements import (
     ScreenElement,
     build_screen_elements,
     foreground_package_from_tree,
+    is_noise_text,
+    screen_fingerprint,
+    visible_texts,
 )
 from minitap.mobile_use.utils.screen_stability import (
     is_stable,
@@ -63,6 +67,95 @@ from minitap.mobile_use.utils.screen_stability import (
 from minitap.mobile_use.utils.ui_hierarchy_view import normalize_hierarchy
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 「上一步的结果」—— 把它写进执行器的局部历史（2026-10-24）
+# ---------------------------------------------------------------------------
+#
+# 🔴 **为什么**（真机 execution 853，Redmi Turbo 4）
+#
+# 执行器的局部历史里只有**调用**和**工具回执**：
+#
+#     assistant: ExecutorOutput(actions=[{"action":"press_key","key":"Home"}], ...)
+#     tool:      Key Home pressed successfully.
+#
+# **「结果」一个字都没有** —— 屏幕长什么样、前台 app 是谁，一概没记。
+# 执行器于是每轮只能拿当屏去和自己脑子里的几十条记忆比，靠「我刚才按了 Home，
+# 画面变了吗」这种**回忆**判断自己有没有在原地打转。
+#
+# 实测：它把 Home 按了 **13 次**，每一次都以为 Home 会回到桌面（因为历史里
+# 「按了 Home」后面跟的永远是「按成功了」，没有任何东西说「屏幕还是那个」）。
+#
+# ⚠️ **这里只陈述事实，不下结论。**
+# 「这个动作没用」是**相对于目标**的判断，框架做不了 ——
+# 「Home 把我送到看点流」和「滑动让我看到下一个视频」在框架眼里一模一样
+# （同一个 app、动作重复、屏在变）。只有模型知道「我要的是应用抽屉」。
+# ⇒ 框架只负责把**事实**搬进历史，判定留给模型（提示词那一侧配套要求
+# 「先说上一步的结果」）。
+#
+# ⇒ 也因此**不做「重复 N 次 ⇒ 你该换招了」这种提醒**：
+# 刷短视频时连滑 10 次是在正常浏览，提醒它「无效」就是误伤。
+
+
+def render_action_result(
+    *,
+    previous_elements: list[ScreenElement] | None,
+    previous_app: str | None,
+    current_elements: list[ScreenElement] | None,
+    current_app: str | None,
+    max_new_texts: int = 6,
+) -> str | None:
+    """一句话描述「上一步那个动作之后，屏变成了什么样」。
+
+    两样事实，**都是屏上的客观状态**：
+      1. **前台 app** 变了没有、变成了谁；
+      2. **屏幕内容** 变了没有、**新出现了哪些文字**。
+
+    ⚠️ 不说「有没有进展」—— 那是相对目标的判断，框架不知道目标。
+    ⚠️ 不说「你重复了几次」—— 「重复」本身不是「无效」（刷短视频就是重复的）。
+
+    Returns:
+        渲染好的一行；没有可比的前一屏时返回 None（第一次抓屏没有「上一步」）。
+    """
+    if not previous_elements and previous_app is None:
+        # 没有前一屏 ⇒ 没有「上一步」可谈
+        return None
+
+    parts: list[str] = []
+
+    # ---- 1. 前台 app ----
+    if previous_app != current_app:
+        if current_app:
+            parts.append(f"前台应用变成了 {current_app}")
+        else:
+            parts.append("前台应用读不到了")
+    elif current_app:
+        parts.append(f"前台应用没变（还是 {current_app}）")
+
+    # ---- 2. 屏幕内容 ----
+    prev_fp = screen_fingerprint(previous_elements)
+    cur_fp = screen_fingerprint(current_elements)
+    prev_texts = set(visible_texts(previous_elements))
+    # 新出现的文字 = 原文差集里**非噪音**的那些（时钟/电量不算「新内容」）
+    new_texts = [
+        t
+        for t in visible_texts(current_elements)
+        if t not in prev_texts and not is_noise_text(t)
+    ]
+    if prev_fp == cur_fp:
+        parts.append("屏幕内容没变")
+    elif new_texts:
+        shown = "、".join(new_texts[:max_new_texts])
+        if len(new_texts) > max_new_texts:
+            shown += f" 等 {len(new_texts)} 条"
+        parts.append(f"屏幕上新出现了：{shown}")
+    else:
+        parts.append("屏幕内容变了（没有新的可读文字）")
+
+    if not parts:
+        return None
+    return "[上一步的结果] " + "；".join(parts)
 
 
 class ContextorNode:
@@ -277,25 +370,46 @@ class ContextorNode:
         # （tools/utils.py:384-398），那边**不用改**。
         # 这里是「不猜」：猜错就是静默剥夺别的平台的感知能力。
 
+        # ---- 「上一步的结果」写进执行器的局部历史 ----
+        #
+        # 局部历史原来只有「调用 + 工具回执」，**没有结果**（见
+        # ``render_action_result`` 上面那段）。这里把客观事实补进去，
+        # 执行器下一轮就能读到「我刚才那一步之后，屏变成什么样」。
+        #
+        # ⚠️ 只有**已经执行过动作**才有「上一步」—— 第一次抓屏时不写。
+        # ⚠️ 这是 executor 的局部历史，跟着子目标走（Cortex 下发新目标时清空）。
+        # ⚠️ getattr 兜底：测试替身（精简过的 state）可能没这两个字段 ——
+        # 和上面 perception 那段同一个理由：不猜，直接当成「没有上一屏」。
+        result_line = render_action_result(
+            previous_elements=getattr(state, "latest_screen_elements", None),
+            previous_app=getattr(state, "focused_app_info", None),
+            current_elements=screen_elements,
+            current_app=current_app_package,
+        )
+
+        update: dict[str, Any] = {
+            # 索引契约本身，**不能被清空**：工具要把 Target.index 还原成
+            # 当屏那一行的真实坐标，只有这一次裁剪的结果算数。
+            # 下一次 contextor 会整体覆盖它。
+            "latest_screen_elements": screen_elements,
+            # 建完表就清空层级树：它没有索引契约，工具侧走
+            # controller.get_ui_elements() 现取即可。留着它会让工具侧
+            # 按 id / 文字查找的分支复活（tools/utils.py:178,197）——
+            # 那是行为变更，不在本次范围内。
+            "latest_ui_hierarchy": None,
+            "latest_ocr_results": ocr_results,
+            "focused_app_info": current_app_package,
+            "screen_size": (device_data.width, device_data.height),
+            "device_date": device_date,
+            "screen_state": screen_state,
+            "agents_thoughts": [agent_outcome],
+        }
+        if result_line:
+            update[EXECUTOR_MESSAGES_KEY] = [HumanMessage(content=result_line)]
+
         return await state.asanitize_update(
             ctx=self.ctx,
-            update={
-                # 索引契约本身，**不能被清空**：工具要把 Target.index 还原成
-                # 当屏那一行的真实坐标，只有这一次裁剪的结果算数。
-                # 下一次 contextor 会整体覆盖它。
-                "latest_screen_elements": screen_elements,
-                # 建完表就清空层级树：它没有索引契约，工具侧走
-                # controller.get_ui_elements() 现取即可。留着它会让工具侧
-                # 按 id / 文字查找的分支复活（tools/utils.py:178,197）——
-                # 那是行为变更，不在本次范围内。
-                "latest_ui_hierarchy": None,
-                "latest_ocr_results": ocr_results,
-                "focused_app_info": current_app_package,
-                "screen_size": (device_data.width, device_data.height),
-                "device_date": device_date,
-                "screen_state": screen_state,
-                "agents_thoughts": [agent_outcome],
-            },
+            update=update,
             agent="contextor",
         )
 

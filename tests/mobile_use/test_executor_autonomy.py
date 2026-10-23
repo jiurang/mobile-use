@@ -1843,6 +1843,143 @@ def test_t33c_no_visible_text_means_no_evidence_fabrication():
 
 
 # ---------------------------------------------------------------------------
+# T37 —— 证据**不许按「前 N 行」截**（2026-10-24 真机 execution 853）
+# ---------------------------------------------------------------------------
+#
+# 小米应用商城「番茄畅听」详情页：元素表 **152 行**，主按钮「打开」在**第 141 行**。
+# 旧实现只取前 25 行 ⇒ 证据里没有「打开」⇒ Cortex 读不到「按钮显示打开」
+# ⇒ **正确地**拒绝汇报 ⇒ 改下一个难十倍的目标 ⇒ 执行器掉进 MIUI 看点浮层陷阱
+# ⇒ 原地打转 16 分钟、67.9 万 token。
+#
+# 实测那一屏全量只有 827 字符 ⇒ **字符预算本来够，砍掉的是行数**。
+
+
+def _long_detail_page(middle_rows: int = 140) -> list:
+    """复刻那个详情页的形状：顶部标题 + 一堆推荐位 + **屏底的主按钮**。"""
+    elements = [
+        ScreenElement(
+            index=1,
+            kind="ui",
+            label="北京臻鼎科技有限公司",
+            bounds=ElementBounds(x=339, y=115, width=465, height=59),
+            flags="CF",
+        ),
+        ScreenElement(
+            index=2,
+            kind="ui",
+            label="已通过安全检测",
+            bounds=ElementBounds(x=339, y=186, width=282, height=58),
+            flags="CF",
+        ),
+    ]
+    for i in range(middle_rows):
+        elements.append(
+            ScreenElement(
+                index=3 + i,
+                kind="ui",
+                label=f"推荐应用{i}",
+                bounds=ElementBounds(x=280, y=500 + i * 10, width=500, height=60),
+                flags="CF",
+            )
+        )
+    # 屏底：主操作按钮 —— 旧实现在这里被砍掉了
+    elements.append(
+        ScreenElement(
+            index=3 + middle_rows,
+            kind="ui",
+            label="打开",
+            bounds=ElementBounds(x=141, y=2501, width=938, height=124),
+            flags="",
+        )
+    )
+    return elements
+
+
+def test_t37_evidence_keeps_the_bottom_action_button():
+    """🔴 **核心断言**：屏底的主按钮必须进证据。
+
+    少了它 ⇒ supervisor 核实不了 ⇒ 拒绝 ⇒ 换成更难的目标 ⇒ 死循环（853）。
+    """
+    from minitap.mobile_use.agents.reporter.reporter import (
+        compose_evidence,
+        visible_screen_text,
+    )
+
+    state = State(
+        **{
+            **_initial_state(),
+            "latest_screen_elements": _long_detail_page(),
+        }
+    )
+
+    screen = visible_screen_text(state)
+    assert screen is not None
+    assert "打开" in screen, f"屏底的主按钮被砍掉了：{screen[-200:]}"
+    assert "北京臻鼎科技有限公司" in screen, "屏顶也不该丢"
+
+    evidence = compose_evidence("已成功点击元素 [1]", screen)
+    assert evidence is not None
+    assert "打开" in evidence
+
+
+def test_t37b_short_screens_are_not_truncated_at_all():
+    """短屏（绝大多数）⇒ **一字不落地**给出去。"""
+    from minitap.mobile_use.agents.reporter.reporter import visible_screen_text
+
+    state = State(
+        **{
+            **_initial_state(),
+            "latest_screen_elements": [
+                ScreenElement(
+                    index=i + 1,
+                    kind="ui",
+                    label=f"第{i}行",
+                    bounds=ElementBounds(x=0, y=i * 10, width=100, height=10),
+                    flags="",
+                )
+                for i in range(20)
+            ],
+        }
+    )
+
+    screen = visible_screen_text(state)
+    assert screen is not None
+    for i in range(20):
+        assert f"第{i}行" in screen, f"第{i}行不见了"
+
+
+def test_t37c_over_budget_keeps_both_ends_and_says_how_many_were_dropped():
+    """超预算 ⇒ **保首尾** + **明说**省略了多少条（不装成「全都看到了」）。"""
+    from minitap.mobile_use.agents.reporter.reporter import (
+        MAX_SCREEN_EVIDENCE_CHARS,
+        visible_screen_text,
+    )
+
+    state = State(
+        **{
+            **_initial_state(),
+            "latest_screen_elements": [
+                ScreenElement(
+                    index=i + 1,
+                    kind="ui",
+                    label=f"很长的一行文字{i}" + "x" * 60,
+                    bounds=ElementBounds(x=0, y=i * 10, width=100, height=10),
+                    flags="",
+                )
+                for i in range(80)
+            ],
+        }
+    )
+
+    screen = visible_screen_text(state)
+    assert screen is not None
+    assert len(screen) <= MAX_SCREEN_EVIDENCE_CHARS + 60, "超预算了没裁"
+    assert "省略" in screen, "省略了多少条要说清楚"
+    assert "很长的一行文字0" in screen, "开头要保住"
+    assert "很长的一行文字79" in screen, "**结尾要保住** —— 主按钮在屏底"
+
+
+# ---------------------------------------------------------------------------
 # T34 / T35 —— cortex 的韧性 + 「同目标重发不清历史」
 # ---------------------------------------------------------------------------
 #

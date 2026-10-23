@@ -65,15 +65,18 @@ For OCR rows, verify any confidence below 0.6 first.
 | Field | Meaning |
 |---|---|
 | `actions` | Actions to execute; required unless `done`, empty when done |
-| `agent_thought` | One sentence explaining this action |
+| `agent_thought` | **First state the result of the previous step (checked against what you want), then why this action** |
 | `done` | Set true when the goal is reached |
 | `done_reason` | Evidence that the goal is reached; required when `done` |
 
-**If the goal is reached, you MUST set `done: true` — every time.**
-The goal is reached when *all* of its conditions hold. If every condition is already
-satisfied by what you have seen, do not take another action to confirm it once more —
-set `done: true` and put the evidence in `done_reason`. Re-checking a condition you have
-already checked is not progress: it is the same turn over and over, and the task never ends.
+**Your history contains "the result of the previous step"** (objective facts the
+framework recorded: which app is in the foreground, what is on screen). Read it
+first: if it is not what you want, take a different action; if it is, do not
+mistake a right step for a reached goal.
+
+The goal is reached when **every** condition of it already holds in what you have
+seen. Then you **MUST** set `done: true` with the evidence in `done_reason`, and
+must not verify again — re-checking produces no progress and the task never ends.
 
 ```json
 {"actions": [], "agent_thought": "The WLAN page is open, so the goal is reached.", "done": true, "done_reason": "The action bar title reads WLAN and the network list is visible."}

@@ -75,8 +75,8 @@ class ExecutorOutput(BaseModel):
     agent_thought: str = Field(
         default="",
         description=(
-            "One short sentence: why this action. Max 1 sentence. "
-            "Do NOT put the goal statement here."
+            "Short: first the result of the previous step (checked against what "
+            "you want), then why this action. Do NOT put the goal statement here."
         ),
     )
     done: bool = Field(

@@ -269,8 +269,52 @@ def test_executor_prompt_output_fields_match_executor_output():
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     for field in ("actions", "agent_thought", "done", "done_reason"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
-    # agent_thought：≤1 句，只解释本动作（与 zh 版字段表对齐）
-    assert "One sentence explaining this action" in text
+    # agent_thought：**先说上一步的结果，再说本动作的原因**（与 zh 版字段表对齐）
+    #
+    # 2026-10-24 改的：以前是「One sentence explaining this action」——
+    # 纯前视的。实测（execution 853）：执行器把 Home 按了 13 次，每一次都以为
+    # Home 会回到桌面，因为历史里「按了 Home」后面跟的永远是「按成功了」，
+    # **没有任何东西说「屏幕还是那个」**。
+    # ⇒ 框架现在把「上一步的结果」写进历史，提示词要求它**先读那个结果、
+    # 对照自己要的东西**，再决定下一步。
+    assert "First state the result of the previous step" in text
+    assert "One sentence explaining this action" not in text
+
+
+def test_executor_schema_description_agrees_with_the_prompt():
+    """🔴 **schema 的字段描述是模型真正看到的东西** —— 它必须和提示词说同一件事。
+
+    2026-10-24 踩过：`agent_thought` 的 schema 描述还写着「Max 1 sentence:
+    why this action」，而提示词已经改成「先说上一步的结果，再说本动作的原因」
+    ⇒ **两边对着干**，模型会照着 schema 那个走，历史里的「上一步的结果」白记。
+
+    ⇒ 这条测试盯住 schema 描述：改了它、忘了改提示词（或反过来），这里会红。
+    """
+    from minitap.mobile_use.agents.executor.types import ExecutorOutput
+
+    description = ExecutorOutput.model_fields["agent_thought"].description or ""
+    assert "result of the previous step" in description
+    assert "Max 1 sentence" not in description
+
+
+def test_executor_prompt_tells_the_model_to_use_the_previous_result():
+    """提示词必须明说「历史里有上一步的结果，要先对照它」。
+
+    框架只负责把**客观事实**搬进历史（见 `contextor.render_action_result`）；
+    「这个动作没用」是**相对于目标**的判断，框架做不了 ⇒ 必须由模型做。
+    ⇒ 提示词不写清楚，模型就会忽略历史里那几行，继续原地打转。
+    """
+    en = " ".join(_EXECUTOR_MD.read_text(encoding="utf-8").split())
+    zh = " ".join(_EXECUTOR_ZH_MD.read_text(encoding="utf-8").split())
+
+    assert "the result of the previous step" in en
+    assert "上一步的结果" in zh
+    # 两边都要说清「结果不对就换动作，别重复验」
+    assert "take a different action" in en
+    assert "换个动作" in zh
+    # 也要说清「结果对了就 done，别再验一遍」
+    assert "instead of verifying it again" in en
+    assert "别再验一遍" in zh
 
 
 def test_executor_prompt_keeps_the_anchor_rules():
