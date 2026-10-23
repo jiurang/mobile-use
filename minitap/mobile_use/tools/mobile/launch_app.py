@@ -58,14 +58,22 @@ def get_launch_app_tool(ctx: MobileUseContext):
                 status="error",
             )
         else:
-            success, error_msg = await launch_app_with_retries(ctx=ctx, app_package=package_name)
+            # ``detail`` 的含义随 ``ok`` 变（见 launch_app_with_retries 的文档）：
+            # 失败时它是**原因**，成功时它是**保留意见**（目前只有「没能确认切到
+            # 前台」一种）。**两种都要让模型看见** —— 少了它，模型只能把
+            # 「启动成了但没确认」当成「失败了」，然后重发、然后重验、然后转圈。
+            ok, detail = await launch_app_with_retries(ctx=ctx, app_package=package_name)
+            if ok:
+                content = launch_app_wrapper.on_success_fn(app_name)
+                if detail:
+                    content = f"{content} {detail}"
+            else:
+                content = launch_app_wrapper.on_failure_fn(app_name, detail or "")
             tool_message = ToolMessage(
                 tool_call_id=tool_call_id,
-                content=launch_app_wrapper.on_success_fn(app_name)
-                if success
-                else launch_app_wrapper.on_failure_fn(app_name, error_msg),
-                additional_kwargs={} if success else {"error": error_msg},
-                status="success" if success else "error",
+                content=content,
+                additional_kwargs={} if ok else {"error": detail},
+                status="success" if ok else "error",
             )
 
         return Command(

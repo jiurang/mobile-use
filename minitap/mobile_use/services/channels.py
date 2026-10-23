@@ -144,6 +144,25 @@ class ChannelSpec:
     #: M3 默认开。开着思考时**不能**强制指定 tool_choice（DeepSeek 直接 400）。
     thinking_default_on: bool = False
 
+    #: 「要不要思考」这个开关在 ``.env`` 里的变量名。
+    #:
+    #: 老路（配置文件 + .env）靠它兜底；渠道下发的值优先于它（见
+    #: :meth:`~minitap.mobile_use.services.llm.ProviderOverride.thinking_or`）。
+    thinking_env: str | None = None
+
+    #: 没人指定时，我们**发什么**。
+    #:
+    #: None = 不发这个字段（走供应商自己的默认）。
+    #: llama.cpp 是 False —— 它的思考链默认开着，而开着时 ``content`` 恒为空，
+    #: 结构化输出必然失败（实测：思考 ON + max_tokens=256 → JSON 没写完；
+    #: 不限长 → 直接挂死）。所以它必须**显式**发一个关。
+    thinking_fallback: bool | None = None
+
+    #: 请求里带上「本次运行 id」的查询参数名。
+    #:
+    #: minitap 用它把一次运行里的多次调用串起来（``?sessionId=…``）。
+    session_query_param: str | None = None
+
     #: 能不能强制指定 tool_choice。
     #:
     #: 默认 True（多数端点随便强制）。DeepSeek 在思考模式下不行 —— 所以它
@@ -168,10 +187,9 @@ class ChannelSpec:
 
     #: 这条渠道是不是**必须**由使用者自己给访问端点。
     #:
-    #: 「自定义（OpenAI 兼容）」那条渠道是：它没有默认地址，配置文件里写
-    #: ``provider: custom`` 却不给 base_url 的话，请求会打到 OpenAI 官方端点 ——
-    #: 症状是「密钥是我自己那家的，怎么报的是 OpenAI 的错」。
-    requires_explicit_base_url: bool = False
+    #: 「自定义（OpenAI 兼容）」和 Azure 是：它们没有默认地址，不给端点的话
+    #: 请求会打到别处 —— 「密钥是我自己那家的，怎么报的是 OpenAI 的错」。
+    requires_base_url: bool = False
 
     #: 要不要开 ``stream_usage``。
     #:
@@ -186,6 +204,11 @@ class ChannelSpec:
 
     #: 失败重试次数。
     max_retries: int | None = None
+
+    #: 「模型名前缀 → 这个前缀用的重试次数」。
+    #:
+    #: minitap 上的 ``google/`` 系模型要多试一次（默认 2），其余照默认。
+    retry_rules: tuple[tuple[str, int], ...] = ()
 
     def default_url(self) -> str | None:
         """这条渠道的默认端点。"""
@@ -227,6 +250,7 @@ CHANNELS: dict[str, ChannelSpec] = {
         # 加上 {"thinking": {"type": "disabled"}} 后 = 200。
         thinking_style="deepseek",
         thinking_default_on=True,
+        thinking_env="DEEPSEEK_THINKING",
         force_tool_choice=False,
         client_kind="deepseek",
         request_timeout=180.0,
@@ -255,6 +279,7 @@ CHANNELS: dict[str, ChannelSpec] = {
         base_url_env="MINIMAX_BASE_URL",
         thinking_style="minimax",
         thinking_default_on=True,
+        thinking_env="MINIMAX_THINKING",
         effort_style="output_config",
         # MiniMax 只收 0..1（超了服务端 400）。
         temperature_range=(0.0, 1.0),
@@ -330,6 +355,10 @@ CHANNELS: dict[str, ChannelSpec] = {
         ),
         api_key_env="MINITAP_API_KEY",
         base_url_env="MINITAP_API_BASE_URL",
+        # minitap 用 sessionId 把一次运行里的多次调用串起来。
+        session_query_param="sessionId",
+        # google/ 系模型要多试一次（以前的工厂就是这么写的）。
+        retry_rules=(("google/", 2),),
     ),
     "llamacpp": ChannelSpec(
         id="llamacpp",
@@ -344,6 +373,9 @@ CHANNELS: dict[str, ChannelSpec] = {
         # 关思考是**必须**的：开着时 content 恒为空，结构化输出必然失败。
         thinking_style="chat_template_kwargs",
         thinking_default_on=True,
+        thinking_env="LLAMACPP_ENABLE_THINKING",
+        # 关思考是**必须**的：开着时 content 恒为空，结构化输出必然失败。
+        thinking_fallback=False,
         force_tool_choice=False,
         # json_schema 是语法级约束（GBNF），实测 5/5 解析成功。
         structured_output="json_schema",
@@ -365,7 +397,20 @@ CHANNELS: dict[str, ChannelSpec] = {
         request_timeout=180.0,
         max_retries=2,
     ),
+    # ---- 自定义：任何 OpenAI 兼容的第三方服务 --------------------------------
+    "custom": ChannelSpec(
+        id="custom",
+        label="自定义（OpenAI 兼容）",
+        protocol="openai",
+        # 没有默认地址：必须自己填。填错的话请求会打到别处，而错误信息完全
+        # 指不到真正的原因。
+        base_url=None,
+        requires_base_url=True,
+        api_key_env=None,
+        base_url_env=None,
+    ),
     # ---- 保留的原生通道（SDK 没有 OpenAI 兼容等价物）------------------------
+    "google": ChannelSpec(
         id="google",
         label="Google Gemini",
         protocol="google",
@@ -393,6 +438,8 @@ CHANNELS: dict[str, ChannelSpec] = {
         base_url=None,  # 必填，但由调用方给（部署自己的端点）
         api_key_env="AZURE_API_KEY",
         base_url_env="AZURE_BASE_URL",
+        # azure 没有默认端点：每个部署的 URL 都不一样，必须自己给。
+        requires_base_url=True,
         # azure 可以完全不带 key（走 DefaultAzureCredential）。
         requires_api_key=False,
         max_retries=2,
@@ -426,8 +473,7 @@ def require_channel(channel_id: str) -> ChannelSpec:
     spec = get_channel(channel_id)
     if spec is None:
         raise ValueError(
-            f"unknown LLM channel {channel_id!r}; known channels are: "
-            + ", ".join(channel_ids())
+            f"unknown LLM channel {channel_id!r}; known channels are: " + ", ".join(channel_ids())
         )
     return spec
 

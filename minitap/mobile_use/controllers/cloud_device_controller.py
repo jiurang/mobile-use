@@ -24,6 +24,7 @@ from minitap.mobile_use.controllers.device_controller import (
 )
 from minitap.mobile_use.controllers.types import Bounds, CoordinatesSelectorRequest, TapOutput
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
+from minitap.mobile_use.utils.launch_command import launch_failure_reason
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.video import DEFAULT_MAX_DURATION_SECONDS, VideoRecordingResult
 
@@ -238,7 +239,16 @@ class CloudAndroidController(MobileDeviceController):
             return False
 
     async def launch_app(self, package_or_bundle_id: str) -> bool:
-        """Launch an application using am start, with monkey as a fallback."""
+        """启动 app：`am start -n <component>`，不行就退回 monkey。
+
+        ⚠️ **两条路都要看输出**（2026-10-24）：adbutils 的 `shell()` 只返回输出
+        字符串、不检查错误输出 ⇒ `am start` / `monkey` 失败时**不抛异常**，
+        照常返回 ⇒ 会把「根本没启动」报成「启动成功」。
+        真机实测：包不存在时 monkey 输出
+        `** No activities found to run, monkey aborted.`。
+
+        失败时**抛异常**（消息里带原因原文）—— 调用方会把原因回灌给模型。
+        """
         try:
             # First, try to get the launcher activity from the package
             result = self.device.shell(
@@ -252,18 +262,28 @@ class CloudAndroidController(MobileDeviceController):
                 if result and "/" in result:
                     # Got component name like "com.android.settings/.Settings"
                     logger.info(f"Launching app with component: {result}")
-                    self.device.shell(f"am start -n {result}")
-                    return True
+                    output = self.device.shell(f"am start -n {result}")
+                    reason = launch_failure_reason(output)
+                    if not reason:
+                        return True
+                    logger.error(f"Failed to launch app {package_or_bundle_id}: {reason}")
+                    raise RuntimeError(f"launch failed for {package_or_bundle_id}: {reason}")
 
             # Fallback: use monkey command which resolves the launcher activity
             logger.info(f"Falling back to monkey for: {package_or_bundle_id}")
-            self.device.shell(
+            output = self.device.shell(
                 f"monkey -p {package_or_bundle_id} -c android.intent.category.LAUNCHER 1"
             )
+            reason = launch_failure_reason(output)
+            if reason:
+                logger.error(f"Failed to launch app {package_or_bundle_id}: {reason}")
+                raise RuntimeError(f"launch failed for {package_or_bundle_id}: {reason}")
             return True
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Failed to launch app {package_or_bundle_id}: {e}")
-            return False
+            raise RuntimeError(f"launch failed for {package_or_bundle_id}: {e}") from e
 
     async def terminate_app(self, package_or_bundle_id: str | None) -> bool:
         """Terminate an application."""

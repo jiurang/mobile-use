@@ -14,6 +14,7 @@ from minitap.mobile_use.controllers.device_controller import (
 )
 from minitap.mobile_use.controllers.types import Bounds, CoordinatesSelectorRequest, TapOutput
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
+from minitap.mobile_use.utils.launch_command import launch_failure_reason
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.video import (
     ANDROID_MAX_RECORDING_DURATION_SECONDS,
@@ -155,12 +156,39 @@ class AndroidDeviceController(MobileDeviceController):
             return False
 
     async def launch_app(self, package_or_bundle_id: str) -> bool:
+        """启动 app。
+
+        ⚠️ **不用 `device.app_start()`**（2026-10-24）
+
+        adbutils 的 `app_start` 内部是 monkey，而 **monkey 失败时不抛异常**
+        （adbutils 的 `shell()` 只返回输出字符串、不检查错误输出）。真机实测：
+        包不存在时输出 `** No activities found to run, monkey aborted.`，
+        但 `app_start()` 照常返回 ⇒ 调用方会把「**根本没启动**」当成「启动了」。
+        ⇒ 这里自己发命令、看输出（`utils/launch_command.py`）。
+
+        失败时**抛异常**（消息里带原因原文）：调用方 `launch_app_with_retries`
+        会把原因回灌给模型 —— 只回一句「失败了」，模型没法决定下一步该干什么。
+        """
         try:
-            self.device.app_start(package_or_bundle_id)
-            return True
+            output = self.device.shell(
+                [
+                    "monkey",
+                    "-p",
+                    package_or_bundle_id,
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                    "1",
+                ]
+            )
         except Exception as e:
             logger.error(f"Failed to launch app {package_or_bundle_id}: {e}")
-            return False
+            raise RuntimeError(f"launch failed for {package_or_bundle_id}: {e}") from e
+
+        reason = launch_failure_reason(output)
+        if reason:
+            logger.error(f"Failed to launch app {package_or_bundle_id}: {reason}")
+            raise RuntimeError(f"launch failed for {package_or_bundle_id}: {reason}")
+        return True
 
     async def terminate_app(self, package_or_bundle_id: str | None) -> bool:
         try:

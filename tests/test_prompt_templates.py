@@ -286,6 +286,33 @@ def test_executor_prompt_keeps_the_anchor_rules():
     assert "reach it, or report truthfully that you could not" in text
 
 
+def test_executor_prompt_demands_done_when_the_goal_is_reached():
+    """目标达成**必须** `done: true` —— 中英两版都要有。
+
+    2026-10-24 真机实测（mobile-manager execution 851）：cortex 下发了一个
+    「A **并且** B」的验证型子目标，executor 两个条件都验过了（每一步 thought
+    都写着「已确认」），却**一次都没发过 `done: true`** —— 该子目标跑了 54 次
+    调用、51 个动作步、59.6 万 token，任务永远收不了尾。
+
+    ⇒ 这条不是风格偏好，是**「没有出口」的兜底**：executor 循环唯一的出口
+    就是模型说 done（``graph.py`` 的 ``post_executor_gate``）。模型不说，
+    就永远在里面转。
+    """
+    en = _EXECUTOR_MD.read_text(encoding="utf-8")
+    zh = _EXECUTOR_ZH_MD.read_text(encoding="utf-8")
+
+    # 归一化空白：提示词是按行宽排版的，断言不能被换行炸掉
+    flat_en = " ".join(en.split())
+    flat_zh = " ".join(zh.split())
+
+    assert "you MUST set `done: true`" in flat_en
+    assert "你必须把 `done` 置为 true" in flat_zh
+
+    # 死循环的另一只手：已经验过的条件不要再验。
+    assert "Re-checking a condition you have already checked is not progress" in flat_en
+    assert "把已经验过的条件再验一遍不是进展" in flat_zh
+
+
 def test_reporter_template_is_static():
     """reporter.md 完全静态：没有模板变量，渲染结果 == 原文。"""
     template_vars = _load().TEMPLATE_VARS

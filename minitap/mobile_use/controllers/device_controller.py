@@ -56,7 +56,15 @@ class MobileDeviceController(Protocol):
     async def launch_app(self, package_or_bundle_id: str) -> bool:
         """
         Launch an application by package name (Android) or bundle ID (iOS).
-        Returns True on success, False on failure.
+
+        Returns True on success. **On failure it raises** (the message carries
+        the reason) — the reason is what the model gets to see, so it must not
+        be swallowed here.
+
+        ⚠️ Don't trust the launch command's exit status alone: `adb`'s `shell()`
+        only returns the output text and never raises on error output, so a
+        failed launch looks exactly like a successful one. See
+        `utils/launch_command.py`.
         """
         raise NotImplementedError("Subclasses must implement this method")
 

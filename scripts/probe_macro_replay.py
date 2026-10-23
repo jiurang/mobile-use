@@ -361,10 +361,18 @@ async def main() -> int:
 
             if action == "launch_app":
                 pkg = args.package or app_package or args_d.get("app_name")
-                ok = await controller.launch_app(pkg)
+                try:
+                    # launch_app 失败时**抛异常**（原因在消息里）。
+                    await controller.launch_app(pkg)
+                    ok = True
+                except Exception as e:
+                    ok = False
+                    detail_launch = str(e)
+                else:
+                    detail_launch = ""
                 ready, ready_why = await wait_for_app(controller, pkg)
                 app_established = bool(ok and ready)
-                detail = f"launch {pkg} -> {ok}；{ready_why}"
+                detail = f"launch {pkg} -> {ok}；{ready_why}{detail_launch}"
                 if not ready:
                     print("  %2d. %-22s ❌ %s" % (i, action, detail))
                     failed_at = (i, action, ready_why)

@@ -57,11 +57,17 @@ async def main() -> int:
 
         for model in ["deepseek-chat", "deepseek-reasoner", "deepseek-flash"]:
             for label, extra in (
-                ("强制tool_choice", {"tool_choice": {"type": "function", "function": {"name": "Probe"}}}),
-                ("强制tool_choice+thinking.disabled", {
-                    "tool_choice": {"type": "function", "function": {"name": "Probe"}},
-                    "thinking": {"type": "disabled"},
-                }),
+                (
+                    "强制tool_choice",
+                    {"tool_choice": {"type": "function", "function": {"name": "Probe"}}},
+                ),
+                (
+                    "强制tool_choice+thinking.disabled",
+                    {
+                        "tool_choice": {"type": "function", "function": {"name": "Probe"}},
+                        "thinking": {"type": "disabled"},
+                    },
+                ),
             ):
                 payload = {
                     "model": model,

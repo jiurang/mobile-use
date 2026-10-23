@@ -9,6 +9,15 @@ from google.auth.exceptions import DefaultCredentialsError
 from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings
 
+from minitap.mobile_use.services.channels import (
+    CHANNELS,
+    ChannelSpec,
+    channel_ids,
+    channel_requires_api_key,
+    channel_supports_endpoint,
+    get_channel,
+    require_channel,
+)
 from minitap.mobile_use.utils.file import load_jsonc
 from minitap.mobile_use.utils.logger import get_logger
 
@@ -163,45 +172,43 @@ def record_events(output_path: Path | None, events: list[str] | BaseModel | Any)
 
 ### LLM Configuration
 
-LLMProvider = Literal[
-    "openai",
-    "google",
-    "openrouter",
-    "xai",
-    "vertexai",
-    "minitap",
-    "anthropic",
-    "azure",
-    "minimax",
-    "deepseek",
-    "siliconflow",
-    "llamacpp",
-]
-#: 这些 provider 不需要 API Key：它们走环境里的服务账号凭据
+#: 渠道 id 的取值集合 —— **由渠道目录推导**（见
+#: :mod:`minitap.mobile_use.services.channels`）。
+#:
+#: 以前这是一份手抄的字面量：加一个供应商要同时改目录和这里，漏改的后果是
+#: 「渠道在 manager 侧能存，到设备上却因为 provider 非法起不来」。现在只有目录
+#: 一处是真的。
+LLMProvider = Literal[*channel_ids()]
+
+#: 这些渠道不需要 API Key：它们走环境里的服务账号凭据
 #: （azure → DefaultAzureCredential，vertexai → ADC），或者端点根本不鉴权
 #: （llamacpp → 本地 llama-server 默认不校验 Authorization 头）。
-#: 渠道没给密钥是合法的。其余 provider 缺密钥就是缺 —— 见 :func:`provider_requires_api_key`。
-KEYLESS_PROVIDERS: frozenset[str] = frozenset({"azure", "vertexai", "llamacpp"})
+#: 渠道没给密钥是合法的。其余渠道缺密钥就是缺 —— 见 :func:`provider_requires_api_key`。
+KEYLESS_PROVIDERS: frozenset[str] = frozenset(
+    cid for cid, spec in CHANNELS.items() if not spec.requires_api_key
+)
 
-#: 这些 provider 的客户端不接受自定义端点（google 的 SDK、vertexai 的 ADC 都没有
+#: 这些渠道的客户端不接受自定义端点（google 的 SDK、vertexai 的 ADC 都没有
 #: 「访问端点」这个旋钮）。渠道给不给 base_url 都一样，所以不强制要求。
-ENDPOINTLESS_PROVIDERS: frozenset[str] = frozenset({"google", "vertexai"})
+ENDPOINTLESS_PROVIDERS: frozenset[str] = frozenset(
+    cid for cid, spec in CHANNELS.items() if not spec.supports_endpoint
+)
 
 
 def provider_requires_api_key(provider: str) -> bool:
-    """这个 provider 是不是必须有一把密钥。
+    """这个渠道是不是必须有一把密钥。
 
     判据只有一条：能不能用服务账号凭据代替。azure 和 vertexai 能，其余不能。
     """
-    return provider not in KEYLESS_PROVIDERS
+    return channel_requires_api_key(provider)
 
 
 def provider_supports_endpoint(provider: str) -> bool:
-    """这个 provider 是不是接受自定义访问端点。
+    """这个渠道是不是接受自定义访问端点。
 
     google / vertexai 的客户端没有端点参数，渠道里填了也会被忽略并告警。
     """
-    return provider not in ENDPOINTLESS_PROVIDERS
+    return channel_supports_endpoint(provider)
 
 
 LLMUtilsNode = Literal["outputter", "hopper", "video_analyzer"]
@@ -282,49 +289,58 @@ class LLM(BaseModel):
             return True
         return bool(getattr(settings, attr, None))
 
+    @property
+    def channel(self) -> "ChannelSpec":
+        """这条接入点对应的**渠道定义**（默认端点、模型列表、协议、旋钮）。
+
+        ``provider`` 这个字段的值就是渠道 id —— 名字没改（数据库、API、runner
+        载荷都靠它），改的是「这个值从哪来、附带什么信息」。
+        """
+        return require_channel(self.provider)
+
+    @property
+    def protocol(self) -> str:
+        """这条接入点用哪个协议客户端（``openai`` / ``anthropic`` / …）。
+
+        由渠道 id 推导 —— 协议是**渠道的属性**，不是每次调用现场决定的东西。
+        """
+        return self.channel.protocol
+
     def validate_provider(self, name: str):
         # 只校验「能不能拿到密钥」,不校验密钥是哪来的 —— 配置自带是新增的合法来源,
         # 不能因为 settings 里没有就判它无效。
-        match self.provider:
-            case "azure":
-                # 不校验密钥:azure 允许完全不带 key,走 DefaultAzureCredential
-                # (见 get_azure_llm)。加这条校验会打断那类现有部署。
-                if not (self.base_url or settings.AZURE_BASE_URL):
-                    raise Exception(f"{name} requires AZURE_BASE_URL in .env")
-            case "openai":
-                if not self._has_api_key("OPENAI_API_KEY"):
-                    raise Exception(f"{name} requires OPENAI_API_KEY in .env")
-            case "google":
-                if not self._has_api_key("GOOGLE_API_KEY"):
-                    raise Exception(f"{name} requires GOOGLE_API_KEY in .env")
-            case "vertexai":
-                validate_vertex_ai_credentials()
-            case "openrouter":
-                if not self._has_api_key("OPEN_ROUTER_API_KEY"):
-                    raise Exception(f"{name} requires OPEN_ROUTER_API_KEY in .env")
-            case "xai":
-                if not self._has_api_key("XAI_API_KEY"):
-                    raise Exception(f"{name} requires XAI_API_KEY in .env")
-            case "minitap":
-                if not self._has_api_key("MINITAP_API_KEY"):
-                    raise Exception(f"{name} requires MINITAP_API_KEY in .env")
-            case "anthropic":
-                if not self._has_api_key("ANTHROPIC_API_KEY"):
-                    raise Exception(f"{name} requires ANTHROPIC_API_KEY in .env")
-            case "minimax":
-                if not self._has_api_key("MINIMAX_API_KEY"):
-                    raise Exception(f"{name} requires MINIMAX_API_KEY in .env")
-            case "deepseek":
-                if not self._has_api_key("DEEPSEEK_API_KEY"):
-                    raise Exception(f"{name} requires DEEPSEEK_API_KEY in .env")
-            case "siliconflow":
-                if not self._has_api_key("SILICONFLOW_API_KEY"):
-                    raise Exception(f"{name} requires SILICONFLOW_API_KEY in .env")
-            case "llamacpp":
-                # **不要求密钥**：本地 llama-server 默认不鉴权（没起 `--api-key` 时
-                # 它不校验 Authorization 头）。端点缺失也放行 —— 工厂自带默认地址。
-                # 加一条「必须有密钥」的校验会把这条渠道整个堵死，而且没有别的解法。
-                pass
+        spec = get_channel(self.provider)
+        if spec is None:  # pragma: no cover —— provider 是 Literal,到不了这里
+            raise Exception(f"{name}: unknown LLM channel {self.provider!r}")
+
+        if spec.protocol == "vertexai":
+            validate_vertex_ai_credentials()
+            return
+
+        # 没有默认端点的渠道（azure / 自定义）：必须给一个，否则请求会打到
+        # 别的服务商的地址，而错误信息完全指不到真正的原因。
+        if spec.requires_base_url and not (
+            self.base_url or (spec.base_url_env and getattr(settings, spec.base_url_env, None))
+        ):
+            raise Exception(
+                f"{name} requires {spec.base_url_env or 'a base URL'} for channel "
+                f"{spec.id!r} (in .env or in the channel config)"
+            )
+
+        # 不校验密钥的渠道：azure 走 DefaultAzureCredential、vertexai 走 ADC、
+        # llamacpp 本地 server 不鉴权 —— 加校验会打断那类现有部署。
+        if spec.requires_api_key:
+            if spec.api_key_env:
+                if not self._has_api_key(spec.api_key_env):
+                    raise Exception(f"{name} requires {spec.api_key_env} in .env")
+            elif not self.api_key:
+                # 目录里没有对应的环境变量（「自定义」那条渠道）：密钥只能来自
+                # 渠道本身。
+                raise Exception(
+                    f"{name} requires an api_key for channel {spec.id!r} "
+                    f"(no environment variable is known for it — "
+                    f"put the key in the channel config)"
+                )
 
     def __str__(self):
         return f"{self.provider}/{self.model}"

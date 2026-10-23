@@ -69,6 +69,12 @@ For OCR rows, verify any confidence below 0.6 first.
 | `done` | Set true when the goal is reached |
 | `done_reason` | Evidence that the goal is reached; required when `done` |
 
+**If the goal is reached, you MUST set `done: true` — every time.**
+The goal is reached when *all* of its conditions hold. If every condition is already
+satisfied by what you have seen, do not take another action to confirm it once more —
+set `done: true` and put the evidence in `done_reason`. Re-checking a condition you have
+already checked is not progress: it is the same turn over and over, and the task never ends.
+
 ```json
 {"actions": [], "agent_thought": "The WLAN page is open, so the goal is reached.", "done": true, "done_reason": "The action bar title reads WLAN and the network list is visible."}
 ```

@@ -35,7 +35,10 @@ def test_get_deepseek_llm_defaults_to_domestic_endpoint(mock_settings, mock_chat
     assert kwargs["base_url"] == "https://api.deepseek.com"
     assert kwargs["model"] == "deepseek-flash"
     # Thinking mode is DeepSeek's own default, so we send nothing.
-    assert "extra_body" not in kwargs
+    #
+    # 实现改成协议层之后，这个参数**始终出现**（空的时候是 None）——
+    # 「不发这个字段」和「发一个 None」在请求体上一回事。
+    assert kwargs.get("extra_body") is None
 
 
 @patch("minitap.mobile_use.services.llm.DeepSeekChatOpenAI")

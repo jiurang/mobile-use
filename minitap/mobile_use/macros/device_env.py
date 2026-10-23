@@ -67,8 +67,13 @@ async def make_device_env(ctx: MobileUseContext) -> MacroEnv:
                 package = args.get("package")
                 if not isinstance(package, str) or not package:
                     return ToolOutcome(ok=False, message="launch_app 需要 package")
-                ok = await controller.launch_app(package)
-                return ToolOutcome(ok=ok, message=f"launch {package} -> {ok}")
+                try:
+                    # launch_app 失败时**抛异常**（原因在消息里）—— 见
+                    # controllers/device_controller.py 的契约说明。
+                    await controller.launch_app(package)
+                except Exception as e:
+                    return ToolOutcome(ok=False, message=f"launch {package} 失败：{e}")
+                return ToolOutcome(ok=True, message=f"launch {package} -> True")
             if tool == "stop_app":
                 package = args.get("package")
                 ok = await controller.terminate_app(package if isinstance(package, str) else None)

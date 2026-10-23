@@ -141,12 +141,21 @@ class iOSDeviceController(MobileDeviceController):
             return False
 
     async def launch_app(self, package_or_bundle_id: str) -> bool:
-        """Launch an iOS app using IDB."""
+        """Launch an iOS app using IDB.
+
+        失败时**抛异常**（消息里带原因）—— 和 android / cloud 两个实现一致：
+        调用方 `launch_app_with_retries` 会把原因回灌给模型，只回一句
+        「失败了」模型没法决定下一步。
+        """
         try:
-            return await self.ios_client.launch(bundle_id=package_or_bundle_id)  # type: ignore[call-arg]
+            launched = await self.ios_client.launch(bundle_id=package_or_bundle_id)  # type: ignore[call-arg]
         except Exception as e:
             logger.error(f"Failed to launch app {package_or_bundle_id}: {e}")
-            return False
+            raise RuntimeError(f"launch failed for {package_or_bundle_id}: {e}") from e
+        if not launched:
+            logger.error(f"Failed to launch app {package_or_bundle_id}")
+            raise RuntimeError(f"launch failed for {package_or_bundle_id}")
+        return True
 
     async def terminate_app(self, package_or_bundle_id: str | None) -> bool:
         """Terminate an iOS app using IDB."""

@@ -211,15 +211,23 @@ def test_file_config_still_falls_back_to_settings(settings_minimax):
 
 
 def test_channel_does_not_read_the_endpoint_from_env(settings_minimax):
-    """渠道没给端点时，用 provider 自带的默认端点，**不读** .env 里的那个。
+    """渠道没给端点时，用该渠道的默认端点，**不读** .env 里的那个。
 
     读 .env 意味着「manager 说用 minimax，端点却是设备本地 .env 里那个」——
     国内 key 发到国际端点是 401，而错误信息完全指不到真正的原因。
+
+    默认端点本身来自**渠道目录**（``services/channels.py``），不再是各工厂里
+    各写一份的常量。MiniMax 的默认是国内站 ``api.minimaxi.com``：国内站的 key
+    发到国际站 ``api.minimax.io`` 会 401「invalid api key (2049)」
+    （2026-10-24 实测）—— 渠道目录存在的意义就是「填了 key 就能用」。
     """
+    from minitap.mobile_use.services.channels import default_base_url
+
     cfg = llm_config_for_single_model("minimax", "M3.1", api_key="channel-key")
     client = get_llm(_ctx(cfg), name="cortex")
 
-    assert client.openai_api_base == "https://api.minimax.io/v1"
+    assert client.openai_api_base == default_base_url("minimax")
+    assert client.openai_api_base == "https://api.minimaxi.com/v1"
 
 
 def test_channel_key_works_with_empty_settings(no_settings_minimax):

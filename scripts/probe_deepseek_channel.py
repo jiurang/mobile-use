@@ -74,9 +74,7 @@ async def _main() -> int:
     print("=" * 78)
     for thinking in (False, True, None):
         override = _channel_override(thinking)
-        client = get_deepseek_llm(
-            model_name="deepseek-chat", temperature=1, override=override
-        )
+        client = get_deepseek_llm(model_name="deepseek-chat", temperature=1, override=override)
         extra = client.extra_body
         print(
             f"  渠道 thinking={thinking!r:<6} → extra_body={extra!r}"

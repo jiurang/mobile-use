@@ -3,6 +3,7 @@ import functools
 import inspect
 import logging
 import re
+import sys
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -24,6 +25,10 @@ from minitap.mobile_use.config import (
     settings,
 )
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.services.channels import (
+    ChannelSpec,
+    require_channel,
+)
 from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.utils.llm_usage import (
     close_capture,
@@ -106,12 +111,33 @@ class ProviderOverride:
             return self.api_key
         return self.api_key or getattr(settings, attr, None)
 
-    def url_or(self, attr: str, default: str | None = None) -> str | None:
+    def url_or(self, attr: str | None, default: str | None = None) -> str | None:
         if self.strict:
             # 渠道没给端点时用 provider 自带的默认端点（那是代码里的常量，
             # 不是设备本地环境的一部分），但绝不读 .env 里的 <PROVIDER>_BASE_URL。
             return self.base_url or default
-        return self.base_url or getattr(settings, attr, None) or default
+        env_value = getattr(settings, attr, None) if attr else None
+        return self.base_url or env_value or default
+
+    def thinking_or(self, attr: str | None) -> bool | None:
+        """「要不要思考」：渠道下发的优先，没下发时按 strict 决定要不要读 .env。
+
+        和 :meth:`key_or` / :meth:`url_or` 同一套语义：**渠道下发的东西就是全部**。
+        strict 时绝不读 .env —— 渠道说了「开」就开、说了「关」就关、没说就不发这个
+        字段（走供应商自己的默认），而不是被设备本地的环境变量改写。
+
+        以前 DeepSeek 只读 ``settings.DEEPSEEK_THINKING``，**完全无视渠道下发的
+        thinking**：症状是「我在 manager 里把思考关了，它还在思考」，于是
+        「思考模式下强制 tool_choice」被服务端拒绝（400），每个 agent 节点全挂。
+        """
+        if self.thinking is not None:
+            return self.thinking
+        if self.strict or not attr:
+            return None
+        value = getattr(settings, attr, None)
+        # isinstance 检查是为了挡住「settings 被测试打桩成 MagicMock」这种情况 ——
+        # 那时 ``settings.DEEPSEEK_THINKING`` 是个对象而不是 bool，当作「没设置」。
+        return value if isinstance(value, bool) else None
 
 
 def _warn_base_url_ignored(provider: str) -> None:
@@ -339,23 +365,22 @@ def get_minitap_llm(
         if effective_api_key is None:
             raise ValueError("MINITAP_API_KEY must be provided or set in environment")
 
-    if max_retries is None and model.startswith("google/"):
-        max_retries = 2
-
-    custom_headers = _build_custom_headers(agent_name)
-
-    client = SurgeryChatOpenAI(
-        model=model,
-        temperature=temperature,
-        max_retries=max_retries,
+    # 显式给的 key 优先于渠道/环境里那份。
+    override = ProviderOverride(
         api_key=effective_api_key,
-        base_url=override.url_or("MINITAP_API_BASE_URL"),
-        default_query={
-            "sessionId": trace_id,
-        },
-        default_headers=custom_headers or None,
+        base_url=override.base_url,
+        thinking=override.thinking,
+        strict=override.strict,
     )
-    return client
+
+    return build_openai_protocol_client(
+        require_channel("minitap"),
+        model,
+        temperature if temperature is not None else 1,
+        override,
+        agent_name=agent_name,
+        trace_id=trace_id,
+    )
 
 
 def get_google_llm(
@@ -429,6 +454,14 @@ class ToolSchemaSurgeryMixin:
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)  # type: ignore[misc]
         return apply_tool_schema_surgery(payload)
 
+    def should_force_tool_choice(self) -> bool:
+        """这次调用能不能**强制**指定 tool_choice（把 schema 当工具绑上去时）。
+
+        默认能 —— 多数端点随便强制。DeepSeek 覆盖它：思考模式下强制是硬 400
+        （"Thinking mode does not support this tool_choice"）。
+        """
+        return True
+
 
 class SurgeryChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
     """``ChatOpenAI`` + 工具 schema 结构手术。"""
@@ -491,16 +524,14 @@ def get_openai_llm(
     temperature: float = 1,
     override: ProviderOverride | None = None,
 ) -> ChatOpenAI:
-    override = override or ProviderOverride()
-    api_key = override.key_or("OPENAI_API_KEY")
-    assert api_key is not None
-    client = SurgeryChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        base_url=override.url_or("OPENAI_BASE_URL"),
-        temperature=temperature,
+    """OpenAI 官方端点。
+
+    现在只是一层薄封装：真正的实现是 :func:`build_openai_protocol_client`
+    （OpenAI 兼容协议的那**一份**实现），渠道之间的差别全在渠道目录里。
+    """
+    return build_openai_protocol_client(
+        require_channel("openai"), model_name, temperature, override
     )
-    return client
 
 
 def get_openrouter_llm(
@@ -508,16 +539,9 @@ def get_openrouter_llm(
     temperature: float = 1,
     override: ProviderOverride | None = None,
 ):
-    override = override or ProviderOverride()
-    api_key = override.key_or("OPEN_ROUTER_API_KEY")
-    assert api_key is not None
-    client = SurgeryChatOpenAI(
-        model=model_name,
-        temperature=temperature,
-        api_key=api_key,
-        base_url=override.url_or("OPEN_ROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    return build_openai_protocol_client(
+        require_channel("openrouter"), model_name, temperature, override
     )
-    return client
 
 
 def get_grok_llm(
@@ -525,16 +549,7 @@ def get_grok_llm(
     temperature: float = 1,
     override: ProviderOverride | None = None,
 ) -> ChatOpenAI:
-    override = override or ProviderOverride()
-    api_key = override.key_or("XAI_API_KEY")
-    assert api_key is not None
-    client = SurgeryChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        temperature=temperature,
-        base_url=override.url_or("XAI_BASE_URL", "https://api.x.ai/v1"),
-    )
-    return client
+    return build_openai_protocol_client(require_channel("xai"), model_name, temperature, override)
 
 
 def get_azure_llm(
@@ -951,55 +966,13 @@ def get_minimax_llm(
     剥不掉 -> 没有 tool_calls -> "returned no parseable CortexOutput" -> 整个
     goal 崩。M3.1 的思考走独立字段，16 次 ``content`` 里 0 次混入 <think>。
     （M3 也能解这个问题：把思考关掉就行 —— 见上面的开关。）
+
+    实现本身在 :func:`build_openai_protocol_client`（OpenAI 兼容协议的那一份），
+    这里只是渠道入口。
     """
-    override = override or ProviderOverride()
-    api_key = override.key_or("MINIMAX_API_KEY")
-    assert api_key is not None
-    clamped_temperature = max(0.0, min(1.0, temperature))
-
-    extra_body: dict[str, Any] = {}
-    effort = resolve_minimax_effort()
-    if effort is not None:
-        extra_body["output_config"] = {"effort": effort}
-
-    # 思考开关：渠道下发的优先，其次 settings，再都没有就不发这个字段。
-    # isinstance 检查是为了挡住「settings 被测试打桩成 MagicMock」这种情况 ——
-    # 那时 ``settings.MINIMAX_THINKING`` 是个对象而不是 bool，当作「没设置」。
-    requested_thinking = override.thinking
-    if requested_thinking is None:
-        configured = getattr(settings, "MINIMAX_THINKING", None)
-        requested_thinking = configured if isinstance(configured, bool) else None
-    thinking = resolve_minimax_thinking(model_name, requested_thinking)
-    if thinking is not None:
-        extra_body["thinking"] = thinking
-
-    client = MiniMaxChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        temperature=clamped_temperature,
-        base_url=override.url_or("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
-        # 必须显式开：langchain-openai 只有在流式请求且 stream_usage=True 时
-        # 才把 provider 报的 usage 转发回来。不开的话，**每一次 LLM 调用的
-        # usage_metadata 都是 None** —— 于是遥测记 0（看起来像「这次调用免费」），
-        # 缓存命中率更是无从计算。
-        # manager 侧在宿主进程里补了同样的开关（runner-host/llm_usage_patch.py），
-        # 原因相同；这里直接在工厂里设，因为 mobile-use 就是上游本身。
-        stream_usage=True,
-        # A bounded request timeout, because the default is not one. With
-        # `request_timeout` unset the OpenAI SDK waits 600s and langchain retries
-        # twice, so a single hung connection parks the whole agent for 30
-        # minutes with only "Waiting for LLM call response..." printed — there
-        # is no error, no retry limit, no way back. Reproduced on a phone over
-        # USB: the LLM call at 22:23:59 had still produced nothing at 22:36.
-        # Measured normal latency is seconds, so 180s is generous; one retry
-        # covers a single dropped connection without compounding a real outage.
-        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,
-        max_retries=1,
-        # 显式传而不是 **dict 解包：解包会让类型检查器把整个 dict 当成
-        # **kwargs 逐个参数校验，一堆误报。空的时候给 None（不发这个字段）。
-        extra_body=extra_body or None,
+    return build_openai_protocol_client(
+        require_channel("minimax"), model_name, temperature, override
     )
-    return client
 
 
 class DeepSeekChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
@@ -1017,10 +990,33 @@ class DeepSeekChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
     2. Binding the schema as a tool *with a forced specific ``tool_choice``* also
        fails while thinking mode is on (DeepSeek's default):
        ``400 invalid_request_error: Thinking mode does not support this
-       tool_choice``. So we force it only when the user has explicitly turned
-       thinking off via ``DEEPSEEK_THINKING=false``; otherwise the tool is
-       offered and the model calls it on its own (verified: it does).
+       tool_choice``. So we force it only when thinking is **off**; otherwise the
+       tool is offered and the model calls it on its own (verified: it does).
+
+    实测（2026-10-24，真实 API）::
+
+        deepseek-flash    + 强制 tool_choice                    → HTTP 400（思考模式）
+        deepseek-flash    + 强制 tool_choice + thinking.disabled → HTTP 200
+        deepseek-reasoner + 强制 tool_choice                     → HTTP 400（思考模式）
+        deepseek-chat     + 强制 tool_choice                     → HTTP 200（它默认不思考）
+
+    ⇒ 「能不能强制」不是一条写死的常量，而是**这次请求思考开着没有**。
+    渠道把思考关掉时必须真的关掉 —— 以前渠道下发的 thinking 被无视了
+    （只读 .env 的 ``DEEPSEEK_THINKING``），于是每个 agent 节点都在 400。
     """
+
+    def _thinking_disabled(self) -> bool:
+        """这次请求有没有显式关掉思考。"""
+        body = self.extra_body or {}
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict):
+            return thinking.get("type") == "disabled"
+        return False
+
+    def should_force_tool_choice(self) -> bool:
+        # 思考开着（或者没发 thinking 字段 → 走 DeepSeek 的默认，而它的推理
+        # 模型默认是**开**思考）时强制 tool_choice 会被服务端拒。
+        return self._thinking_disabled()
 
     def with_structured_output(self, schema=None, **kwargs):  # type: ignore[override]
         if not isinstance(schema, type) or not issubclass(schema, BaseModel):
@@ -1029,7 +1025,7 @@ class DeepSeekChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
         return _ToolCallStructuredRunnable(
             self,
             schema,
-            force_tool_choice=settings.DEEPSEEK_THINKING is False,
+            force_tool_choice=self.should_force_tool_choice(),
         )
 
 
@@ -1051,22 +1047,9 @@ def get_deepseek_llm(
       they only apply in non-thinking mode. They are accepted either way, so
       there is nothing to clamp here.
     """
-    override = override or ProviderOverride()
-    api_key = override.key_or("DEEPSEEK_API_KEY")
-    assert api_key is not None
-    extra_kwargs: dict[str, Any] = {}
-    if settings.DEEPSEEK_THINKING is not None:
-        extra_kwargs["extra_body"] = {
-            "thinking": {"type": "enabled" if settings.DEEPSEEK_THINKING else "disabled"}
-        }
-    client = DeepSeekChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        temperature=temperature,
-        base_url=override.url_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        **extra_kwargs,
+    return build_openai_protocol_client(
+        require_channel("deepseek"), model_name, temperature, override
     )
-    return client
 
 
 class _SiliconFlowStructuredRunnable(Runnable):
@@ -1181,25 +1164,9 @@ def get_siliconflow_llm(
     (verified live for 0, 0.01 and 2), so the ``0`` that ``hopper`` hardcodes
     for reproducibility keeps working.
     """
-    override = override or ProviderOverride()
-    api_key = override.key_or("SILICONFLOW_API_KEY")
-    assert api_key is not None
-    client = SiliconFlowChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        temperature=temperature,
-        base_url=override.url_or("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
-        # 必须显式开：不开的话流式调用的 usage_metadata 是 None，遥测里 token
-        # 消耗和缓存命中率都记不上（实测：不带这个参数时 astream 回来的
-        # usage_metadata 就是 None）。openai 分支一直没开这个开关。
-        stream_usage=True,
-        # 有界超时 + 一次重试，理由同 get_minimax_llm：不设的话 SDK 等 600s
-        # 且重试两次，一次挂掉的连接会把整个 agent 拖住 30 分钟且只打印
-        # "Waiting for LLM call response..."。
-        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,
-        max_retries=1,
+    return build_openai_protocol_client(
+        require_channel("siliconflow"), model_name, temperature, override
     )
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -1311,48 +1278,9 @@ def get_llamacpp_llm(
     * **密钥**：本地 server 默认不鉴权，占位 key 即可；server 起了 ``--api-key``
       时才需要真密钥（渠道下发，或写进 ``.env`` 的 ``LLAMACPP_API_KEY``）。
     """
-    override = override or ProviderOverride()
-
-    api_key = override.key_or("LLAMACPP_API_KEY", required=False)
-    if api_key is None:
-        # OpenAI SDK 不接受空 api_key；llama server 没起 --api-key 时不校验这个头。
-        api_key = SecretStr("sk-local")
-
-    enable_thinking = override.thinking
-    if enable_thinking is None:
-        enable_thinking = settings.LLAMACPP_ENABLE_THINKING
-
-    max_tokens = (
-        settings.LLAMACPP_MAX_TOKENS_THINKING if enable_thinking else settings.LLAMACPP_MAX_TOKENS
+    return build_openai_protocol_client(
+        require_channel("llamacpp"), model_name, temperature, override
     )
-
-    client = LlamaCppChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        temperature=temperature,
-        base_url=override.url_or("LLAMACPP_BASE_URL", "http://127.0.0.1:9931/v1"),
-        # 关思考是**必须**的：开着时 content 恒为空，结构化输出必然失败。
-        # 开思考时也显式写 true，别依赖服务端默认 —— 默认值在不同版本上变过。
-        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-        # 有界：不限长时思考链会一直续写 → 客户端挂死。
-        max_tokens=max_tokens,  # type: ignore[call-arg]  # field aliased to max_completion_tokens
-        # 有界超时 + 一次重试，理由同 get_minimax_llm。
-        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS,  # type: ignore[call-arg]  # field aliased to timeout
-        max_retries=1,
-        # 不开这个开关，流式调用的 usage_metadata 是 None，遥测里 token 消耗记不上。
-        stream_usage=True,
-    )
-    return client
-
-
-@overload
-def get_llm(
-    ctx: MobileUseContext,
-    name: AgentNodeWithFallback,
-    *,
-    use_fallback: bool = False,
-    temperature: float = 1,
-) -> BaseChatModel: ...
 
 
 @overload
@@ -1361,6 +1289,189 @@ def get_llm(
     name: LLMUtilsNode,
     *,
     is_utils: Literal[True],
+    temperature: float = 1,
+) -> BaseChatModel: ...
+
+
+#: OpenAI 兼容协议下的客户端变体（见
+#: :data:`~minitap.mobile_use.services.channels.ClientKind`）。
+#:
+#: 这里存的是**类名**而不是类本身：类要在模块加载完才都定义好，而且用类名
+#: 延迟解析，测试里 ``patch("...llm.DeepSeekChatOpenAI")`` 那种替换仍然生效
+#: （直接持有类引用的话，替换发生在引用之后，就拦不住了）。
+#:
+#: 同一个协议，不同供应商对「结构化输出」「工具 schema」「思考链」的处理不一样，
+#: 所以客户端分几个变体 —— 但**协议只有一份实现**（下面的
+#: :func:`build_openai_protocol_client`）。
+_OPENAI_CLIENT_KINDS: dict[str, str] = {
+    "surgery": "SurgeryChatOpenAI",
+    "minimax": "MiniMaxChatOpenAI",
+    "deepseek": "DeepSeekChatOpenAI",
+    "siliconflow": "SiliconFlowChatOpenAI",
+    "llamacpp": "LlamaCppChatOpenAI",
+}
+
+
+def _resolve_thinking(
+    spec: ChannelSpec,
+    model_name: str,
+    override: ProviderOverride,
+) -> tuple[bool | None, dict[str, Any]]:
+    """把「要不要思考」翻译成这条渠道的请求体片段。
+
+    返回 ``(我们发出去的值, 请求体片段)``。值是 ``None`` 表示**没发**这个字段
+    —— 走供应商自己的默认。
+
+    渠道之间的形状不一样（llama.cpp 是 ``chat_template_kwargs.enable_thinking``，
+    minimax 是 ``thinking.type``，DeepSeek 也是 ``thinking.type`` 但取值不同），
+    所以这个翻译按渠道目录里的 ``thinking_style`` 走，而不是让渠道去猜请求体。
+    """
+    requested = override.thinking_or(spec.thinking_env)
+    style = spec.thinking_style
+
+    if style == "none":
+        return None, {}
+    if style == "minimax":
+        body = resolve_minimax_thinking(model_name, requested)
+        # 关不掉时 resolve 返回 None → 什么都不发（走服务端默认），并打一条
+        # warning 说明「这次没关成」。
+        if not body:
+            return None, {}
+        return requested, {"thinking": body}
+    if style == "deepseek":
+        if requested is None:
+            # 没指定 → 不发这个字段，走 DeepSeek 的默认（推理模型默认**开**思考）。
+            return None, {}
+        return requested, {"thinking": {"type": "enabled" if requested else "disabled"}}
+    if style == "chat_template_kwargs":
+        value = requested if requested is not None else spec.thinking_fallback
+        if value is None:
+            return None, {}
+        return value, {"chat_template_kwargs": {"enable_thinking": value}}
+    return None, {}
+
+
+def build_openai_protocol_client(
+    spec: ChannelSpec,
+    model_name: str,
+    temperature: float = 1,
+    override: ProviderOverride | None = None,
+    *,
+    agent_name: str | None = None,
+    trace_id: str | None = None,
+) -> ChatOpenAI:
+    """OpenAI 兼容协议的**唯一**实现。
+
+    所有 OpenAI 兼容的渠道（DeepSeek / MiniMax / 硅基流动 / OpenRouter / xAI /
+    minitap / llama.cpp / OpenAI 官方 / 自定义）都走这里。渠道之间的差别全部
+    来自渠道目录里的**数据**（默认端点、密钥变量名、思考开关的形状、token 上限
+    策略……），不再靠一堆 if/elif 分支。
+
+    ⇒ **加一个供应商 = 加一条目录数据**，不是加一个工厂函数。
+
+    以前这里是 8 个几乎一样的工厂（``get_openai_llm`` / ``get_grok_llm`` /
+    ``get_openrouter_llm`` / ``get_minitap_llm`` / ``get_minimax_llm`` /
+    ``get_deepseek_llm`` / ``get_siliconflow_llm`` / ``get_llamacpp_llm``），
+    各自决定「思考开关长什么样」「能不能强制 tool_choice」—— 于是同一件事有 8 种
+    写法，DeepSeek 那种「思考模式下强制 tool_choice 会 400」的坑就只在一个工厂
+    里被处理了，别的路径照踩（executor / reporter 走的那条路就是照踩的那个）。
+    """
+    override = override or ProviderOverride()
+
+    # ---- 密钥 ----
+    if spec.api_key_env:
+        api_key = override.key_or(spec.api_key_env, required=spec.requires_api_key)
+    else:
+        # 目录里没有对应的环境变量（「自定义」那条渠道）：密钥只能来自渠道本身。
+        api_key = override.api_key
+    if api_key is None:
+        # OpenAI SDK 不接受空 api_key；llama server 没起 --api-key 时不校验这个头。
+        api_key = SecretStr("sk-local")
+
+    # ---- 端点 ----
+    base_url = override.url_or(spec.base_url_env, spec.base_url)
+    if base_url is None and spec.requires_base_url:
+        raise ValueError(
+            f"渠道 {spec.id!r} 必须给一个访问端点（base_url）：它没有默认地址。"
+            f"请在渠道配置里填上 —— 不填的话请求会打到别的服务商，"
+            f"而错误信息完全指不到真正的原因。"
+        )
+
+    # ---- 温度钳制 ----
+    if spec.temperature_range:
+        low, high = spec.temperature_range
+        temperature = max(low, min(high, temperature))
+
+    # ---- 请求体旋钮 ----
+    thinking_value, thinking_body = _resolve_thinking(spec, model_name, override)
+    extra_body: dict[str, Any] = dict(thinking_body)
+    if spec.effort_style == "output_config":
+        # MiniMax 的思考深度档位。实测这个档位在本负载上不是个有效的旋钮
+        # （low/medium/high/max 两列都非单调，max 反而最快）—— 但它决定花多少
+        # token，写死在配置里比吃服务端默认值可控。
+        effort = resolve_minimax_effort()
+        if effort is not None:
+            extra_body["output_config"] = {"effort": effort}
+
+    # ---- 重试次数 ----
+    max_retries = spec.max_retries
+    for prefix, retries in spec.retry_rules:
+        if model_name.startswith(prefix):
+            max_retries = retries
+            break
+
+    client_cls = getattr(sys.modules[__name__], _OPENAI_CLIENT_KINDS[spec.client_kind])
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "api_key": api_key,
+        "temperature": temperature,
+        "base_url": base_url,
+        # 显式传而不是 **dict 解包：解包会让类型检查器把整个 dict 当成
+        # **kwargs 逐个参数校验，一堆误报。空的时候给 None（不发这个字段）。
+        "extra_body": extra_body or None,
+    }
+    if spec.stream_usage:
+        # 必须显式开：langchain-openai 只有在流式请求且 stream_usage=True 时
+        # 才把 provider 报的 usage 转发回来。不开的话，**每一次 LLM 调用的
+        # usage_metadata 都是 None** —— 于是遥测记 0（看起来像「这次调用免费」），
+        # 缓存命中率更是无从计算。
+        kwargs["stream_usage"] = True
+    if spec.request_timeout is not None:
+        # A bounded request timeout, because the default is not one. With
+        # `request_timeout` unset the OpenAI SDK waits 600s and langchain retries
+        # twice, so a single hung connection parks the whole agent for 30
+        # minutes with only "Waiting for LLM call response..." printed — there
+        # is no error, no retry limit, no way back. Reproduced on a phone over
+        # USB: the LLM call at 22:23:59 had still produced nothing at 22:36.
+        # Measured normal latency is seconds, so 180s is generous; one retry
+        # covers a single dropped connection without compounding a real outage.
+        kwargs["request_timeout"] = spec.request_timeout
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if spec.max_tokens_policy == "llamacpp":
+        # 思考链和正文**共用**这一个预算，所以思考开时要宽得多。
+        # （实测思考 ON + 256 token 的结果是 LengthFinishReasonError：思考吃满
+        # 预算，JSON 没写完。）
+        kwargs["max_tokens"] = (  # type: ignore[call-arg]  # field aliased to max_completion_tokens
+            settings.LLAMACPP_MAX_TOKENS_THINKING
+            if thinking_value
+            else settings.LLAMACPP_MAX_TOKENS
+        )
+    if spec.session_query_param and trace_id:
+        kwargs["default_query"] = {spec.session_query_param: trace_id}
+        headers = _build_custom_headers(agent_name)
+        if headers:
+            kwargs["default_headers"] = headers
+
+    return client_cls(**kwargs)
+
+
+@overload
+def get_llm(
+    ctx: MobileUseContext,
+    name: AgentNodeWithFallback,
+    *,
+    use_fallback: bool = False,
     temperature: float = 1,
 ) -> BaseChatModel: ...
 
@@ -1412,37 +1523,29 @@ def get_llm(
     # (hopper=0 / video_analyzer=0.2 / 其余 1)。
     effective_temperature = llm.temperature if llm.temperature is not None else temperature
 
-    if llm.provider == "anthropic":
-        return get_anthropic_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "openai":
-        return get_openai_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "google":
-        return get_google_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "vertexai":
-        return get_vertex_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "openrouter":
-        return get_openrouter_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "xai":
-        return get_grok_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "azure":
-        return get_azure_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "minimax":
-        return get_minimax_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "deepseek":
-        return get_deepseek_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "siliconflow":
-        return get_siliconflow_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "llamacpp":
-        return get_llamacpp_llm(llm.model, effective_temperature, override)
-    elif llm.provider == "minitap":
-        return get_minitap_llm(
-            trace_id=ctx.trace_id,
-            model=llm.model,
-            temperature=effective_temperature,
+    # 按**协议**分派，不是按渠道 id 分派。
+    #
+    # 渠道 → 协议 → 客户端实现。渠道之间的差别（默认端点、思考开关的形状、
+    # 能不能强制 tool_choice）全在渠道目录里；这里只决定「用哪套客户端」。
+    spec = require_channel(llm.provider)
+    if spec.protocol == "openai":
+        return build_openai_protocol_client(
+            spec,
+            llm.model,
+            effective_temperature,
+            override,
             agent_name=name,
-            override=override,
+            trace_id=ctx.trace_id,
         )
-    else:
+    elif spec.protocol == "anthropic":
+        return get_anthropic_llm(llm.model, effective_temperature, override)
+    elif spec.protocol == "google":
+        return get_google_llm(llm.model, effective_temperature, override)
+    elif spec.protocol == "vertexai":
+        return get_vertex_llm(llm.model, effective_temperature, override)
+    elif spec.protocol == "azure":
+        return get_azure_llm(llm.model, effective_temperature, override)
+    else:  # pragma: no cover —— 目录里没有别的协议了
         raise ValueError(f"Unsupported provider: {llm.provider}")
 
 
@@ -1466,13 +1569,16 @@ def get_structured_llm(
 
     * ``structured_output_strategy == "json_schema"``（llamacpp）→ 走
       ``llm.with_structured_output(schema)``，即原生语法约束。
-    * 其它（默认）→ 保持原样：``_ToolCallStructuredRunnable(llm, schema)``，与改动前
-      **逐字同构**（同样把 schema 绑成工具、同样 force_tool_choice=True）。
+    * 其它（默认）→ ``_ToolCallStructuredRunnable(llm, schema)``。
 
-    ⚠️ 不要图省事把 executor / reporter 直接改成 ``llm.with_structured_output(schema)``：
-    DeepSeek 的 ``with_structured_output`` 用
-    ``force_tool_choice=settings.DEEPSEEK_THINKING is False``，而直连
-    ``_ToolCallStructuredRunnable`` 恒为 True —— 直接换会**悄悄改变 DeepSeek 的行为**。
+    「能不能强制 tool_choice」也问客户端自己（``should_force_tool_choice()``），
+    **不再写死 True**。
+
+    ⚠️ 这条正是 DeepSeek 之前一直 400 的地方：executor / reporter 走的是这里，
+    而这里恒为 ``force_tool_choice=True``，于是「思考模式 + 强制 tool_choice」被
+    服务端拒绝（400 "Thinking mode does not support this tool_choice"）——
+    DeepSeek 的推理模型默认就开着思考，所以每个 agent 节点全挂。
+    现在由客户端根据**这次请求思考开着没有**来回答。
     """
     llm = get_llm(ctx=ctx, name=name, use_fallback=use_fallback, temperature=temperature)
     if getattr(llm, "structured_output_strategy", "tool") == "json_schema":
@@ -1480,7 +1586,11 @@ def get_structured_llm(
     # `_ToolCallStructuredRunnable` 的 llm 形参标的是 ChatOpenAI，但 get_llm 返回的
     # 是 BaseChatModel（anthropic 渠道甚至不是 ChatOpenAI）。它只用到 bind_tools，
     # 所以这里放宽成 Any —— 不去动 services/llm.py 里那个类的签名。
-    return _ToolCallStructuredRunnable(cast("Any", llm), schema)
+    force = getattr(llm, "should_force_tool_choice", None)
+    force_tool_choice = force() if callable(force) else True
+    return _ToolCallStructuredRunnable(
+        cast("Any", llm), schema, force_tool_choice=force_tool_choice
+    )
 
 
 T = TypeVar("T")
