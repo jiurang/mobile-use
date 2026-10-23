@@ -38,7 +38,16 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import Runnable
 
 from minitap.mobile_use.agents.cortex.dispatcher import dispatch_decisions_with_reason
-from minitap.mobile_use.agents.executor.prompt import build_executor_messages
+from minitap.mobile_use.agents.executor.prompt import (
+    build_executor_messages,
+    render_device_state,
+    render_dispatch_rejection,
+    render_done_fallback,
+    render_extra_actions_notice,
+    render_no_goal_message,
+    render_retry_nudge,
+    render_step_limit_message,
+)
 from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
@@ -145,7 +154,9 @@ class ExecutorNode:
                 ctx=self.ctx,
                 update={
                     "executor_done": True,
-                    "executor_messages": [AIMessage(content="no goal was provided, cannot act")],
+                    "executor_messages": [
+                        AIMessage(content=render_no_goal_message(language=self.ctx.prompt_language))
+                    ],
                 },
                 agent="executor",
             )
@@ -191,8 +202,8 @@ class ExecutorNode:
             )
             return await emit(
                 AIMessage(
-                    content=(
-                        f"step limit of {MAX_STEPS_PER_SUBGOAL} reached; stopping and reporting"
+                    content=render_step_limit_message(
+                        MAX_STEPS_PER_SUBGOAL, language=self.ctx.prompt_language
                     )
                 ),
                 done=True,
@@ -208,7 +219,11 @@ class ExecutorNode:
         # （独立验收 2026-10-21 查出的致命 bug 1）。
         if response.done:
             return await emit(
-                AIMessage(content=response.done_reason or response.agent_thought or "goal reached"),
+                AIMessage(
+                    content=response.done_reason
+                    or response.agent_thought
+                    or render_done_fallback(language=self.ctx.prompt_language)
+                ),
                 done=True,
             )
 
@@ -256,10 +271,8 @@ class ExecutorNode:
             return await emit(
                 AIMessage(content=response.agent_thought or ""),
                 HumanMessage(
-                    content=(
-                        f"Your previous action was NOT executed: {reject_reason}. "
-                        "Decide again — read the Tools table and the current "
-                        "screen element list."
+                    content=render_dispatch_rejection(
+                        reject_reason or "", language=self.ctx.prompt_language
                     )
                 ),
             )
@@ -273,9 +286,8 @@ class ExecutorNode:
         # 下一轮要重新决定（否则它会以为那些动作已经做过了）。
         extra_note = ""
         if len(response.actions) > 1:
-            extra_note = (
-                f" Only the first of your {len(response.actions)} actions was executed; "
-                "the rest were discarded and must be decided again next round."
+            extra_note = render_extra_actions_notice(
+                len(response.actions), language=self.ctx.prompt_language
             )
 
         return await emit(
@@ -296,23 +308,17 @@ class ExecutorNode:
         解析失败**不会**返回 None —— 内部已经降级成「空动作 + 说明」，
         调用方拿到的永远是一个可用的输出对象。
         """
-        device_state_lines: list[str] = []
-        if state.device_date:
-            device_state_lines.append(f"Device date: {state.device_date}")
-        if state.focused_app_info:
-            device_state_lines.append(f"Focused app info: {state.focused_app_info}")
-        if state.screen_state == "off":
-            # 息屏时元素表只剩 systemui 残留 —— 不告诉模型，
-            # 它就会在黑屏上反复尝试（真机实测：30 步 → 51 步没跑完）。
-            #
-            # ⚠️ **这段里不许出现 "screenshot"**：模型看不到图，
-            # 提示词里就不该有图相关的词（否则它会以为自己能看图）。
-            device_state_lines.append(
-                "Screen is OFF (the device is asleep). The element list only holds "
-                "systemui leftovers, so there is nothing to act on. Call wake_screen "
-                "FIRST, then read the screen again on the next turn."
-            )
-        device_state_lines.extend(self._perception_state_lines())
+        # 设备状态也是模板块（措辞在 executor.md / executor-zh.md 里）。
+        # 息屏 / 无感知通道的告知都在这个宏里 —— 不告诉模型，它就会在黑屏
+        # 上反复尝试（真机实测：30 步 → 51 步没跑完）。
+        device_state = render_device_state(
+            device_date=state.device_date,
+            focused_app_info=state.focused_app_info,
+            screen_off=state.screen_state == "off",
+            no_perception=not (self.ctx.perception.ui_hierarchy or self.ctx.perception.ocr),
+            language=self.ctx.prompt_language,
+        )
+        device_state_lines = [device_state] if device_state else []
 
         messages = build_executor_messages(
             ctx=self.ctx,
@@ -364,13 +370,7 @@ class ExecutorNode:
             retry_messages = [
                 *messages,
                 HumanMessage(
-                    content=(
-                        f"Your last answer could not be used: {failure_reason}. "
-                        "You must call the "
-                        "ExecutorOutput tool with the fields (actions, agent_thought, "
-                        "done, done_reason). Do not write the output "
-                        "as plain text — a plain-text answer is discarded."
-                    )
+                    content=render_retry_nudge(failure_reason, language=self.ctx.prompt_language)
                 ),
             ]
             response, retry_reason = await self._invoke(runner, retry_messages, schema)
@@ -410,34 +410,6 @@ class ExecutorNode:
         )
 
         return response
-
-    def _perception_state_lines(self) -> list[str]:
-        """感知通道被关掉时，**如实告诉模型**它现在能看到什么。
-
-        为什么要有这一段
-        ----------------
-        Manager 把 UI 元素表和 OCR 都关掉时，Executor 手里**什么都没有**。
-        不告诉它，它就会对着空气猜「屏幕上有个搜索框」→ 报出一个不存在的
-        目标 → 工具回「不在屏上」→ 它再猜 → 原地打转。
-
-        这里**不阻断**（照跑、照上报），只把事实摆给它，让它在
-        `agent_thought` 里如实说「我看不见屏幕」，而不是编一个目标。
-
-        判据用 `ctx.perception`（Manager 侧的开关），和 prompt 侧裁 prompt
-        用的是同一份配置 —— 两边不一致就会出现「提示词说有通道、实际没有」。
-        """
-        perception = self.ctx.perception
-        if perception.ui_hierarchy or perception.ocr:
-            return []  # 至少还有一条文本通道，不用多说
-
-        # ⚠️ **这段里不许出现 "screenshot" / "picture"**：模型看不到图，
-        # 提示词里就不该有图相关的词。
-        return [
-            "NO perception channel is available: the UI element list and the OCR "
-            "text are both OFF. You have no description of the screen at all - "
-            "do not invent what is on it. Say plainly in agent_thought that you "
-            "cannot act without a screen description."
-        ]
 
     async def _invoke(
         self,

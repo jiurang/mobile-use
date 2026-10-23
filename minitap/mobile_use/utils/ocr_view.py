@@ -45,11 +45,12 @@ def _truncate(text: str) -> str:
     return text[: MAX_TEXT_CHARS - 1] + "…"
 
 
-def render_ocr_results(results: list[OcrText] | None) -> str:
-    """渲染 OCR 文本块；没有结果时返回空串（调用方据此不发消息）。
+def render_ocr_rows(results: list[OcrText] | None) -> str:
+    """只渲染 OCR 数据行（不带表头）；没有结果时返回空串。
 
     编号从 1 开始、连续、不跳号，且与 `results` 的下标严格对应
     （`[i]` 就是 `results[i-1]`）。这条契约由 `resolve_ocr_index` 兑现。
+    表头属于提示词，住在 Executor 的模板里（按语言翻译）；编号规则不行。
 
     Args:
         results: OCR 引擎的输出，已按阅读顺序排列。
@@ -58,13 +59,24 @@ def render_ocr_results(results: list[OcrText] | None) -> str:
         return ""
 
     logger.debug(f"OCR view: rendering {len(results)} texts")
-    lines = [
+    return "\n".join(
         f"[{index}] {json.dumps(_truncate(item.text), ensure_ascii=False)} "
         f"({item.bounds.x},{item.bounds.y},{item.bounds.width}x{item.bounds.height}) "
         f"{item.score:.2f}"
         for index, item in enumerate(results, 1)
-    ]
-    return f"{_HEADER}\n" + "\n".join(lines)
+    )
+
+
+def render_ocr_results(results: list[OcrText] | None) -> str:
+    """表头 + 数据行（英文默认版）；没有结果时返回空串。
+
+    Executor 的提示词走 `render_ocr_rows` + 模板表头（支持中英切换）；
+    这个函数保留给测试 / 脚本 / 其它需要独立英文块的调用方。
+    """
+    rows = render_ocr_rows(results)
+    if not rows:
+        return ""
+    return f"{_HEADER}\n{rows}"
 
 
 def resolve_ocr_index(

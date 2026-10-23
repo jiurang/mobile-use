@@ -288,12 +288,13 @@ def build_screen_elements(
     return elements
 
 
-def render_screen_elements(elements: list[ScreenElement]) -> str:
-    """把元素表渲染成给模型看的那一块。
+def render_screen_rows(elements: list[ScreenElement]) -> str:
+    """只渲染数据行（不带表头）。空表返回空串。
 
-    行格式和旧的 UI 块保持一致（`[i] "text" id=... Class (x,y,WxH) flags`），
-    只是 OCR 行并进了同一张表、共享同一套编号。OCR 行没有 id 和 flags，
-    末尾带 OCR 置信度。
+    **索引契约的唯一来源**：这里印出的 `[i]` 和 `resolve_screen_index` 吃的
+    下标是同一条契约的两端。表头属于提示词，住在 Executor 的模板里
+    （`executor.md` / `executor-zh.md` 的 `screen_elements_message`），
+    所以表头可以按语言翻译，编号规则不行。
     """
     if not elements:
         return ""
@@ -315,7 +316,19 @@ def render_screen_elements(elements: list[ScreenElement]) -> str:
         if element.kind == "ocr" and element.confidence is not None:
             parts.append(f"{element.confidence:.2f}")
         lines.append(f"[{element.index}] " + " ".join(parts))
-    return f"{_HEADER}\n" + "\n".join(lines)
+    return "\n".join(lines)
+
+
+def render_screen_elements(elements: list[ScreenElement]) -> str:
+    """表头 + 数据行（英文默认版）。
+
+    Executor 的提示词走 `render_screen_rows` + 模板表头（支持中英切换）；
+    这个函数保留给测试 / 脚本 / 其它需要独立英文块的调用方。
+    """
+    rows = render_screen_rows(elements)
+    if not rows:
+        return ""
+    return f"{_HEADER}\n{rows}"
 
 
 def resolve_screen_index(

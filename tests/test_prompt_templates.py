@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = ROOT / "scripts" / "check_prompt_templates.py"
 _AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
 _EXECUTOR_MD = _AGENTS_DIR / "executor" / "executor.md"
+_EXECUTOR_ZH_MD = _AGENTS_DIR / "executor" / "executor-zh.md"
 _REPORTER_MD = _AGENTS_DIR / "reporter" / "reporter.md"
 
 
@@ -38,6 +39,13 @@ def _load() -> ModuleType:
 def _render(template_path: Path, variables: dict[str, object]) -> str:
     env = Environment(undefined=StrictUndefined, autoescape=False)
     return env.from_string(template_path.read_text(encoding="utf-8")).render(**variables)
+
+
+def _render_executor_system(variables: dict[str, object], path: Path = _EXECUTOR_MD) -> str:
+    """Executor 的模板是宏库：正文的渲染入口是 `system_message` 宏。"""
+    env = Environment(undefined=StrictUndefined, autoescape=False)
+    template = env.from_string(path.read_text(encoding="utf-8"))
+    return template.module.system_message(**variables)
 
 
 def _perception(
@@ -65,63 +73,82 @@ def test_every_agent_prompt_is_registered():
     assert on_disk - set(template_vars) == set(), "有 .md 没登记渲染变量，无法校验"
 
 
-def test_executor_template_declares_exactly_four_vars():
-    """executor.md 的模板变量恰好四个：platform / executor_tools_list / goal / perception。
+def test_executor_template_declares_exactly_three_vars():
+    """executor.md 的 system_message 变量恰好三个：platform / executor_tools_list / perception。
 
     多一个 → 渲染端要多传一个（调用点会对不上）；少一个 → 模板引用了没传的变量。
 
     `perception` 是**感知通道开关状态**（Manager 侧）：两条通道开着哪几条，
     提示词里必须写清楚 —— 否则模型会按一个被关掉的通道去寻址。
     一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
+
+    目标**不是** system prompt 的变量：它每子目标变，只能走独立消息块。
     """
     template_vars = _load().TEMPLATE_VARS
     assert set(template_vars["executor/executor.md"]) == {
         "platform",
         "executor_tools_list",
-        "goal",
         "perception",
     }
-    # goal 必须登记成「取值可能为空」的变量，否则 {% if goal %} 的 else 分支
-    # 永远编不到 —— 写坏了也能「全过」。
-    assert "goal" in _load().OPTIONAL_VARS
+    assert set(template_vars["executor/executor-zh.md"]) == {
+        "platform",
+        "executor_tools_list",
+        "perception",
+    }
+
+
+def test_executor_templates_own_every_message_block():
+    """所有进 prompt 的块都必须是模板宏 —— 代码不再自带文案。
+
+    宏名就是「块契约」：prompt.py / executor.py 按名字取，提示词作者只改
+    ``.md``。中英两份必须逐个对齐，缺一个就会在 zh 运行时回落成空串。
+    """
+    macros = (
+        "system_message",
+        "goal_message",
+        "failures_message",
+        "device_state_message",
+        "screen_elements_message",
+        "ocr_message",
+        "dispatch_rejection_message",
+        "retry_message",
+        "extra_actions_message",
+        "step_limit_message",
+        "no_goal_message",
+        "done_fallback_message",
+    )
+    for path in (_EXECUTOR_MD, _EXECUTOR_ZH_MD):
+        text = path.read_text(encoding="utf-8")
+        for macro in macros:
+            assert f"macro {macro}(" in text, f"{path.name} 缺少宏 {macro}"
 
 
 def test_executor_prompt_renders_without_leftover_placeholders():
     """渲染后不能残留 Jinja 占位符 —— 残留在 prompt 里等于给了模型一句废话。"""
-    rendered = _render(
-        _EXECUTOR_MD,
+    rendered = _render_executor_system(
         {
             "platform": "android",
             "executor_tools_list": "tap, back",
-            "goal": "打开快手赚钱",
             "perception": _perception(),
-        },
+        }
     )
     assert "{{" not in rendered and "{%" not in rendered
-    assert "打开快手赚钱" in rendered
-    assert "Your goal:" in rendered
+    assert "You are the **Executor**" in rendered
+    assert "## Tools" in rendered
 
 
-def test_executor_prompt_survives_an_empty_goal():
-    """goal 传空串时 prompt 仍然完整。
+def test_executor_system_prompt_does_not_carry_the_goal():
+    """目标每子目标变 → 只能走独立消息块，绝不能进 system prompt。
 
-    目标有两种放法：渲染进 system prompt（契约 W1.1），或者留空、由调用方
-    放在紧随其后的消息块里（Executor 节点的选择 —— 目标每子目标变，进
-    system prompt 会让整块缓存每换一次子目标就重算）。两种都得能用。
+    一旦内联，换子目标时整块 system 缓存从目标那一行起全部重算。
     """
-    rendered = _render(
-        _EXECUTOR_MD,
-        {
-            "platform": "android",
-            "executor_tools_list": "tap, back",
-            "goal": "",
-            "perception": _perception(),
-        },
-    )
-    assert "{{" not in rendered and "{%" not in rendered
-    # 不能留下一句空的 "Your goal:" 让模型以为渲染坏了
-    assert "Your goal: \n" not in rendered
-    assert "Your goal:" in rendered
+    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    system_part, marker, blocks_part = text.partition("{%- macro goal_message")
+    assert marker, "executor.md 缺少 goal_message 宏"
+    assert "{{ goal }}" not in system_part
+    assert "{% if goal" not in system_part
+    # 目标只能从消息块进来
+    assert "{{ goal }}" in blocks_part
 
 
 def test_executor_prompt_is_an_independent_decider():

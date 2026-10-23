@@ -251,8 +251,10 @@ def test_executor_prompt_follows_the_switch():
     zh = render_executor_system(_ctx(PromptLanguage.ZH))
     assert "You are the **Executor**" in en
     assert "你是 **Executor**" in zh
-    # 索引契约的字面量不许翻
-    assert "`ocr_index`" in zh
+    # 索引契约的字面量不许翻 —— 它住在 OCR 块的宏里（无元素表时才追加），
+    # 不在 system prompt 正文里。
+    zh_template = (_AGENTS_DIR / "executor/executor-zh.md").read_text(encoding="utf-8")
+    assert "`ocr_index`" in zh_template
 
 
 def test_cortex_prompt_follows_the_switch(monkeypatch: MonkeyPatch):

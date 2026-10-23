@@ -14,6 +14,13 @@
 实测数字见 ``doc/executor-autonomy-plan.md`` §4.1.1，
 复现脚本 ``scripts/audit_executor_cache_layout.py``。
 
+**文案全部由模板宏提供**
+--------------------
+``executor.md`` / ``executor-zh.md`` 是**宏库**：正文在 ``system_message`` 宏里，
+其余每个运行时消息块（目标 / 失败 / 设备 / 元素表 / OCR / 反馈）也各是一个宏。
+本模块只负责**按顺序把宏的渲染结果放进消息列表**，不再自带任何提示词散文。
+唯一的例外是元素行 / OCR 行 —— 它们的编号契约要和工具侧的反解共用，不能拆两份。
+
 **另一条硬约束：不要 bind_tools 那 16 个设备工具。**
 bind_tools 的 JSON schema 是 4,008 token，而且**不参与缓存键**（实测 E5），
 所以每轮都按满价计费。Executor 的工具用法靠 ``executor.md`` 里的
@@ -75,40 +82,53 @@ from langchain_core.messages import (
 )
 
 from minitap.mobile_use.context import MobileUseContext
-from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template, pick
+from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template
 from minitap.mobile_use.tools.index import format_tools_list
-from minitap.mobile_use.utils.failed_targets import render_failure_facts
-from minitap.mobile_use.utils.ocr_view import render_ocr_results
-from minitap.mobile_use.utils.screen_elements import ScreenElement, render_screen_elements
+from minitap.mobile_use.utils.failed_targets import describe
+from minitap.mobile_use.utils.ocr_view import render_ocr_rows
+from minitap.mobile_use.utils.screen_elements import ScreenElement, render_screen_rows
 from minitap.mobile_use.utils.thoughts_compaction import split_sentences
 
 EXECUTOR_PROMPT_PATH = Path(__file__).parent / "executor.md"
 
 
+def _blocks(language: PromptLanguage):
+    """模板里的宏集合：``system_message`` + 各运行时消息块。
+
+    **所有会进 prompt 的文案都住在 ``.md`` 里**，代码只负责挑数据：
+    系统消息、目标、失败事实、设备状态、元素表表头、OCR 说明、反馈语。
+    唯一的例外是元素行 / OCR 行本身 —— 它们由共用渲染器生成，因为编号
+    契约是「渲染」和「反解」两端共用的，不能拆成两份。
+
+    ``load_prompt_template`` 按 ``(路径, 语言)`` 缓存编译结果，
+    ``Template.module`` 也是缓存属性 ⇒ 同一份模板只编译一次。
+    """
+    return load_prompt_template(EXECUTOR_PROMPT_PATH, language).module
+
+
 def render_executor_system(ctx: MobileUseContext) -> str:
     """渲染 Executor 的 system prompt（静态部分）。
 
-    ``executor.md`` 的模板变量：``platform`` / ``executor_tools_list`` /
-    ``goal`` / ``perception``。
+    ``system_message`` 宏的参数：``platform`` / ``executor_tools_list`` /
+    ``perception``。
 
-    ⚠️ **``goal`` 故意传空串**：目标是**每子目标**变的，放进 system prompt
+    ⚠️ **目标不在这个宏里**：目标是**每子目标**变的，放进 system prompt
     会让整个 system 块在换子目标时全部重算。目标走独立的消息块
-    （见 `build_executor_messages` 的 [2]），子目标内它是恒定的。
+    （``goal_message``，见 `build_executor_messages` 的 [2]），子目标内它是恒定的。
 
-    ``perception`` 传的是**通道开关状态**（`ctx.perception`）：三条通道
+    ``perception`` 传的是**通道开关状态**（`ctx.perception`）：两条通道
     开着哪几条，在一次运行里是恒定的 ⇒ 它落在 system prompt 里不会伤缓存，
-    但模型必须知道 —— 否则它会一直举手要一张**永远不会来的**图。
+    但模型必须知道 —— 否则它会按一个被关掉的通道寻址。
 
     语言跟着 ``ctx.prompt_language`` 走（``en`` → ``executor.md``，
     ``zh`` → ``executor-zh.md``）。
     """
-    return load_prompt_template(EXECUTOR_PROMPT_PATH, ctx.prompt_language).render(
+    return _blocks(ctx.prompt_language).system_message(
         platform=ctx.device.mobile_platform.value,
         executor_tools_list=format_tools_list(
             ctx=ctx,
             wrappers=list(_executor_wrappers(ctx)),
         ),
-        goal="",
         perception=ctx.perception,
     )
 
@@ -122,53 +142,84 @@ def _executor_wrappers(ctx: MobileUseContext):
     return wrappers
 
 
-def render_device_state(state_lines: list[str]) -> str:
-    """设备状态块（息屏 / 前台 app / 日期）。
+def render_goal_message(goal: str, *, language: PromptLanguage) -> str:
+    """目标陈述块（子目标内恒定，排在局部历史之前才能被缓存覆盖）。"""
+    return _blocks(language).goal_message(goal=goal)
 
-    息屏那行是关键：真机实测 30 分钟息屏超时让一个任务从 30 步涨到 51 步
+
+def render_failures_message(failures: list[dict], *, language: PromptLanguage) -> str:
+    """跨子目标的失败事实块；空账本返回空串（调用方据此不发消息）。
+
+    每条事实的描述由 ``describe`` 拼 —— 它和 Cortex / 熔断器看到的是同一份
+    身份格式，搬进模板的只有**措辞**。
+    """
+    facts = [
+        {
+            "desc": describe(item.get("index"), item.get("resource_id"), item.get("label")),
+            "reason": item.get("reason") or "",
+        }
+        for item in (failures or [])
+    ]
+    if not facts:
+        return ""
+    return _blocks(language).failures_message(failures=facts)
+
+
+def render_device_state(
+    *,
+    device_date: str | None = None,
+    focused_app_info: str | None = None,
+    screen_off: bool = False,
+    no_perception: bool = False,
+    language: PromptLanguage,
+) -> str:
+    """设备状态块（日期 / 前台 app / 息屏 / 无感知通道）；无内容返回空串。
+
+    息屏那句是关键：真机实测 30 分钟息屏超时让一个任务从 30 步涨到 51 步
     还没跑完 —— 模型看不到「屏是黑的」，就在黑屏上反复尝试。
     """
-    return "\n".join(state_lines)
+    return _blocks(language).device_state_message(
+        device_date=device_date,
+        focused_app_info=focused_app_info,
+        screen_off=screen_off,
+        no_perception=no_perception,
+    )
 
 
-# 无元素表时的说明段。放在 OCR 块**前面**：模型是从上往下读的，
-# 一旦先看到 `[i]`，它就会照着静态提示词里「index 直接用」那句话去填
-# `index` —— 而无元素表时 `index` 必然解析失败，每个动作都被工具拒掉。
-#
-# ⚠️ **字面量不许翻**：`ocr_index` / `index` 是模型要填的字段名，
-# 那句报错原文是**工具真的会给出来的字符串**（模型要照着它认错）。
-_NO_TABLE_NOTE_EN = """\
-NO SCREEN ELEMENT TABLE ON THIS SCREEN.
-There is no element table here (the device could not report one, or the UI
-element channel is off), so the OCR block below is the whole screen description.
-
-Address those lines with **`ocr_index`** - the leading `[i]` of the OCR block,
-1-based, copied verbatim. Do NOT use `index` here: with no table there is no row
-for it to point at, so every `index` target fails with:
-"index=N is not a row in the screen element table (no table)".
-
-```json
-{"action": "tap", "target": {"ocr_index": 3}}
-```
-"""
-
-_NO_TABLE_NOTE_ZH = """\
-本屏没有屏幕元素表。
-这里没有元素表（设备没报上来，或者 UI 元素通道关着），所以下面的 OCR 块就是
-整屏的描述。
-
-用 **`ocr_index`** 寻址那些行 —— OCR 块行首的 `[i]`，1-based，原样照填。
-这里**不要**用 `index`：没有表就没有行可指，每个 `index` 目标都会失败并报：
-"index=N is not a row in the screen element table (no table)"。
-
-```json
-{"action": "tap", "target": {"ocr_index": 3}}
-```
-"""
+def render_screen_message(elements: list[ScreenElement] | None, *, language: PromptLanguage) -> str:
+    """元素表块：表头在模板里，行由共用渲染器生成（索引契约不能拆两份）。"""
+    rows = render_screen_rows(elements or [])
+    if not rows:
+        return ""
+    return _blocks(language).screen_elements_message(rows=rows)
 
 
-def _no_table_note(language: PromptLanguage) -> str:
-    return pick(_NO_TABLE_NOTE_EN, _NO_TABLE_NOTE_ZH, language=language)
+def render_dispatch_rejection(reason: str, *, language: PromptLanguage) -> str:
+    """动作没被派发时的回灌（不是 ToolMessage：那份没有对应的 tool_call）。"""
+    return _blocks(language).dispatch_rejection_message(reason=reason)
+
+
+def render_retry_nudge(reason: str | None, *, language: PromptLanguage) -> str:
+    """解析失败后重试一次时的提醒，必须带上**具体**失败原因。"""
+    return _blocks(language).retry_message(reason=reason)
+
+
+def render_extra_actions_notice(count: int, *, language: PromptLanguage) -> str:
+    """一轮只执行第一个动作时，告诉模型其余动作没有被执行。"""
+    return _blocks(language).extra_actions_message(count=count)
+
+
+def render_step_limit_message(limit: int, *, language: PromptLanguage) -> str:
+    return _blocks(language).step_limit_message(limit=limit)
+
+
+def render_no_goal_message(*, language: PromptLanguage) -> str:
+    return _blocks(language).no_goal_message()
+
+
+def render_done_fallback(*, language: PromptLanguage) -> str:
+    """``done`` 但没有 done_reason / agent_thought 时的收尾文案。"""
+    return _blocks(language).done_fallback_message()
 
 
 def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
@@ -189,18 +240,21 @@ def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
 
 
 def render_legacy_ocr_block(ocr_results: list | None, language: PromptLanguage) -> str:
-    """没有元素表时的屏幕描述：说明段 + 共用的 OCR 渲染。
+    """没有元素表时的屏幕描述：说明段 + 表头 + 共用的 OCR 行。
 
-    ``render_ocr_results`` 是**共用**的，不能改它 —— 它打的 ``[i]`` 和
-    ``ocr_view.resolve_ocr_index`` 吃的下标是同一条契约的两端。这里只在
-    前面加说明，编号本身一个字节都不动。
+    ``render_ocr_rows`` 是**共用**的，不能改它 —— 它打的 ``[i]`` 和
+    ``ocr_view.resolve_ocr_index`` 吃的下标是同一条契约的两端。模板只加
+    说明和表头，编号本身一个字节都不动。
+
+    ⚠️ **字面量不许翻**：``ocr_index`` / ``index`` 是模型要填的字段名，
+    那句报错原文是**工具真的会给出来的字符串**（模型要照着它认错）。
 
     没有 OCR 结果时返回空串（调用方据此不发消息）。
     """
-    body = render_ocr_results(ocr_results)
-    if not body:
+    rows = render_ocr_rows(ocr_results)
+    if not rows:
         return ""
-    return f"{_no_table_note(language)}\n{body}"
+    return _blocks(language).ocr_message(rows=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -509,13 +563,7 @@ def build_executor_messages(
     """
     messages: list[BaseMessage] = [
         SystemMessage(content=render_executor_system(ctx)),
-        HumanMessage(
-            content=pick(
-                f"Your goal:\n{goal}",
-                f"你的目标：\n{goal}",
-                language=ctx.prompt_language,
-            )
-        ),
+        HumanMessage(content=render_goal_message(goal, language=ctx.prompt_language)),
     ]
 
     # 局部历史在「每轮变的块」**之前** —— 见模块文档的顺序说明。
@@ -542,18 +590,18 @@ def build_executor_messages(
     # ⚠️ 顺序不是随便定的：**元素表必须仍在最后**（它每轮重编号，永不缓存），
     # 设备状态和失败清单放在它前面、局部历史之后。
 
-    failure_line = render_failure_facts(failures)
+    failure_line = render_failures_message(failures, language=ctx.prompt_language)
     if failure_line:
         messages.append(HumanMessage(content=failure_line))
 
     if device_state_lines:
-        messages.append(HumanMessage(content=render_device_state(device_state_lines)))
+        messages.append(HumanMessage(content="\n".join(device_state_lines)))
 
     # 元素表：每轮都变，所以放最后。
     # 判据统一走 has_element_table —— 提示侧和工具侧必须用同一个判据。
     elements = screen_elements or []
     if has_element_table(elements):
-        screen_text = render_screen_elements(elements)
+        screen_text = render_screen_message(elements, language=ctx.prompt_language)
         if screen_text:
             messages.append(HumanMessage(content=screen_text))
     else:

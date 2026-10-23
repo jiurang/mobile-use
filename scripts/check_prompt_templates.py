@@ -88,12 +88,11 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "initial_goal": "打开快手赚钱",
         "previous_plan": "subgoal-0",
         "agent_thoughts": "thought",
-    },  # executor.py 的 system prompt 渲染（契约 W1.1）—— 四个变量，缺一不可。
-    # goal 放在模板**末尾**是有意的，不是随手写的：executor.md 里只有 goal 会变
-    # （Cortex 每下发一个子目标就换一个），而前缀缓存是**前缀**匹配 —— goal 后面
-    # 的一切每次换子目标都要重算。它前面那段静态内容（工具表、元素索引说明、
-    # 规则）因此能跨子目标一直命中。实测依据见 tools/index.py:69-89：system
-    # prompt 内部 58% 处一断，缓存从 10,477 token 掉到 1,169。
+    },  # executor.py 的 system prompt 渲染（契约 W1.1）—— 三个变量，缺一不可。
+    # 目标**不在** system prompt 里：它每换一个子目标就变，放进静态块会让
+    # 整段缓存从目标那一行起全部重算。目标走紧随其后的 `goal_message` 消息块。
+    # 实测依据见 tools/index.py:69-89：system prompt 内部 58% 处一断，
+    # 缓存从 10,477 token 掉到 1,169。
     #
     # `perception` 是**感知通道开关状态**（Manager 侧）：两条通道开着哪几条，
     # 提示词里要写清楚 —— 否则模型会按一个被关掉的通道去寻址。
@@ -101,7 +100,6 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
     "executor/executor.md": {
         "platform": "android",
         "executor_tools_list": "tools",
-        "goal": "打开快手赚钱",
         "perception": _Perception(True, True),
     },
     # executor.md 的中文兄弟文件。代码块、jinja 变量与英文版逐字节对齐，
@@ -109,7 +107,6 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
     "executor/executor-zh.md": {
         "platform": "android",
         "executor_tools_list": "tools",
-        "goal": "打开快手赚钱",
         "perception": _Perception(True, True),
     },
     # reporter.md **完全静态**：没有任何模板变量。Reporter 只写 summary + 挑
@@ -176,9 +173,7 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
 }
 
 # 这些变量在生产里取值可能为 None，每个取值都要编一遍。
-# goal 也要进来：executor.md 里它是「有就内联、没有就指向下一条消息」两个分支，
-# 只编一个分支的话，写坏的 {% else %} 照样「全过」。
-OPTIONAL_VARS = ("locked_app_package", "video_recording_enabled", "goal")
+OPTIONAL_VARS = ("locked_app_package", "video_recording_enabled")
 
 
 def _branches(base: dict[str, object]) -> list[dict[str, object]]:
@@ -211,12 +206,21 @@ def check() -> tuple[int, list[str]]:
     for rel in sorted(set(TEMPLATE_VARS) & on_disk):
         path = AGENTS_DIR / rel
         source = path.read_text(encoding="utf-8")
+        # Executor 的模板是「宏库」：正文住在 system_message 宏里，直接 render
+        # 只会输出空串（等于什么都没校验）。宏调用才是它真实的渲染入口。
+        # 用源码判断而不是 `hasattr(template.module, ...)`：后者会为了探测而
+        # 渲染**所有**模板的正文，别的模板缺变量时会在这里误报。
+        template = env.from_string(source)
+        is_macro_library = "macro system_message" in source
         for branch in _branches(TEMPLATE_VARS[rel]):
             detail = ", ".join(f"{k}={v!r}" for k, v in branch.items() if k in OPTIONAL_VARS)
             label = f"{rel} [{detail or '默认'}]"
             checked += 1
             try:
-                env.from_string(source).render(**branch)
+                if is_macro_library:
+                    template.module.system_message(**branch)
+                else:
+                    template.render(**branch)
             except Exception as e:  # noqa: BLE001 - 渲染期任何异常都算坏模板
                 failures.append(f"{label}: {type(e).__name__}: {e}")
     return checked, failures
