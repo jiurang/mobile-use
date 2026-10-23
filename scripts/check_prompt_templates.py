@@ -30,44 +30,30 @@ AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
 class _Perception:
     """感知开关的替身（和 `context.PerceptionConfig` 同形）。
 
-    `screenshot` 是**三态字符串**：`"always"` / `"on_demand"` / `"off"`。
-    模板用 `screenshot_channel` 分支（它就是 `screenshot` 本身），
-    用 `can_see_screenshot` 判「模型能不能看图」。
-
-    ⚠️ 老代码里 `screenshot` 是 `bool | "on_demand"`（`True`=每轮都带图），
-    混型导致真假判断到处是坑。现在统一成字符串枚举，`True`/`False`
-    在 `PerceptionConfig` 的校验器里就被收成 `"on_demand"`/`"off"`。
+    两条通道：UI 元素表 + OCR。图片通道已于 2026-10-23 下线 ——
+    屏幕截图不再进模型，所以模板里也没有第三种状态可编。
     """
 
     def __init__(
         self,
         ui_hierarchy: bool = True,
         ocr: bool = True,
-        screenshot: str = "on_demand",
     ) -> None:
         self.ui_hierarchy = ui_hierarchy
         self.ocr = ocr
-        self.screenshot = screenshot
-
-    @property
-    def screenshot_channel(self) -> str:
-        return self.screenshot
-
-    @property
-    def can_see_screenshot(self) -> bool:
-        return self.screenshot != "off"
 
 
 def _perception_variants() -> list[_Perception]:
     """感知开关的典型组合 —— 模板里每种都有一条分支，都要编到。
 
-    特别要编到 `"off"`：**不能看图时模板里不许出现图相关的词**，
-    那条分支（以及整段被跳过的内容）必须能正常渲染。
+    特别要编到**两条全关**：那时提示词里必须如实告诉模型「没有任何
+    视觉感知」，那条分支必须能正常渲染。
     """
     return [
-        _Perception(True, True, "always"),  # 每轮都带图
-        _Perception(True, True, "on_demand"),  # 默认：Executor 自己决定
-        _Perception(False, False, "off"),  # 全关（连图都没有）
+        _Perception(True, True),  # 默认：两条全开
+        _Perception(True, False),  # 只留 UI 元素表
+        _Perception(False, True),  # 只留 OCR
+        _Perception(False, False),  # 全关
     ]
 
 
@@ -102,22 +88,21 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "initial_goal": "打开快手赚钱",
         "previous_plan": "subgoal-0",
         "agent_thoughts": "thought",
-    },
-    # executor.py 的 system prompt 渲染（契约 W1.1）—— 四个变量，缺一不可。
+    },  # executor.py 的 system prompt 渲染（契约 W1.1）—— 四个变量，缺一不可。
     # goal 放在模板**末尾**是有意的，不是随手写的：executor.md 里只有 goal 会变
     # （Cortex 每下发一个子目标就换一个），而前缀缓存是**前缀**匹配 —— goal 后面
     # 的一切每次换子目标都要重算。它前面那段静态内容（工具表、元素索引说明、
     # 规则）因此能跨子目标一直命中。实测依据见 tools/index.py:69-89：system
     # prompt 内部 58% 处一断，缓存从 10,477 token 掉到 1,169。
     #
-    # `perception` 是**感知通道开关状态**（Manager 侧）：三条通道开着哪几条，
-    # 提示词里要写清楚 —— 否则模型会一直要一张不会来的图，或者按一个被关掉的
-    # 通道去寻址。一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
+    # `perception` 是**感知通道开关状态**（Manager 侧）：两条通道开着哪几条，
+    # 提示词里要写清楚 —— 否则模型会按一个被关掉的通道去寻址。
+    # 一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
     "executor/executor.md": {
         "platform": "android",
         "executor_tools_list": "tools",
         "goal": "打开快手赚钱",
-        "perception": _Perception(True, True, "on_demand"),
+        "perception": _Perception(True, True),
     },
     # executor.md 的中文兄弟文件。代码块、jinja 变量与英文版逐字节对齐，
     # 所以渲染变量表也保持一致。
@@ -125,14 +110,24 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "platform": "android",
         "executor_tools_list": "tools",
         "goal": "打开快手赚钱",
-        "perception": _Perception(True, True, "on_demand"),
+        "perception": _Perception(True, True),
     },
     # reporter.md **完全静态**：没有任何模板变量。Reporter 只写 summary + 挑
     # evidence，outcome / actions_taken / failed_targets 全由代码填（见
     # agents/executor/types.py:ExecutorReport），所以它不需要模板变量。
     "reporter/reporter.md": {},
+    # reporter 的中文兄弟文件：同样完全静态（变量表为空）。
+    "reporter/reporter-zh.md": {},
     # contextor.py:218
     "contextor/contextor.md": {
+        "task_goal": "打开快手赚钱",
+        "subgoal_plan": "subgoal-0",
+        "locked_app_package": "com.ss.android.ugc.aweme",
+        "current_app_package": "com.ss.android.ugc.aweme",
+        "agents_thoughts": ["thought"],
+    },
+    # contextor 的中文兄弟文件：变量表与英文版一致（zh 只翻散文，字面量不动）。
+    "contextor/contextor-zh.md": {
         "task_goal": "打开快手赚钱",
         "subgoal_plan": "subgoal-0",
         "locked_app_package": "com.ss.android.ugc.aweme",
@@ -147,13 +142,31 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "subgoals_to_examine": "subgoal-0",
         "agent_thoughts": "thought",
     },
+    # orchestrator 的中文兄弟文件（system + human 两块）。
+    "orchestrator/orchestrator-zh.md": {"platform": "android"},
+    "orchestrator/human-zh.md": {
+        "initial_goal": "打开快手赚钱",
+        "subgoal_plan": "subgoal-0",
+        "subgoals_to_examine": "subgoal-0",
+        "agent_thoughts": "thought",
+    },
     # hopper.py:29 —— .render() 无参
     "hopper/hopper.md": {},
+    # hopper 的中文兄弟文件：同样无参渲染。
+    "hopper/hopper-zh.md": {},
     # video_analyzer.py:58 / video_analyzer.py:62
     "video_analyzer/video_analyzer.md": {},
     "video_analyzer/human.md": {"prompt": "把视频里的数字报出来"},
     # outputter.py:28 —— system prompt 是硬编码字符串，没有 .md 模板
     "outputter/human.md": {
+        "initial_goal": "打开快手赚钱",
+        "agents_thoughts": "thought",
+        "structured_output": {"x": 1},
+        "output_description": "结构化输出",
+        "last_ai_message": "done",
+    },
+    # outputter 的中文兄弟文件：变量表一致。
+    "outputter/human-zh.md": {
         "initial_goal": "打开快手赚钱",
         "agents_thoughts": "thought",
         "structured_output": {"x": 1},
@@ -176,7 +189,7 @@ def _branches(base: dict[str, object]) -> list[dict[str, object]]:
             continue
         for value in (None, base[name]):
             variants.append({**base, name: value})
-    # perception 有三个独立开关，模板里每种组合都有分支 —— 都要编一遍。
+    # perception 有两个独立开关，模板里每种组合都有分支 —— 都要编一遍。
     if isinstance(base.get("perception"), _Perception):
         for perception in _perception_variants():
             variants.append({**base, "perception": perception})

@@ -13,6 +13,7 @@ from minitap.mobile_use.controllers.cloud_device_controller import (
     CloudAndroidController,
     CloudIosController,
 )
+from minitap.mobile_use.prompt_language import PromptLanguage
 from minitap.mobile_use.sdk.constants import DEFAULT_PROFILE_NAME
 from minitap.mobile_use.sdk.types.agent import (
     AgentConfig,
@@ -56,6 +57,7 @@ class AgentConfigBuilder:
         self._browserstack_config: BrowserStackClientConfig | None = None
         self._video_recording_enabled: bool = False
         self._perception: PerceptionConfig = PerceptionConfig()
+        self._prompt_language: PromptLanguage | None = None
         self._cloud_device_config: CloudDeviceConfig | None = None
         self._cloud_android_controller: CloudAndroidController | None = None
         self._cloud_ios_controller: CloudIosController | None = None
@@ -330,25 +332,21 @@ class AgentConfigBuilder:
         """
         Configure which perception channels the Executor receives.
 
-        This is the **Manager-side control surface** for perception: three
+        This is the **Manager-side control surface** for perception: two
         independent switches, each one only removes that channel's information
-        and cost - the other two are unaffected.
+        and cost - the other one is unaffected.
 
         * ``ui_hierarchy`` - the screen element table. Off => no table, the
           Executor addresses things by ``ocr_index`` instead.
         * ``ocr`` - OCR text. Off => Contextor does not run OCR at all
           (measured 381~443ms per step saved) and the Executor gets no OCR block.
-        * ``screenshot`` - **whether the model can look at the screen at all**:
-          ``"on_demand"`` (default - the **Executor decides**: it raises
-          ``need_screenshot`` and the current screen is attached to its next
-          turn), ``"always"`` (a picture every turn), or ``"off"`` (never).
 
-          With ``"off"`` the picture leaves **no trace**: no image words in the
-          prompt and no ``need_screenshot`` field in the output schema - a
-          model that cannot see images should not be told it can.
+        Note: the screen image is **not** a channel any more (retired
+        2026-10-23). It never reaches the model - the prompt has no image
+        words and the output schema has no "ask for a picture" field.
 
         Args:
-            perception: Screenshot / UI hierarchy / OCR switches, plus the OCR
+            perception: UI hierarchy / OCR switches, plus the OCR
                 engine configuration.
 
         Example:
@@ -356,12 +354,36 @@ class AgentConfigBuilder:
             >>> from minitap.mobile_use.services.ocr import OcrConfig
             >>> config = (Builders.AgentConfig
             ...     .with_perception(PerceptionConfig(
-            ...         screenshot="off",  # text-only model
             ...         ocr_config=OcrConfig(engine="paddle_onnx"),
             ...     ))
             ...     .build())
         """
         self._perception = copy.deepcopy(perception)
+        return self
+
+    def with_prompt_language(self, language: PromptLanguage) -> "AgentConfigBuilder":
+        """
+        Set the default language the agent prompts are written in.
+
+        ``"zh"`` loads the Chinese versions of the agent prompts (``*.md`` ->
+        ``*-zh.md``); ``"en"`` keeps the English originals.
+
+        This is the **agent-level** switch. A task can override it
+        (``task.with_prompt_language(...)``), and when neither is set the
+        ``MOBILE_USE_PROMPT_LANGUAGE`` env var decides.
+
+        Prompts that have no Chinese version yet fall back to English **with a
+        warning** - they are never blocked.
+
+        Args:
+            language: ``"en"`` or ``"zh"``
+
+        Example:
+            >>> config = (Builders.AgentConfig
+            ...     .with_prompt_language("zh")
+            ...     .build())
+        """
+        self._prompt_language = language
         return self
 
     def with_video_recording_tools(self) -> "AgentConfigBuilder":
@@ -450,6 +472,7 @@ class AgentConfigBuilder:
             browserstack_config=self._browserstack_config,
             video_recording_enabled=self._video_recording_enabled,
             perception=self._perception,
+            prompt_language=self._prompt_language,
             cloud_device_config=self._cloud_device_config,
             cloud_android_controller=self._cloud_android_controller,
             cloud_ios_controller=self._cloud_ios_controller,

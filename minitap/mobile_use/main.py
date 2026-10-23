@@ -15,6 +15,7 @@ from minitap.mobile_use.clients.ios_client_config import (
     WdaClientConfig,
 )
 from minitap.mobile_use.config import initialize_llm_config, settings
+from minitap.mobile_use.prompt_language import PromptLanguage
 from minitap.mobile_use.sdk import Agent
 from minitap.mobile_use.sdk.builders import Builders
 from minitap.mobile_use.sdk.types.agent import CloudDevicePlatform
@@ -53,6 +54,7 @@ async def run_automation(
     idb_port: int | None = None,
     device_type: DeviceType = DeviceType.LOCAL,
     cloud_platform: CloudDevicePlatform | None = None,
+    prompt_language: PromptLanguage | None = None,
 ):
     llm_config = initialize_llm_config()
     agent_profile = AgentProfile(name="default", llm_config=llm_config)
@@ -98,6 +100,9 @@ async def run_automation(
             task.with_name(test_name).with_trace_recording(path=traces_output_path_str)
         if output_description:
             task.with_output_description(output_description)
+        if prompt_language is not None:
+            # 任务级语言开关：**优先级最高**，盖过 Agent 级和环境变量。
+            task.with_prompt_language(prompt_language)
 
         agent_thoughts_path = os.getenv("EVENTS_OUTPUT_PATH", None)
         llm_result_path = os.getenv("RESULTS_OUTPUT_PATH", None)
@@ -223,6 +228,19 @@ def main(
             help="Cloud device platform: 'android' or 'ios'. Required for cloud devices.",
         ),
     ] = None,
+    prompt_language: Annotated[
+        PromptLanguage | None,
+        typer.Option(
+            "--prompt-language",
+            "-L",
+            help=(
+                "Language of the agent prompts: 'en' (default) or 'zh' (Chinese)."
+                " Not set = fall back to the MOBILE_USE_PROMPT_LANGUAGE env var,"
+                " then to English. Prompts with no Chinese version yet fall back"
+                " to English with a warning."
+            ),
+        ),
+    ] = None,
 ):
     """
     Run the Mobile-use agent to automate tasks on a mobile device.
@@ -280,6 +298,7 @@ def main(
                 video_recording_tools_enabled=with_video_recording_tools,
                 device_type=device_type,
                 cloud_platform=cloud_platform,
+                prompt_language=prompt_language,
             )
         )
     except KeyboardInterrupt:

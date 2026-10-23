@@ -8,6 +8,7 @@ from typing import Self, TypeVar, cast
 from pydantic import BaseModel
 
 from minitap.mobile_use.constants import DEFAULT_MAX_STEPS
+from minitap.mobile_use.prompt_language import PromptLanguage
 from minitap.mobile_use.sdk.types.agent import AgentProfile
 from minitap.mobile_use.sdk.types.task import TaskRequest, TaskRequestCommon
 
@@ -29,6 +30,7 @@ class TaskRequestCommonBuilder(BaseModel):
         self._thoughts_output_path: Path | None = None
         self._locked_app_package: str | None = None
         self._app_path: Path | None = None
+        self._prompt_language: PromptLanguage | None = None
 
     def with_max_steps(self, max_steps: int) -> Self:
         """
@@ -105,6 +107,27 @@ class TaskRequestCommonBuilder(BaseModel):
         self._app_path = Path(app_path) if isinstance(app_path, str) else app_path
         return self
 
+    def with_prompt_language(self, language: PromptLanguage) -> Self:
+        """
+        Set the language the agent prompts are written in for this task.
+
+        ``"zh"`` loads the Chinese versions of the agent prompts (``*.md`` ->
+        ``*-zh.md``); ``"en"`` keeps the English originals.
+
+        This is the **task-level** switch: it overrides the agent-level default
+        (``AgentConfigBuilder.with_prompt_language``) and the
+        ``MOBILE_USE_PROMPT_LANGUAGE`` env var, so one agent can run a Chinese
+        task and an English task back to back.
+
+        Prompts that have no Chinese version yet fall back to English **with a
+        warning** - they are never blocked.
+
+        Args:
+            language: ``"en"`` or ``"zh"``
+        """
+        self._prompt_language = language
+        return self
+
     def build(self) -> TaskRequestCommon:
         """
         Build the TaskRequestCommon object.
@@ -123,6 +146,7 @@ class TaskRequestCommonBuilder(BaseModel):
             thoughts_output_path=self._thoughts_output_path,
             locked_app_package=self._locked_app_package,
             app_path=self._app_path,
+            prompt_language=self._prompt_language,
         )
 
 
@@ -163,6 +187,7 @@ class TaskRequestBuilder[TIn](TaskRequestCommonBuilder):
         res._thoughts_output_path = common.thoughts_output_path
         res._locked_app_package = common.locked_app_package
         res._app_path = common.app_path
+        res._prompt_language = common.prompt_language
         return res
 
     def using_profile(self, profile: str | AgentProfile) -> "TaskRequestBuilder[TIn]":
@@ -252,5 +277,6 @@ class TaskRequestBuilder[TIn](TaskRequestCommonBuilder):
             thoughts_output_path=self._thoughts_output_path,
             locked_app_package=self._locked_app_package,
             app_path=self._app_path,
+            prompt_language=self._prompt_language,
         )
         return task_request

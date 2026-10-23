@@ -110,7 +110,6 @@ def _state(
         subgoal_plan=subgoal_plan if subgoal_plan is not None else [],
         latest_ui_hierarchy=None,
         latest_ocr_results=None,
-        latest_screenshot=None,
         focused_app_info=None,
         device_date=None,
         structured_decisions=None,

@@ -20,13 +20,13 @@ agent。
 import json
 from pathlib import Path
 
-from jinja2 import Template
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from minitap.mobile_use.config import OutputConfig
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import load_prompt_template, pick
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.utils.conversations import is_ai_message
 from minitap.mobile_use.utils.logger import get_logger
@@ -40,12 +40,15 @@ async def outputter(
     logger.info("Starting Outputter Agent")
     last_message = graph_output.messages[-1] if graph_output.messages else None
 
-    system_message = (
+    system_message = pick(
         "You are a helpful assistant tasked with generating "
-        + "the final structured output of a multi-agent reasoning process."
+        "the final structured output of a multi-agent reasoning process.",
+        "你是一个助手，负责把多智能体推理过程的最终结果整理成结构化输出。",
+        language=ctx.prompt_language,
     )
-    human_message = Template(
-        Path(__file__).parent.joinpath("human.md").read_text(encoding="utf-8")
+    human_message = load_prompt_template(
+        Path(__file__).parent.joinpath("human.md"),
+        ctx.prompt_language,
     ).render(
         initial_goal=graph_output.initial_goal,
         agents_thoughts=graph_output.agents_thoughts,

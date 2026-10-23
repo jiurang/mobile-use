@@ -11,13 +11,14 @@ from typing import Literal
 
 from adbutils import AdbClient
 from openai import BaseModel
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field
 
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.clients.ios_client import IosClientWrapper
 from minitap.mobile_use.clients.ui_automator_client import UIAutomatorClient
 from minitap.mobile_use.config import AgentNode, LLMConfig
 from minitap.mobile_use.controllers.cloud_device_controller import CloudAndroidController
+from minitap.mobile_use.prompt_language import PromptLanguage
 from minitap.mobile_use.services.ocr.types import OcrConfig
 
 
@@ -93,13 +94,13 @@ def _stability_mode_default() -> str:
 
 
 class PerceptionConfig(BaseModel):
-    """三条感知通道的开关 + 感知前的沉降等待。
+    """两条感知通道的开关 + 感知前的沉降等待。
 
-    这三个开关是 **Manager 侧**的控制面（`AgentConfig.perception` →
+    这两个开关是 **Manager 侧**的控制面（`AgentConfig.perception` →
     `MobileUseContext.perception`，见 `sdk/agent.py:722`）：Manager 建 agent 时
     决定哪几条通道开着，Executor 每次决策拿到的屏幕描述就按这个裁。
 
-    关掉任何一条都是**纯粹减少**该通道带来的信息与开销，不会改变另外两条的
+    关掉任何一条都是**纯粹减少**该通道带来的信息与开销，不会改变另外一条的
     行为：
 
     - `ui_hierarchy`（UI 元素表）：关掉后**不再有元素表**，Executor 只拿到
@@ -108,78 +109,17 @@ class PerceptionConfig(BaseModel):
       的 `resolve_target` 看的是同一份 `state.latest_screen_elements`）。
     - `ocr`（OCR 文本）：关掉后 Contextor **根本不跑 OCR**（真机实测 381~443ms
       /步），Executor 也拿不到 OCR 块。
-    - `screenshot`（图片）：见下面的三态。**关掉时图相关的词一个都不许进
-      prompt**（连 schema 里的 `need_screenshot` 字段都没有）—— 模型看不到的
-      东西，就不该让它以为有。
 
-    `screenshot` 是**三态**（字符串枚举，不是 bool）：
-
-    - `"on_demand"` —— **默认**：**Executor 自己决定**要不要看图。它在结构化
-      输出里把 `need_screenshot` 置 true，框架就在**它的下一轮**把当屏截图
-      挂进去（不额外再问一次 LLM —— 循环本来就要继续下一轮）。
-    - `"always"` —— 每轮都挂图（模型不用举手）。
-    - `"off"` —— 永远不给图。
-
-    为什么默认是 `"on_demand"`（2026-10-21 / 2026-10-22 实测）
-    -------------------------------------------------------
-    截图进 prompt 的代价是**每轮都付、且永远付**：
-
-    - 它是**不可缓存**的 —— 在 prompt 末尾，而 provider 的缓存单元建在「用户输入
-      的末尾」，请求总长一变（base64 长度随画面变）就匹配不上。
-    - 实测那 47,672 字符的 base64 占了整个易变尾部的 **92%**；砍掉它之后
-      12 轮里只有 1 轮低于 80%，带它时约 1/3 的轮次掉到 6-12%
-      （见 `doc/cache-hit-rate-audit-20261020.md` 第 8 节）。
-
-    绝大多数决策靠 UI 元素表 + OCR 就够（模型报的是索引，坐标由代码给），
-    图只在「颜色 / 图标 / 遮挡 / 图片内容」这些文字表达不了的地方才需要
-    ⇒ 让**要图的人自己举手**，而不是每轮都付这份钱。
-
-    ⚠️ 老行为（2026-10-22 之前）是「模型说 `need_screenshot` → 同轮补一张 →
-    **再问一次 LLM**」。那一次二问是整整一次 LLM 调用（真机实测 executor 单次
-    决策中位 5,276ms）。现在改成「下一轮就给」：**零额外 LLM 调用**，而且图
-    一定是 contextor 刚抓的那一帧（和元素表同屏，索引契约不受影响）。
+    ⚠️ **原来还有第三条「图片」通道（`screenshot`），已下线。**
+    屏幕截图**不再进模型**：提示词里没有图的痕迹，输出 schema 里也没有
+    `need_screenshot` 字段 —— 模型看不到的东西，就不该让它以为有。
+    设备截图本身还在（OCR 与坐标校验都要用那一帧），只是不再作为
+    多模态内容块发给模型。
     """
 
-    screenshot: Literal["always", "on_demand", "off"] = "on_demand"
     ui_hierarchy: bool = True
     ocr: bool = True
     ocr_config: OcrConfig = Field(default_factory=OcrConfig)
-
-    @field_validator("screenshot", mode="before")
-    @classmethod
-    def _normalize_screenshot(cls, value: object) -> object:
-        """把老的 bool 收成三态枚举。
-
-        ⚠️ **``True`` 的含义变了**：老代码里 ``True`` 是「每轮都带图」
-        （Cortex 时代的老行为，今天已经没人读它）。Manager-web 的开关是
-        「**能不能看图**」⇒ ``True`` 现在映射成 ``"on_demand"``
-        （能看图，**由 Executor 自己决定**什么时候看）。
-
-        「每轮都带图」仍然做得到，但要**显式**写 ``"always"``。
-        """
-        if value is True:
-            return "on_demand"
-        if value is False:
-            return "off"
-        return value
-
-    @property
-    def screenshot_channel(self) -> Literal["always", "on_demand", "off"]:
-        """图片通道的三态（模板和执行层都用这一个判据）。
-
-        归一化已经在字段校验里做完了 ⇒ 这里直接返回，不会出现
-        「``"on_demand"`` 是真值」那种真假判断陷阱。
-        """
-        return self.screenshot
-
-    @property
-    def can_see_screenshot(self) -> bool:
-        """模型**能不能**看图。
-
-        提示词和 schema 都按这个判：**不能**看图时，一个图相关的词都不许
-        进 prompt，schema 里也不留 `need_screenshot` 字段。
-        """
-        return self.screenshot_channel != "off"
 
     # 动作之后的**沉降等待下限**（毫秒）。
     #
@@ -274,6 +214,13 @@ class MobileUseContext(BaseModel):
     on_plan_changes: Callable[[list[Subgoal], IsReplan], Coroutine] | None = None
     video_recording_enabled: bool = False
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
+
+    #: 提示词语言（``en`` / ``zh``）。**已经在 SDK 层定好了**（任务级 > Agent 级 >
+    #: 环境变量 > 英文），这里只负责带进各个 agent。
+    #:
+    #: 为什么放在 context 而不是让每个 agent 自己读环境变量：同一个 Agent 上
+    #: 可能同时跑中文任务和英文任务，环境变量是**进程级**的，读不了「这次任务」。
+    prompt_language: PromptLanguage = PromptLanguage.EN
 
     def get_adb_client(self) -> AdbClient:
         if self.adb_client is None:

@@ -7,17 +7,16 @@
 元素了）。
 
 ⇒ 所以「抓屏」和「建表」必须发生在**同一个节点**里：两者之间不可能有任何
-动作插进来，工具读到的就一定是模型看到的那一屏的表。截图同理 —— 它是
-**contextor 刚抓的那一帧**，不是 executor 事后重抓的（重抓会多一次 adb 往返，
-还可能拿到不同帧，图和编号就对不上了）。
+动作插进来，工具读到的就一定是模型看到的那一屏的表。
 
-三条通道，Manager 侧可开关（``ctx.perception``）
--------------------------------------------------
+两条通道，Manager 侧可开关（``ctx.perception``）
+---------------------------------------------
 * ``ui_hierarchy`` —— UI 元素表。关掉 ⇒ 不建表 ⇒ 工具侧走 legacy OCR 路径。
 * ``ocr`` —— OCR 文字。关掉 ⇒ **OCR 引擎根本不跑**（不是「跑完再丢掉」：
   真机实测 381~443ms/步，占整段感知的一大截，而结果被丢掉）。
-* ``screenshot`` —— 截图。**由 Executor 自己决定**要不要（见
-  ``agents/executor/executor.py``），contextor 只负责提供那一帧。
+
+⚠️ **截图不再进模型**（图片通道 2026-10-23 下线）：抓屏本身照旧（OCR 与
+坐标校验都要用那一帧），但它不再作为多模态内容块发给 Executor。
 
 先判稳，再建表
 --------------
@@ -34,7 +33,6 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from minitap.mobile_use.agents.contextor.types import AppLockVerificationOutput, ContextorOutput
@@ -45,6 +43,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
     get_device_date,
 )
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import load_prompt_template, pick
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.services.ocr import get_ocr_engine
 from minitap.mobile_use.services.ocr.types import OcrEngine, OcrText
@@ -291,7 +290,6 @@ class ContextorNode:
                 # 那是行为变更，不在本次范围内。
                 "latest_ui_hierarchy": None,
                 "latest_ocr_results": ocr_results,
-                "latest_screenshot": device_data.base64,
                 "focused_app_info": current_app_package,
                 "screen_size": (device_data.width, device_data.height),
                 "device_date": device_date,
@@ -566,8 +564,9 @@ class ContextorNode:
         # 25 条（``[-25:]``）。同名不同向 —— 别照抄 planner 那边的写法。
         MAX_AGENTS_THOUGHTS = 25
 
-        system_message = Template(
-            Path(__file__).parent.joinpath("contextor.md").read_text(encoding="utf-8")
+        system_message = load_prompt_template(
+            Path(__file__).parent.joinpath("contextor.md"),
+            self.ctx.prompt_language,
         ).render(
             task_goal=initial_goal,
             subgoal_plan="\n".join([str(subgoal) for subgoal in subgoal_plan]),
@@ -578,7 +577,13 @@ class ContextorNode:
 
         messages = [
             SystemMessage(content=system_message),
-            HumanMessage(content="Please make your decision."),
+            HumanMessage(
+                content=pick(
+                    "Please make your decision.",
+                    "请做出你的判断。",
+                    language=self.ctx.prompt_language,
+                )
+            ),
         ]
 
         llm = get_llm(ctx=self.ctx, name="contextor").with_structured_output(ContextorOutput)

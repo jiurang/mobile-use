@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from minitap.mobile_use.agents.outputter.outputter import outputter
 from minitap.mobile_use.config import LLM, OutputConfig
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.prompt_language import PromptLanguage
 from minitap.mobile_use.utils.logger import get_logger
 
 # 这里**不要**再给 sys.modules 打桩。
@@ -77,6 +78,9 @@ def mock_context():
         "orchestrator": LLM(provider="openai", model="gpt-5-nano"),
     }
     ctx.device = Mock()
+    # 提示词语言：outputter 要按它挑 human.md（human.md / human-zh.md）。
+    # 同样是 pydantic 字段，Mock(spec=...) 不会自动生成，得显式给。
+    ctx.prompt_language = PromptLanguage.EN
     return ctx
 
 

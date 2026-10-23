@@ -10,11 +10,11 @@
 
 from pathlib import Path
 
-from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.prompt_language import load_prompt_template, pick
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.utils.logger import get_logger
 
@@ -36,12 +36,23 @@ async def hopper(
     data: str,
 ) -> HopperOutput:
     logger.info("Starting Hopper Agent")
-    system_message = Template(
-        Path(__file__).parent.joinpath("hopper.md").read_text(encoding="utf-8")
+    system_message = load_prompt_template(
+        Path(__file__).parent.joinpath("hopper.md"),
+        ctx.prompt_language,
     ).render()
     messages = [
         SystemMessage(content=system_message),
-        HumanMessage(content=f"{request}\nHere is the data you must dig:\n{data}"),
+        HumanMessage(
+            content=(
+                f"{request}\n"
+                + pick(
+                    "Here is the data you must dig:",
+                    "下面是你要从中挖掘的数据：",
+                    language=ctx.prompt_language,
+                )
+                + f"\n{data}"
+            )
+        ),
     ]
 
     llm = get_llm(ctx=ctx, name="hopper", is_utils=True, temperature=0).with_structured_output(

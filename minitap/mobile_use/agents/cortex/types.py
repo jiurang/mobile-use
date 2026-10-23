@@ -15,7 +15,6 @@ Executor 自主执行之后，感知和动作全下沉给了 Executor（它自�
 
 * ``needs_replan`` —— 重规划的判断权只在 Orchestrator（方案 §6.5.1）。
   两处都能判 replan 就会出现两个互相覆盖的判断源。
-* ``need_screenshot`` —— Cortex 不看屏了，感知通道下沉到 Executor。
 * ``decisions`` / ``decisions_reason`` / ``goals_completion_reason`` ——
   不再逐轮写动作和长推理，输出因此小了一个数量级。
 """

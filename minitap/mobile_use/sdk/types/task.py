@@ -7,11 +7,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from minitap.mobile_use.config import LLMConfig, get_default_llm_config
 from minitap.mobile_use.constants import DEFAULT_MAX_STEPS
 from minitap.mobile_use.context import DeviceContext
+from minitap.mobile_use.prompt_language import PromptLanguage, coerce_prompt_language
 from minitap.mobile_use.sdk.utils import load_llm_config_override
 
 TaskRunStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
@@ -81,13 +82,28 @@ class TaskRequestCommon(TaskRequestBase):
     locked_app_package: str | None = None
     app_path: Path | None = None
     """Path to an app to install before running the task.
-    
+
     For Android: Path to an APK file.
     For cloud iOS: Path to a .app folder (simulator build).
-    
+
     The app will be installed automatically before the task starts.
     Cloud iOS uses diff-based patch syncing for fast updates.
     """
+    prompt_language: PromptLanguage | None = None
+    """Language the agent prompts are written in for this task (``"en"`` / ``"zh"``).
+
+    ``None`` means "not set here" - the agent-level default (or the
+    ``MOBILE_USE_PROMPT_LANGUAGE`` env var) decides. Setting it here wins over
+    both: one agent can run a Chinese task and an English task back to back.
+
+    An unrecognised value is **degraded to "not set" with a warning**, never
+    rejected: a wrong language must not fail the whole run.
+    """
+
+    @field_validator("prompt_language", mode="before")
+    @classmethod
+    def _normalize_prompt_language(cls, value: object) -> PromptLanguage | None:
+        return coerce_prompt_language(value)
 
 
 class TaskRequest[TOutput](TaskRequestCommon):
@@ -106,6 +122,8 @@ class TaskRequest[TOutput](TaskRequestCommon):
         trace_path: Directory path to save trace data if recording is enabled
         llm_output_path: Path to save LLM output data
         thoughts_output_path: Path to save thoughts output data
+        prompt_language: Language the agent prompts are written in (``"en"`` / ``"zh"``).
+            ``None`` = fall back to the agent-level default / env var.
     """
 
     goal: str

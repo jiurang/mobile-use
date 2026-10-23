@@ -43,10 +43,9 @@ def _render(template_path: Path, variables: dict[str, object]) -> str:
 def _perception(
     ui_hierarchy: bool = True,
     ocr: bool = True,
-    screenshot: bool | str = "on_demand",
 ):
     """感知开关的替身（和 `scripts/check_prompt_templates.py` 里的是同一个类）。"""
-    return _load()._Perception(ui_hierarchy, ocr, screenshot)
+    return _load()._Perception(ui_hierarchy, ocr)
 
 
 def test_prompt_templates_render():
@@ -71,9 +70,9 @@ def test_executor_template_declares_exactly_four_vars():
 
     多一个 → 渲染端要多传一个（调用点会对不上）；少一个 → 模板引用了没传的变量。
 
-    `perception` 是**感知通道开关状态**（Manager 侧）：三条通道开着哪几条，
-    提示词里必须写清楚 —— 否则模型会一直要一张不会来的图，或者按一个
-    被关掉的通道去寻址。一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
+    `perception` 是**感知通道开关状态**（Manager 侧）：两条通道开着哪几条，
+    提示词里必须写清楚 —— 否则模型会按一个被关掉的通道去寻址。
+    一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
     """
     template_vars = _load().TEMPLATE_VARS
     assert set(template_vars["executor/executor.md"]) == {
@@ -145,12 +144,21 @@ def test_executor_prompt_keeps_element_targeting_contract():
 
     这节是索引契约的说明书：工具按 `[i]` 还原当屏那一行，模型抄 id 或坐标
     反而会点到别的东西。
+
+    ⚠️ 2026-10-23：提示词由作者本人重写过（`## Element targeting` →
+    `## Screen composition`，整段措辞被压缩）。所以这条断言的是**契约本身**
+    —— 行格式、1-based、`index` 与 `ocr_index` 两种寻址、失败目标不重复上报 ——
+    而不是某一段标题或某一句措辞：标题和措辞还能再变，契约不能丢。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    assert "## Element targeting" in text
-    assert "1-based, used verbatim" in text
-    assert "never have to copy an id or coordinates" in text
-    assert "An index belongs to one screen" in text
+    # 行格式说明书：`[i] "text" id=... Type (x,y,WxH) flags`
+    assert "[i]" in text
+    assert "id=" in text
+    # 编号是 1-based（OCR 块行首的 `[i]`）
+    assert "1-based" in text
+    # 两种寻址方式：元素表用 `index`，只有 OCR 块时用 `ocr_index`
+    assert "`index`" in text
+    assert "`ocr_index`" in text
     # 失败的目标不重复上报
     assert "do not re-report a target that already failed" in text
 
@@ -178,25 +186,20 @@ def test_executor_prompt_keeps_text_tools_table():
 
 
 def test_executor_prompt_keeps_perception_channels():
-    """感知通道不能丢：**三条通道**（UI 元素 + OCR + 图片）+ 设备状态（息屏）。
+    """感知通道不能丢：**两条通道**（UI 元素 + OCR）+ 设备状态（息屏）。
 
-    🔴 **2026-10-22 改**：图片通道**回来了**，但语义换成了
-    「**Executor 自己举手**」（`need_screenshot`）—— 上一轮举手，下一轮
-    才附当屏截图（不再同轮二问，省一次 LLM 调用）。
-
-    三条通道都由 Manager 侧开关控制（`perception.ui_hierarchy` /
-    `perception.ocr` / `perception.screenshot`），提示词必须**按开关渲染**：
-    通道关着却还在教模型用那个通道，模型就会一直要一张不会来的图。
+    两条通道都由 Manager 侧开关控制（`perception.ui_hierarchy` /
+    `perception.ocr`），提示词必须**按开关渲染**：通道关着却还在教模型
+    用那个通道，模型就会去按一个不存在的通道寻址。
 
     丢了 UI/OCR 通道 ⇒ 模型看不见任何东西；丢了设备状态就会在黑屏上
     反复空转（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "## Perception" in text
-    # 三个通道都在，且**按开关分支**渲染
+    # 两个通道都在，且**按开关分支**渲染
     assert "perception.ui_hierarchy" in text
     assert "perception.ocr" in text
-    assert "perception.screenshot_channel" in text
     # 两个文本通道
     assert "UI elements" in text
     assert "OCR" in text
@@ -204,20 +207,18 @@ def test_executor_prompt_keeps_perception_channels():
     assert "wake_screen" in text
 
 
-def test_executor_prompt_teaches_the_model_to_ask_for_a_picture():
-    """图片通道开着时，提示词必须教它**怎么要**（`need_screenshot`）。
+def test_executor_prompt_has_no_trace_of_the_picture_channel():
+    """图片通道已下线 ⇒ 提示词里**一个图相关的词都不许有**。
 
-    通道关着时不能教 —— 否则模型会一直要一张不会来的图，而且它会以为自己
-    能看到画面。**关掉时模板里一个图相关的词都不该有**（见
-    `tests/mobile_use/test_screenshot_on_demand.py` 的零图词断言）。
+    模型看不到的东西，就不该让它以为有：只要提示词里还留着「截图 /
+    screenshot / need_screenshot」，模型就会按着那个幻觉去要图。
+
+    这条是「下线」的**验收**，不是风格偏好 —— 它挡住了「删了代码但忘了
+    删提示词」这种半吊子状态。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    assert "need_screenshot" in text
-    # 三种通道状态都有分支
-    assert 'perception.screenshot_channel == "always"' in text
-    assert 'perception.screenshot_channel == "on_demand"' in text
-    # 「off」档 = 整段图的内容**不渲染**（模板里没有第三个分支）
-    assert 'perception.screenshot_channel == "off"' not in text
+    for marker in ("screenshot", "Screenshot", "need_screenshot", "picture"):
+        assert marker not in text, f"executor.md 里还留着图片通道的痕迹：{marker}"
 
 
 def test_executor_prompt_has_no_tool_json_schema():
@@ -238,7 +239,7 @@ def test_executor_prompt_has_no_tool_json_schema():
 def test_executor_prompt_output_fields_match_executor_output():
     """Output 字段表要和 `agents/executor/types.py:ExecutorOutput` 逐字对齐。"""
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    for field in ("actions", "agent_thought", "done", "done_reason", "need_screenshot"):
+    for field in ("actions", "agent_thought", "done", "done_reason"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
     # agent_thought：≤1 句，且不许把目标陈述写进去（方案 §3.1.1 顺带说明）
     assert "one short sentence" in text

@@ -35,7 +35,6 @@ from langchain_core.messages import HumanMessage, SystemMessage  # noqa: E402
 
 from minitap.mobile_use.agents.cortex.types import CortexOutput  # noqa: E402
 from minitap.mobile_use.services.llm import MiniMaxChatOpenAI  # noqa: E402
-from minitap.mobile_use.utils.conversations import get_screenshot_message_for_llm  # noqa: E402
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64  # noqa: E402
 from minitap.mobile_use.utils.ui_hierarchy_view import render_hierarchy_and_labels  # noqa: E402
 
@@ -95,7 +94,8 @@ def build_messages() -> tuple[list, dict]:
         ),
         HumanMessage(content="Executor feedback:\n[ToolMessage(content='Tapped WLAN successfully.')]"),
         HumanMessage(content=tree_text),
-        get_screenshot_message_for_llm(compressed),
+        # ⚠️ 图片通道已下线 ⇒ 真实的 prompt 里**没有**图片块了。
+        # 这里保留压缩与体积统计，只作为「当初那张图多大」的对照。
     ]
 
     meta = {

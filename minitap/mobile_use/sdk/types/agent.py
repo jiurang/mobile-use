@@ -3,7 +3,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from langchain_core.callbacks.base import Callbacks
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from minitap.mobile_use.clients.ios_client_config import BrowserStackClientConfig, IosClientConfig
 from minitap.mobile_use.context import DevicePlatform, PerceptionConfig
@@ -11,6 +11,7 @@ from minitap.mobile_use.controllers.cloud_device_controller import (
     CloudAndroidController,
     CloudIosController,
 )
+from minitap.mobile_use.prompt_language import PromptLanguage, coerce_prompt_language
 from minitap.mobile_use.sdk.types.task import AgentProfile, TaskRequestCommon
 
 
@@ -103,9 +104,13 @@ class AgentConfig(BaseModel):
         device_platform: Platform of the device to target.
         servers: Custom server configurations.
         video_recording_enabled: Whether video recording tools are enabled.
-        perception: Which perception channels the Executor gets (screenshot /
-            UI hierarchy / OCR). Manager-side switches; see
+        perception: Which perception channels the Executor gets (UI hierarchy /
+            OCR). Manager-side switches; see
             :meth:`AgentConfigBuilder.with_perception`.
+        prompt_language: Which language the agent prompts are written in
+            (``"en"`` / ``"zh"``). ``None`` means "not set here" - the task
+            request or the ``MOBILE_USE_PROMPT_LANGUAGE`` env var decides.
+            See :meth:`AgentConfigBuilder.with_prompt_language`.
         cloud_device_config: Configuration for cloud device provisioning.
         cloud_android_controller: Pre-configured cloud Android controller.
         cloud_ios_controller: Pre-configured cloud iOS controller.
@@ -122,6 +127,14 @@ class AgentConfig(BaseModel):
     browserstack_config: BrowserStackClientConfig | None = None
     video_recording_enabled: bool = False
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
+    prompt_language: PromptLanguage | None = None
+
+    @field_validator("prompt_language", mode="before")
+    @classmethod
+    def _normalize_prompt_language(cls, value: object) -> PromptLanguage | None:
+        """认不出来的语言按「没指定」处理，不让整次运行失败。"""
+        return coerce_prompt_language(value)
+
     cloud_device_config: CloudDeviceConfig | None = None
     cloud_android_controller: CloudAndroidController | None = None
     cloud_ios_controller: CloudIosController | None = None

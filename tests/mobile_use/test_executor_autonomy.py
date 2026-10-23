@@ -543,36 +543,34 @@ def test_t11b_single_element_array_works():
 # ---------------------------------------------------------------------------
 
 
-def test_t13_executor_output_lets_the_model_ask_for_a_picture():
-    """🔴 2026-10-22：图片通道**回来了**，但语义换成「Executor 自己举手」。
+def test_t13_executor_output_has_no_picture_field():
+    """🔴 2026-10-23：图片通道整条下线 ⇒ 输出 schema 里没有「我要看图」。
 
-    原来这个字段让模型能说「我需要看图」→ 同轮补一张 → **再问一次 LLM**
-    （真机实测 executor 单次决策中位 5,276ms，那一次二问就是白白多花的）。
-
-    现在：
-    * 字段**在** schema 里 ⇒ 模型能说「我需要看图」；
-    * 但**不再二问** —— 框架在**下一轮**把当屏截图挂进 prompt，
-      循环本来就要继续下一轮 ⇒ **零额外 LLM 调用**；
-    * 图和元素表是**同一次抓屏**的产物 ⇒ 编号契约不受影响。
+    模型看不到的东西，就不该让它以为有：只要 `need_screenshot` 还在 schema
+    里，模型就会学会举手要图，而框架已经没有图可以给了。
     """
-    assert "need_screenshot" in ExecutorOutput.model_fields
+    assert "need_screenshot" not in ExecutorOutput.model_fields
+    # 剩下的四个字段就是全部
+    assert set(ExecutorOutput.model_fields) == {
+        "actions",
+        "agent_thought",
+        "done",
+        "done_reason",
+    }
 
-    # 默认不举手（绝大多数轮次靠元素表 + OCR 就够）
-    assert ExecutorOutput(actions=[]).need_screenshot is False
-    # 举手 ⇒ 状态被记住（它决定的是下一轮的 prompt）
-    assert ExecutorOutput(actions=[], need_screenshot=True).need_screenshot is True
 
+def test_t13b_executor_prompt_has_no_picture_words_but_keeps_wake():
+    """executor.md 里不许有图相关的词，但**息屏唤醒必须留着**。
 
-def test_t13b_executor_prompt_mentions_screenshot_and_wake():
-    """executor.md 必须说清「**图片通道怎么用**」+ 息屏唤醒。"""
+    息屏唤醒是另一回事（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步），
+    它和图片通道无关，不能一起删掉。
+    """
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
-    # 要教模型怎么要图（默认档：Executor 自己决定）
-    assert "need_screenshot" in text
-    # 三种通道状态都要有分支（always / on_demand / off）
-    assert "perception.screenshot_channel" in text
-    # 息屏唤醒必须留着（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）
+    for marker in ("screenshot", "need_screenshot", "picture"):
+        assert marker not in text, f"executor.md 里还留着图片通道的痕迹：{marker}"
+    # 息屏唤醒必须留着
     assert "wake_screen" in text
 
 
@@ -1005,7 +1003,7 @@ def _stub_decide(steps_per_subgoal: int):
     只替换 LLM 那一层，`ExecutorNode.__call__` 里**计数**的逻辑是真的。
     """
 
-    async def _decide(self, *, state, goal, screenshot_message=None):
+    async def _decide(self, *, state, goal):
         if state.executor_steps >= steps_per_subgoal:
             return ExecutorOutput(
                 actions=[],

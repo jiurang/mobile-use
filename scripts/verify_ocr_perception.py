@@ -62,18 +62,16 @@ async def main() -> int:
     device = u2.connect(DEVICE_ID)
     OUT.mkdir(exist_ok=True)
 
-    heading("1) 三条感知通道的开关")
+    heading("1) 两条感知通道的开关")
     for label, perception in [
         ("全开（默认）", PerceptionConfig()),
-        ("仅截图", PerceptionConfig(ui_hierarchy=False, ocr=False)),
-        ("仅层级树", PerceptionConfig(screenshot=False, ocr=False)),
-        ("仅 OCR", PerceptionConfig(screenshot=False, ui_hierarchy=False)),
-        ("全关", PerceptionConfig(screenshot=False, ui_hierarchy=False, ocr=False)),
+        ("仅层级树", PerceptionConfig(ocr=False)),
+        ("仅 OCR", PerceptionConfig(ui_hierarchy=False)),
+        ("全关", PerceptionConfig(ui_hierarchy=False, ocr=False)),
     ]:
         active = [
             name
             for name, on in (
-                ("截图", perception.screenshot),
                 ("层级树", perception.ui_hierarchy),
                 ("OCR", perception.ocr),
             )

@@ -105,9 +105,9 @@ flowchart TD
 |---|---|---|---|---|---|
 | **Planner** | 把目标拆成子目标 | `subgoal_plan` `agents_thoughts` `initial_goal` | `subgoal_plan` `subgoal_plan_log` `plan_version` | ✅ | 只在开始/重规划时 |
 | **Orchestrator** | 验收里程碑、决定重规划 | `subgoal_plan` `complete_subgoals_by_ids` `agents_thoughts` | `subgoal_plan` `complete_subgoals_by_ids`(清空) `agents_thoughts` | ✅ | 只在有完成上报时 |
-| **Contextor** | 看屏（感知） | `last_action_at` | `latest_screen_elements` `latest_ocr_results` `latest_screenshot` `latest_ui_hierarchy` `screen_state` `focused_app_info` `device_date` | ❌（仅 app-lock 分支会） | ✅ 每轮 |
+| **Contextor** | 看屏（感知） | `last_action_at` | `latest_screen_elements` `latest_ocr_results` `latest_ui_hierarchy` `screen_state` `focused_app_info` `device_date` | ❌（仅 app-lock 分支会） | ✅ 每轮 |
 | **Cortex** | 决定下一步动作 | 感知块 + `agents_thoughts` + `subgoal_plan_log` + `executor_messages` | `structured_decisions` `complete_subgoals_by_ids` `agents_thoughts` `cortex_last_thought` | ✅ | ✅ 每轮 |
-| **Executor** | 把决策落成工具调用 | `structured_decisions` `cortex_last_thought` `executor_messages` `latest_screen_elements` `latest_ocr_results` `latest_screenshot` | `executor_messages` `cortex_last_thought` `executor_wants_screenshot` | ⚠️ 默认**不调**（直连），兜底才调 | ✅ 每轮 |
+| **Executor** | 把决策落成工具调用 | `structured_decisions` `cortex_last_thought` `executor_messages` `latest_screen_elements` `latest_ocr_results` | `executor_messages` `cortex_last_thought` | ⚠️ 默认**不调**（直连），兜底才调 | ✅ 每轮 |
 | **Summarizer** | 裁剪历史 | `messages` | `messages` | ❌ | ✅ 每轮 |
 | **Outputter** | 生成最终结构化输出 | `initial_goal` `agents_thoughts` `messages` | —（不改 State） | ✅ | ❌ 图外 |
 | **Hopper** | 把人类可读 app 名 → 真机包名 | — | — | ✅ | ❌ 被 `launch_app` 工具内部调用 |
@@ -227,20 +227,19 @@ Orchestrator 看执行反馈后说"确实做完了"是另一回事。这道复�
 
 ### 4.3 Contextor — 感知
 
-**做什么**：抓屏 + 三通道感知 + 状态采集。
+**做什么**：抓屏 + 两通道感知 + 状态采集。
 
-**三个通道**（`context.py:78-161` `PerceptionConfig`）：
+**两个通道**（`context.py` `PerceptionConfig`）：
 
 | 通道 | 内容 | 关掉的后果 |
 |---|---|---|
 | `ui_hierarchy` | UI 层级树 → 元素表 | 失去坐标合法性校验，只剩 OCR 框 |
 | `ocr` | 截图 OCR 文本 | 坐标校验退回只看层级树 |
-| `screenshot` | 截图（**三态**） | 看不到颜色/图标/图片/遮挡 |
 
-`screenshot` 的三态是 `True`（每轮带）/ `False`（不带）/ `"on_demand"`（**默认**）。
-`on_demand` 的含义：模型在结构化输出里把 `need_screenshot` 置 true，
-Cortex 在**同一轮内**补一张图再问一次（`cortex.py:392-398`）——不是多开一轮，
-因为多一轮意味着多一次完整的 prompt 重算。
+> ⚠️ **2026-10-23：图片通道（`screenshot`）整条下线。**
+> 屏幕截图**不再进模型** —— 提示词里没有多模态内容块，Executor 的输出 schema 里
+> 也没有「我要看图」这个字段。抓屏本身照旧（OCR 与坐标校验都要用那一帧），
+> 只是不再作为图片块发给模型。代价是 agent 读不出颜色、图标与遮挡关系。
 
 **两个时序细节**：
 
@@ -274,11 +273,13 @@ Cortex 在**同一轮内**补一张图再问一次（`cortex.py:392-398`）—�
 | `decisions_reason` | 为什么这么决定 → 进 `agents_thoughts` |
 | `goals_completion_reason` | 为什么目标算完成 → 进 `agents_thoughts` |
 | `complete_subgoals_by_ids` | 本轮判定完成的子目标 ID → 触发 Orchestrator 复核 |
-| `need_screenshot` | "看不清，要图" |
 
 **空响应保护**（`cortex.py:142-152`）：四个字段全空 → 抛错 → 切 fallback 模型。
-**但 `need_screenshot=True` 单独算合法应答**——否则 on_demand 模式下模型每次要图都会
-在这里抛"empty response"，整轮失败、agent 白烧步数（真机实测 51 步没跑完）。
+
+> ⚠️ 这一段描述的是**改造前**的 Cortex（`decisions` / `need_screenshot` 那套）。
+> 现在的 `CortexOutput` 只有 `next_subgoal` / `subgoal_completed` /
+> `completion_reason` 三个字段（见 `agents/cortex/types.py`），
+> 而 `need_screenshot` 已随图片通道在 2026-10-23 一起下线。
 
 **未知子目标 ID 会被过滤**（`cortex.py:129-140`），不让模型幻觉的 ID 污染计划。
 
@@ -355,8 +356,6 @@ Cortex decided"。
 | `latest_screen_elements` | contextor→cortex→executor | **不清空**（索引契约，见下） |
 | `latest_ocr_results` | contextor→cortex→executor | **不清空**（同上） |
 | `latest_ui_hierarchy` | contextor→cortex | **清空**（工具侧现取即可） |
-| `latest_screenshot` | contextor→executor | **不清空**（Executor 的图片通道要它；图和元素表是同一次抓屏的产物） |
-| `executor_wants_screenshot` | executor→executor | **换子目标时清空**（Cortex 下发新目标时）—— 上一目标那句「我要看图」指的是那一屏 |
 | `failed_targets` | 工具层 | 熔断器 + 提示词素材 |
 
 **"索引契约"是一处精妙的设计**（`cortex.py:422-433` 的注释）：Cortex 看到的元素表里

@@ -69,6 +69,7 @@ from minitap.mobile_use.agents.planner.utils import (
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.tools.index import (
@@ -85,14 +86,10 @@ logger = get_logger(__name__)
 
 CORTEX_PROMPT_ENV = "MOBILE_USE_CORTEX_PROMPT"
 
+CORTEX_PROMPT_PATH = Path(__file__).parent / "cortex.md"
+
 # 模型偶尔会用这些占位串表示“没有内容”，统一当作 None 处理。
 EMPTY_STRING_TOKENS = frozenset({"{}", "[]", "null", "None", ""})
-
-
-@cache
-def _compile_template(template_text: str) -> Template:
-    """按模板文本缓存编译结果，避免每一步都重新编译 Jinja 模板。"""
-    return Template(template_text)
 
 
 def _normalize_optional_str(value: str | None) -> str | None:
@@ -101,23 +98,35 @@ def _normalize_optional_str(value: str | None) -> str | None:
     return value
 
 
-def load_cortex_prompt() -> str:
-    """读 cortex 的 system prompt 模板。
+@cache
+def load_cortex_template(
+    language: PromptLanguage = PromptLanguage.EN,
+    override: str | None = None,
+) -> Template:
+    """Cortex 的 system prompt 模板（已编译）。
 
-    MOBILE_USE_CORTEX_PROMPT 可以指向另一个 .md（例如同目录的 cortex.zh.md），
-    用来做中/英文提示词的 A/B 实测 —— 同一份 context 分别渲染两种语言，
-    再各自真跑一遍，比较 token 与成功率。
+    **两套切换机制，优先级是「环境变量 > 语言开关」**：
 
-    不设这个变量时读的还是同目录的 cortex.md，行为与从前逐字节一致，
-    所以对生产是 no-op。路径不可读时只 warning 并回落到默认模板：
-    指针写错不该让整条任务挂掉，降级 + 上报即可。
+    1. ``MOBILE_USE_CORTEX_PROMPT`` 可以指向另一个 .md（例如同目录的
+       cortex.zh.md），用来做中/英文提示词的 A/B 实测 —— 同一份 context
+       分别渲染两种语言，再各自真跑一遍，比较 token 与成功率。
+       **显式指定了路径就以它为准**（那是「我要精确用这个文件」），
+       指针写错不该让整条任务挂掉：只 warning 并回落到默认模板。
+    2. 没设这个变量时，按 ``language`` 取：``en`` → ``cortex.md``，
+       ``zh`` → ``cortex.zh.md``（没有则回落英文 + warning）。
+
+    不设任何开关时读的还是同目录的 cortex.md，行为与从前逐字节一致，
+    所以对生产是 no-op。
+
+    ⚠️ **缓存键是 ``(语言, 覆盖路径)``，不是模板正文**：正文有 7KB，
+    拿它当键每轮都要哈希一遍；而覆盖路径必须进键，否则「换个环境变量
+    换份提示词」就不生效了。
     """
-    override = os.getenv(CORTEX_PROMPT_ENV)
     if override:
         path = Path(override).expanduser()
         try:
             if path.is_file():
-                return path.read_text(encoding="utf-8")
+                return Template(path.read_text(encoding="utf-8"))
             logger.warning(
                 f"[cortex] {CORTEX_PROMPT_ENV}={override!r} 不是可读文件，回落到默认 cortex.md"
             )
@@ -125,7 +134,7 @@ def load_cortex_prompt() -> str:
             logger.warning(
                 f"[cortex] 读取 {CORTEX_PROMPT_ENV}={override!r} 失败（{e}），回落到 cortex.md"
             )
-    return Path(__file__).parent.joinpath("cortex.md").read_text(encoding="utf-8")
+    return load_prompt_template(CORTEX_PROMPT_PATH, language)
 
 
 async def _invoke_cortex(
@@ -401,7 +410,10 @@ class CortexNode:
 
         # system prompt 整段静态：不再接 initial_goal / 计划 / 汇报 这类每轮
         # 变化的值。它因此是一个整体可复用的前缀，不会被任何单轮字段击穿。
-        system_message = _compile_template(load_cortex_prompt()).render(
+        system_message = load_cortex_template(
+            self.ctx.prompt_language,
+            os.getenv(CORTEX_PROMPT_ENV),
+        ).render(
             platform=self.ctx.device.mobile_platform.value,
             executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_wrappers),
             locked_app_package=current_locked_app_package,
@@ -674,10 +686,6 @@ class CortexNode:
             # 和致命 bug 3 同一类。）
             if report is None:
                 update[EXECUTOR_MESSAGES_KEY] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
-                # 「我要看图」这个请求也一起作废：换目标 = 换屏幕场景，
-                # 上一个目标里那句「我需要看图」指的是**那一屏**，
-                # 带过来只会给新目标附一张不相干的图。
-                update["executor_wants_screenshot"] = False
             update["executor_steps"] = 0
             # 没判完成就不该有提名：上一次尝试的提名（如果还没被 Orchestrator 消费）
             # 在这里作废，否则 Orchestrator 会验收一个 Cortex 没判完成的子目标。

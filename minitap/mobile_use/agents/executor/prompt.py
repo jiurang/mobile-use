@@ -35,18 +35,18 @@ legacy OCR 分支因此必须**自带**一段「这里用 ``ocr_index``」的说
 静态提示词只教 ``index`` 时，模型在 iOS / 云设备上每个动作都会被工具
 拒掉（``index=N is not a row in the screen element table (no table)``）。
 
-**三条感知通道，Manager 侧可开关**
+**两条感知通道，Manager 侧可开关**
 --------------------------------
-``ctx.perception`` 有三个开关（``ui_hierarchy`` / ``ocr`` / ``screenshot``），
+``ctx.perception`` 有两个开关（``ui_hierarchy`` / ``ocr``），
 Manager 建 agent 时决定（``sdk/agent.py:722``）。本模块只负责**按开关
 裁 prompt**：
 
 * UI 元素表 —— 关掉 ⇒ 不建表 ⇒ 走 legacy OCR 分支（``ocr_index``）。
   判据仍然是 ``has_element_table``，提示侧和工具侧共用同一个。
 * OCR —— 关掉 ⇒ **不给 legacy OCR 块**（不是「关了还偷偷给」）。
-* 图片 —— 由 **Executor 自己决定**（``ExecutorOutput.need_screenshot``）：
-  上一轮它举手，这一轮末尾挂当屏截图。通道关着时举手也不给，
-  提示词里会写明「没有图」，免得它一直要一张不会来的图。
+
+⚠️ **屏幕截图不再进模型**（图片通道已于 2026-10-23 下线）：
+prompt 里没有多模态内容块，也没有「要不要图」这个选择。
 
 **工具结果截断（L5）**
 --------------------
@@ -64,10 +64,8 @@ Manager 建 agent 时决定（``sdk/agent.py:722``）。本模块只负责**按�
 
 from __future__ import annotations
 
-from functools import cache
 from pathlib import Path
 
-from jinja2 import Template
 from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
@@ -77,6 +75,7 @@ from langchain_core.messages import (
 )
 
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template, pick
 from minitap.mobile_use.tools.index import format_tools_list
 from minitap.mobile_use.utils.failed_targets import render_failure_facts
 from minitap.mobile_use.utils.ocr_view import render_ocr_results
@@ -84,11 +83,6 @@ from minitap.mobile_use.utils.screen_elements import ScreenElement, render_scree
 from minitap.mobile_use.utils.thoughts_compaction import split_sentences
 
 EXECUTOR_PROMPT_PATH = Path(__file__).parent / "executor.md"
-
-
-@cache
-def _load_template() -> Template:
-    return Template(EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8"))
 
 
 def render_executor_system(ctx: MobileUseContext) -> str:
@@ -104,8 +98,11 @@ def render_executor_system(ctx: MobileUseContext) -> str:
     ``perception`` 传的是**通道开关状态**（`ctx.perception`）：三条通道
     开着哪几条，在一次运行里是恒定的 ⇒ 它落在 system prompt 里不会伤缓存，
     但模型必须知道 —— 否则它会一直举手要一张**永远不会来的**图。
+
+    语言跟着 ``ctx.prompt_language`` 走（``en`` → ``executor.md``，
+    ``zh`` → ``executor-zh.md``）。
     """
-    return _load_template().render(
+    return load_prompt_template(EXECUTOR_PROMPT_PATH, ctx.prompt_language).render(
         platform=ctx.device.mobile_platform.value,
         executor_tools_list=format_tools_list(
             ctx=ctx,
@@ -137,7 +134,10 @@ def render_device_state(state_lines: list[str]) -> str:
 # 无元素表时的说明段。放在 OCR 块**前面**：模型是从上往下读的，
 # 一旦先看到 `[i]`，它就会照着静态提示词里「index 直接用」那句话去填
 # `index` —— 而无元素表时 `index` 必然解析失败，每个动作都被工具拒掉。
-_NO_TABLE_NOTE = """\
+#
+# ⚠️ **字面量不许翻**：`ocr_index` / `index` 是模型要填的字段名，
+# 那句报错原文是**工具真的会给出来的字符串**（模型要照着它认错）。
+_NO_TABLE_NOTE_EN = """\
 NO SCREEN ELEMENT TABLE ON THIS SCREEN.
 There is no element table here (the device could not report one, or the UI
 element channel is off), so the OCR block below is the whole screen description.
@@ -151,6 +151,24 @@ for it to point at, so every `index` target fails with:
 {"action": "tap", "target": {"ocr_index": 3}}
 ```
 """
+
+_NO_TABLE_NOTE_ZH = """\
+本屏没有屏幕元素表。
+这里没有元素表（设备没报上来，或者 UI 元素通道关着），所以下面的 OCR 块就是
+整屏的描述。
+
+用 **`ocr_index`** 寻址那些行 —— OCR 块行首的 `[i]`，1-based，原样照填。
+这里**不要**用 `index`：没有表就没有行可指，每个 `index` 目标都会失败并报：
+"index=N is not a row in the screen element table (no table)"。
+
+```json
+{"action": "tap", "target": {"ocr_index": 3}}
+```
+"""
+
+
+def _no_table_note(language: PromptLanguage) -> str:
+    return pick(_NO_TABLE_NOTE_EN, _NO_TABLE_NOTE_ZH, language=language)
 
 
 def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
@@ -170,7 +188,7 @@ def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
     return bool(screen_elements)
 
 
-def render_legacy_ocr_block(ocr_results: list | None) -> str:
+def render_legacy_ocr_block(ocr_results: list | None, language: PromptLanguage) -> str:
     """没有元素表时的屏幕描述：说明段 + 共用的 OCR 渲染。
 
     ``render_ocr_results`` 是**共用**的，不能改它 —— 它打的 ``[i]`` 和
@@ -182,7 +200,7 @@ def render_legacy_ocr_block(ocr_results: list | None) -> str:
     body = render_ocr_results(ocr_results)
     if not body:
         return ""
-    return f"{_NO_TABLE_NOTE}\n{body}"
+    return f"{_no_table_note(language)}\n{body}"
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +469,6 @@ def build_executor_messages(
     local_messages: list[AnyMessage],
     device_state_lines: list[str],
     ocr_results: list | None = None,
-    screenshot_message: AnyMessage | None = None,
 ) -> list[BaseMessage]:
     """组装 Executor 每一轮的 prompt。
 
@@ -463,17 +480,14 @@ def build_executor_messages(
         [4] HumanMessage    失败事实清单（每轮变：会增长）
         [5] HumanMessage    设备状态（每轮变：前台 app 会变）
         [6] HumanMessage    屏幕元素表（每轮变：重编号）—— **必须最后**
-        [7] HumanMessage    截图（可选：图通道开着且 Executor 举手了）
 
     ⚠️ **顺序 = 缓存命中率**。前缀缓存只覆盖从头开始的连续前缀：
     任何每轮变的内容排在局部历史**之前**，它之后的整段历史每轮都要满价重算。
     真机实测（2026-10-21）：设备状态和失败清单卡在历史前面时，
     executor 的缓存命中率只有 15.8%（六个 agent 里最差，而它调用量最大）。
 
-    🔴 **2026-10-22 改：[7] 截图块回来了，但不再是「同轮二问」。**
-    现在是「Executor 上一轮举手 → 这一轮带图」，**零额外 LLM 调用**。
-    截图块仍然排在**最后**：它是 prompt 里最不可缓存的一块（base64 长度随
-    画面变），排在任何东西前面都会把它之后的全部字节拖成满价重算。
+    🔴 **图片通道下线（2026-10-23）：没有第 [7] 块截图了。**
+    屏幕截图不再进模型 —— prompt 里没有多模态内容块，元素表就是最后一块。
 
     Args:
         ctx: 运行上下文。
@@ -489,15 +503,19 @@ def build_executor_messages(
         device_state_lines: 设备状态行。
         ocr_results: OCR 结果。**只在没有元素表时用**（iOS / 云设备路径），
             渲染成 legacy OCR 块，并**带上「用 ocr_index」的说明段**。
-        screenshot_message: 当屏截图消息（多模态）。**由调用方决定要不要给** ——
-            图通道关着、或 Executor 上一轮没举手时传 None。
 
     Returns:
         发给 LLM 的消息列表。
     """
     messages: list[BaseMessage] = [
         SystemMessage(content=render_executor_system(ctx)),
-        HumanMessage(content=f"Your goal:\n{goal}"),
+        HumanMessage(
+            content=pick(
+                f"Your goal:\n{goal}",
+                f"你的目标：\n{goal}",
+                language=ctx.prompt_language,
+            )
+        ),
     ]
 
     # 局部历史在「每轮变的块」**之前** —— 见模块文档的顺序说明。
@@ -555,13 +573,8 @@ def build_executor_messages(
         # 什么都没有，Executor 节点会往 device_state_lines 里加一句告知
         # （让它如实说「看不见」，而不是瞎猜）。
         if ctx.perception.ocr:
-            ocr_text = render_legacy_ocr_block(ocr_results)
+            ocr_text = render_legacy_ocr_block(ocr_results, ctx.prompt_language)
             if ocr_text:
                 messages.append(HumanMessage(content=ocr_text))
-
-    # 截图：**最后一块**。它是 prompt 里最不可缓存的一块（base64 长度随画面
-    # 变），放前面会把它之后的全部字节拖成满价重算。
-    if screenshot_message is not None:
-        messages.append(screenshot_message)
 
     return messages

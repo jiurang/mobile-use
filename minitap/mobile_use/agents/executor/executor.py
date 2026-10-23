@@ -31,20 +31,15 @@ Executor 自己看屏、自己决定下一个动作、自己执行，循环到�
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import Runnable
 
 from minitap.mobile_use.agents.cortex.dispatcher import dispatch_decisions_with_reason
 from minitap.mobile_use.agents.executor.prompt import build_executor_messages
-from minitap.mobile_use.agents.executor.types import (
-    ExecutorOutput,
-    ExecutorOutputBase,
-    executor_output_schema,
-)
+from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import (
@@ -58,9 +53,7 @@ from minitap.mobile_use.tools.index import (
     VIDEO_RECORDING_WRAPPERS,
     get_tools_from_wrappers,
 )
-from minitap.mobile_use.utils.conversations import get_screenshot_message_for_llm
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
-from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -174,19 +167,14 @@ class ExecutorNode:
         step_index = state.executor_steps + 1
         next_total_steps = state.total_steps + 1
 
-        async def emit(*messages, done: bool = False, wants_screenshot: bool = False):
-            """写一步的结果。五个出口共用同一份计数器。
-
-            ``wants_screenshot`` 是**Executor 自己举的手**（`need_screenshot`）：
-            它决定的是**下一轮**的 prompt 里带不带当屏截图（图通道开着的话）。
-            """
+        async def emit(*messages, done: bool = False):
+            """写一步的结果。四个出口共用同一份计数器。"""
             return await state.asanitize_update(
                 ctx=self.ctx,
                 update={
                     "executor_done": done,
                     "executor_steps": step_index,
                     "total_steps": next_total_steps,
-                    "executor_wants_screenshot": wants_screenshot,
                     "executor_messages": list(messages),
                 },
                 agent="executor",
@@ -212,52 +200,6 @@ class ExecutorNode:
 
         response = await self._decide(state=state, goal=goal)
 
-        # 🔴 **2026-10-22 改：不再有「同轮二问」。**
-        #
-        # 原来这里：模型说「我需要看图」→ 补一张图 → **再问一次 LLM**。
-        # 那是整整一次 LLM 调用（真机实测 executor 单次决策中位 5,276ms）。
-        #
-        # 现在：**下一轮**的 prompt 里带当屏截图（`state.executor_wants_screenshot`
-        # → `_decide` 里的 `_screenshot_message`）。零额外 LLM 调用，而且图是
-        # contextor 刚抓的那一帧，和元素表同屏。
-
-        # ---- 「我要看图」→ 这一轮的动作**不执行**，下一轮带图重来 ----
-        #
-        # 需求：**决定权在 Executor 手中** —— UI+OCR 分不清目标时，它自己
-        # 举手要图。举了手就先给它图，再让它动手：它此刻只有元素表 + OCR，
-        # 给出的动作是**猜的**，而猜错的那一下可能是「确认支付」。
-        #
-        # 为什么**不额外烧一次 LLM 调用**：图在**下一轮**给，而下一轮循环
-        # 本来就要跑（这一轮没执行任何动作 ⇒ 屏幕没变 ⇒ 不用重新抓屏，
-        # 元素表和图天然同屏）。
-        if self._should_hold_for_picture(state=state, response=response):
-            logger.info(
-                "[executor] Model asked for a screenshot; holding the action back "
-                "and attaching the picture to the next turn"
-            )
-            telemetry.capture_executor_dispatch(
-                task_id=self.ctx.trace_id,
-                dispatched=False,
-                action_count=len(response.actions),
-                rejection_code="wants_screenshot",
-            )
-            # 用 AIMessage + HumanMessage —— 和「dispatcher 拒了」那条路
-            # 同一个形状：graph 的 `post_executor_gate` 看到「最后一条是
-            # HumanMessage」就回 executor 重来（**不重新抓屏**）。
-            return await emit(
-                AIMessage(content=response.agent_thought or ""),
-                HumanMessage(
-                    content=(
-                        "Your previous action was NOT executed: you asked for a "
-                        "screenshot, so it was held back. The screenshot of the "
-                        "current screen is attached to this turn (below the screen "
-                        "element list). Look at it and decide again - if the picture "
-                        "still does not settle it, act on your best guess."
-                    )
-                ),
-                wants_screenshot=True,
-            )
-
         # ---- 目标达成 → 直接收尾，**不碰 actions** ----
         #
         # ⚠️ 顺序至关重要：`done: true` 时 `actions` 是**空数组**，
@@ -268,7 +210,6 @@ class ExecutorNode:
             return await emit(
                 AIMessage(content=response.done_reason or response.agent_thought or "goal reached"),
                 done=True,
-                wants_screenshot=getattr(response, "need_screenshot", False),
             )
 
         # ---- 动作 → tool_calls（确定性直连）----
@@ -321,7 +262,6 @@ class ExecutorNode:
                         "screen element list."
                     )
                 ),
-                wants_screenshot=getattr(response, "need_screenshot", False),
             )
         telemetry.capture_executor_dispatch(
             task_id=self.ctx.trace_id,
@@ -340,7 +280,6 @@ class ExecutorNode:
 
         return await emit(
             AIMessage(content=extra_note, tool_calls=tool_calls),
-            wants_screenshot=getattr(response, "need_screenshot", False),
         )
 
     async def _decide(
@@ -348,7 +287,7 @@ class ExecutorNode:
         *,
         state: State,
         goal: str,
-    ) -> ExecutorOutputBase:
+    ) -> ExecutorOutput:
         """问一次 LLM，拿结构化输出。
 
         **只绑定 `ExecutorOutput` 这一个 schema**（走 `services/llm.py` 的
@@ -356,40 +295,24 @@ class ExecutorNode:
 
         解析失败**不会**返回 None —— 内部已经降级成「空动作 + 说明」，
         调用方拿到的永远是一个可用的输出对象。
-
-        返回类型是 :class:`ExecutorOutputBase` 而不是 ``ExecutorOutput``：
-        「模型不能看图」那条路上用的是**兄弟类**，两者共享基类。写成
-        ``ExecutorOutput`` 会让静态检查骗过运行时（见
-        ``agents/executor/types.py`` 的基类说明）。
         """
         device_state_lines: list[str] = []
         if state.device_date:
             device_state_lines.append(f"Device date: {state.device_date}")
         if state.focused_app_info:
             device_state_lines.append(f"Focused app info: {state.focused_app_info}")
-        can_see_screenshot = self.ctx.perception.can_see_screenshot
         if state.screen_state == "off":
-            # 息屏时截图全黑、元素表只剩 systemui 残留 —— 不告诉模型，
+            # 息屏时元素表只剩 systemui 残留 —— 不告诉模型，
             # 它就会在黑屏上反复尝试（真机实测：30 步 → 51 步没跑完）。
             #
-            # ⚠️ **不能看图时这段里不许出现 "screenshot"**：模型看不到图，
+            # ⚠️ **这段里不许出现 "screenshot"**：模型看不到图，
             # 提示词里就不该有图相关的词（否则它会以为自己能看图）。
-            if can_see_screenshot:
-                device_state_lines.append(
-                    "Screen is OFF (the device is asleep). The screenshot is black and the "
-                    "element list only holds systemui leftovers, so there is nothing to "
-                    "act on. Call wake_screen FIRST, then read the screen again on the "
-                    "next turn."
-                )
-            else:
-                device_state_lines.append(
-                    "Screen is OFF (the device is asleep). The element list only holds "
-                    "systemui leftovers, so there is nothing to act on. Call wake_screen "
-                    "FIRST, then read the screen again on the next turn."
-                )
+            device_state_lines.append(
+                "Screen is OFF (the device is asleep). The element list only holds "
+                "systemui leftovers, so there is nothing to act on. Call wake_screen "
+                "FIRST, then read the screen again on the next turn."
+            )
         device_state_lines.extend(self._perception_state_lines())
-
-        screenshot_message = await self._screenshot_message(state=state)
 
         messages = build_executor_messages(
             ctx=self.ctx,
@@ -401,16 +324,11 @@ class ExecutorNode:
             # iOS / 云设备：没有统一元素表时用 legacy OCR 块（编号与
             # latest_ocr_results 的下标严格对应，工具侧按那个下标解析）。
             ocr_results=state.latest_ocr_results,
-            screenshot_message=screenshot_message,
         )
 
         # 结构化输出按 **provider 能力**分派：llamacpp 走原生 json_schema 语法约束，
         # 其它 provider 保持原样（schema 当工具绑）—— 见 `get_structured_llm`。
-        #
-        # ⚠️ **模型不能看图时，schema 里连 `need_screenshot` 都没有** ——
-        # 提示词里没有图相关的词，schema 里也不该有（模型看不到的东西，
-        # 不该让它以为能举手要）。见 `types.executor_output_schema`。
-        schema = executor_output_schema(can_see_screenshot=can_see_screenshot)
+        schema = ExecutorOutput
         runner = get_structured_llm(ctx=self.ctx, name="executor", schema=schema)
 
         response, failure_reason = await self._invoke(runner, messages, schema)
@@ -450,9 +368,7 @@ class ExecutorNode:
                         f"Your last answer could not be used: {failure_reason}. "
                         "You must call the "
                         "ExecutorOutput tool with the fields (actions, agent_thought, "
-                        "done, done_reason"
-                        + (", need_screenshot" if can_see_screenshot else "")
-                        + "). Do not write the output "
+                        "done, done_reason). Do not write the output "
                         "as plain text — a plain-text answer is discarded."
                     )
                 ),
@@ -508,135 +424,27 @@ class ExecutorNode:
         `agent_thought` 里如实说「我看不见屏幕」，而不是编一个目标。
 
         判据用 `ctx.perception`（Manager 侧的开关），和 prompt 侧裁 prompt
-        用的是同一份配置 —— 两边不一致就会出现「提示词说有图、实际没有」。
+        用的是同一份配置 —— 两边不一致就会出现「提示词说有通道、实际没有」。
         """
         perception = self.ctx.perception
         if perception.ui_hierarchy or perception.ocr:
             return []  # 至少还有一条文本通道，不用多说
 
-        channel = perception.screenshot_channel
-        if channel == "off":
-            # ⚠️ **这段里不许出现 "screenshot" / "picture"**：模型看不到图，
-            # 提示词里就不该有图相关的词。
-            return [
-                "NO perception channel is available: the UI element list and the OCR "
-                "text are both OFF. You have no description of the screen at all - "
-                "do not invent what is on it. Say plainly in agent_thought that you "
-                "cannot act without a screen description."
-            ]
-        if channel == "on_demand":
-            return [
-                "The UI element list and the OCR text are OFF - the screenshot is the "
-                "only way you can see the screen. Set need_screenshot=true and the "
-                "current screen will be attached to your next turn."
-            ]
+        # ⚠️ **这段里不许出现 "screenshot" / "picture"**：模型看不到图，
+        # 提示词里就不该有图相关的词。
         return [
-            "The UI element list and the OCR text are OFF - the screenshot is the only "
-            "screen description you get. Judge what to tap from the picture itself."
+            "NO perception channel is available: the UI element list and the OCR "
+            "text are both OFF. You have no description of the screen at all - "
+            "do not invent what is on it. Say plainly in agent_thought that you "
+            "cannot act without a screen description."
         ]
-
-    def _picture_attached_this_turn(self, state: State) -> bool:
-        """这一轮**已经**带图了吗。
-
-        和 `_screenshot_message` **同一个判据** —— 两边各判各的，早晚会有一边
-        不同步（提示词说有图、实际没有；或者提示词说没有、实际偷偷给了）。
-        """
-        channel = self.ctx.perception.screenshot_channel
-        if channel == "off" or not state.latest_screenshot:
-            return False
-        if channel == "always":
-            return True
-        # on_demand：上一轮举过手 ⇒ 这一轮带图
-        return bool(state.executor_wants_screenshot)
-
-    def _should_hold_for_picture(self, *, state: State, response: ExecutorOutputBase) -> bool:
-        """模型举了手要图，而这一轮**还没**给过它图 ⇒ 先给图，再让它动手。
-
-        为什么不让它先动一下
-        ------------------
-        它此刻只有元素表 + OCR —— 分不清两个长得像的目标时，它给出的动作是
-        **猜的**。猜错的那一下可能是「确认支付」。而循环本来就要继续下一轮，
-        所以这次「等图」**不额外烧 LLM 调用**（老设计是同轮二问，白烧一次）。
-
-        什么时候**不**等（每一条都是防死循环）
-        --------------------------------------
-        * 通道是 ``always`` → 图每轮都在，它没什么要等的；
-        * 通道是 ``off`` → 等不到图，等下去就是死循环；
-        * 手里没有图（``latest_screenshot`` 为空）→ 同样等不到；
-        * 这一轮**已经**带过图了（``executor_wants_screenshot`` 为真）→
-          它看过图还要图，说明图没帮上忙 —— 再等就是无限循环，让它动手。
-        """
-        # 🔴 **2026-10-22 修：先判通道，再读字段。**
-        #
-        # 通道是 ``off`` 时，schema 里**根本没有** ``need_screenshot`` 这个字段
-        # （见 ``executor_output_schema``：不给模型看它不存在的选项）。
-        # 原来先读 `response.need_screenshot` → AttributeError → **整个任务挂掉**
-        # （真机实测 2026-10-22 23:35：'ExecutorOutput' object has no attribute
-        # 'need_screenshot'）。
-        #
-        # 顺序本来就该是这样：通道不是 ``on_demand`` 就不会给图，后面的判断
-        # 全都不成立，先短路掉最省事、也最安全。
-        if self.ctx.perception.screenshot_channel != "on_demand":
-            return False
-        if not getattr(response, "need_screenshot", False):
-            return False
-        if not state.latest_screenshot:
-            return False
-        return not self._picture_attached_this_turn(state)
-
-    async def _screenshot_message(self, *, state: State) -> AnyMessage | None:
-        """这一轮要不要给模型看当屏截图。
-
-        判据（两个都要满足）
-
-        1. **通道开着**（Manager 侧 `perception.screenshot`）：
-
-           - ``always``    → 每轮都给；
-           - ``on_demand`` → 只在 Executor **上一轮举手**时给
-             （`state.executor_wants_screenshot`）；
-           - ``off``       → 永远不给（模型举手也不给 —— 提示词里写了「没有图」，
-             免得它一直要一张不会来的图）。
-
-        2. **手里确实有图**（`state.latest_screenshot`）。
-
-        图是哪来的
-        ----------
-        **contextor 刚抓的那一帧**，不重抓：
-
-        - 重抓要多一次 adb 往返，还可能拿到**不同帧** ⇒ 图和元素表对不上，
-          `[i]` 编号契约就破了；
-        - 用 contextor 那帧 ⇒ 图和编号指的是**同一屏**（抓屏和建表在同一个
-          节点里完成，见 `agents/contextor/contextor.py`）。
-
-        压缩
-        ----
-        等比缩到 640 长边上限（JPEG q50）—— 实测 610x1356 落在 1x2 tile
-        = 516 token（原图 2x4 = 2064，省 75%）。见 `utils/image_compress.py`。
-        PIL 是同步操作，放线程里，别阻塞事件循环。
-        """
-        channel = self.ctx.perception.screenshot_channel
-        if not self._picture_attached_this_turn(state):
-            return None
-
-        raw = state.latest_screenshot
-        if not raw:
-            return None
-
-        compressed = await asyncio.to_thread(compress_screenshot_base64, raw)
-        caption = (
-            "Screenshot of the current screen (you asked for a picture last turn; "
-            "this is the screen as it is now)."
-            if channel == "on_demand"
-            else "Screenshot of the current screen (the same one the element list describes)."
-        )
-        return get_screenshot_message_for_llm(compressed, caption=caption)
 
     async def _invoke(
         self,
         runner: Runnable[Any, Any],
         messages: list[BaseMessage],
-        schema: type[ExecutorOutputBase],
-    ) -> tuple[ExecutorOutputBase | None, str | None]:
+        schema: type[ExecutorOutput],
+    ) -> tuple[ExecutorOutput | None, str | None]:
         """调一次 LLM；解析失败返回 ``(None, 原因)``（不抛）。
 
         ``with_fallback`` 在这里没用：它切到 fallback 模型，但本机 override 里
@@ -675,18 +483,20 @@ class ExecutorNode:
         # 每轮都退化成空动作列表。
         #
         # ⇒ 现在 `schema` 是**参数**：对着实际用的那个类判。
-        # 而且两个变体现在共享 :class:`ExecutorOutputBase`
-        # （见 `agents/executor/types.py`），返回类型也跟着基类走 ——
-        # 静态检查不会再「对着错的类判」。
+        # （图片通道下线前，这里有两个变体共享 `ExecutorOutputBase`；
+        #   现在只剩一个类，直接对着它判就行。）
         if not isinstance(response, schema):
             return None, f"the answer was not an {schema.__name__} object"
         return response, None
 
-    # 🔴 **2026-10-22 删掉了 `_capture_screenshot`。**
+    # 🔴 **图片通道整条下线（2026-10-23）。**
     #
-    # 原来它给「同轮二问」补图：把 `state.latest_screenshot`（一张全分辨率
-    # base64 PNG）解码 → 等比缩到 610x1356 → 重编码成 JPEG（实测 65ms），
-    # 然后**再问一次 LLM**（真机实测 executor 单次决策中位 5,276ms）。
+    # 原来这里有两套东西：`_capture_screenshot`（把 `state.latest_screenshot`
+    # 解码 → 等比缩到 610x1356 → 重编码成 JPEG，实测 65ms，然后**再问一次
+    # LLM**，真机实测 executor 单次决策中位 5,276ms），以及后来改成「下一轮
+    # 附图」的 `_screenshot_message`。
     #
-    # 现在截图通道整条关掉（见 `agents/executor/types.py` 的说明），
-    # 这条路没有消费者了。
+    # 现在**屏幕截图不再进模型**：Executor 只看 UI 元素表 + OCR，
+    # 提示词与输出 schema 里都没有图的痕迹。
+    # 设备截图本身还在（OCR 与坐标校验都要用那一帧），只是不再作为
+    # 多模态内容块发给模型。

@@ -25,7 +25,6 @@ Cortex 只说「我判定这个子目标完成了」，真正把子目标标成 
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from minitap.mobile_use.agents.orchestrator.types import OrchestratorOutput
@@ -40,6 +39,7 @@ from minitap.mobile_use.agents.planner.utils import (
 )
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import load_prompt_template
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
@@ -84,11 +84,13 @@ class OrchestratorNode:
                 ctx=self.ctx, state=state, thoughts=["No subgoal to examine."]
             )
 
-        system_message = Template(
-            Path(__file__).parent.joinpath("orchestrator.md").read_text(encoding="utf-8")
+        system_message = load_prompt_template(
+            Path(__file__).parent.joinpath("orchestrator.md"),
+            self.ctx.prompt_language,
         ).render(platform=self.ctx.device.mobile_platform.value)
-        human_message = Template(
-            Path(__file__).parent.joinpath("human.md").read_text(encoding="utf-8")
+        human_message = load_prompt_template(
+            Path(__file__).parent.joinpath("human.md"),
+            self.ctx.prompt_language,
         ).render(
             initial_goal=state.initial_goal,
             subgoal_plan="\n".join(str(s) for s in state.subgoal_plan),

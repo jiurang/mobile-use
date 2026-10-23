@@ -38,7 +38,6 @@ def make_state(ocr_results: list[OcrText] | None) -> State:
         subgoal_plan=[],
         latest_ui_hierarchy=None,
         latest_ocr_results=ocr_results,
-        latest_screenshot=None,
         focused_app_info=None,
         device_date=None,
         structured_decisions=None,

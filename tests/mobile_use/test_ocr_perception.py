@@ -212,27 +212,24 @@ class TestPerceptionConfig:
         p = PerceptionConfig()
         assert p.ui_hierarchy and p.ocr
 
-    def test_screenshot_defaults_to_on_demand(self):
-        """截图默认**按需**（2026-10-21 改，2026-10-22 改成显式枚举）。
+    def test_the_picture_channel_is_gone(self):
+        """屏幕截图不再进模型 ⇒ 配置里**没有**图片开关。
 
-        截图是最贵的一块，而且永远不可缓存：它在 prompt 末尾，base64 长度随
-        画面变 → 请求总长每轮都变 → provider 的缓存单元匹配不上 → 归零。
-        绝大多数决策靠元素表 + OCR 就够，图只在颜色/图标/遮挡这些地方才需要。
+        这条是「下线」的验收：字段还在（哪怕是坏的）就说明只删了一半。
         """
-        p = PerceptionConfig()
-        assert p.screenshot == "on_demand"
-        assert p.screenshot_channel == "on_demand"
-        assert p.can_see_screenshot is True
+        assert "screenshot" not in PerceptionConfig.model_fields
+        assert not hasattr(PerceptionConfig(), "screenshot_channel")
+        assert not hasattr(PerceptionConfig(), "can_see_screenshot")
 
     def test_channels_are_independent(self):
-        """关掉一条不影响另外两条 —— 而且「关掉」是**字符串**不是假值。
+        """关掉一条不影响另外一条。"""
+        p = PerceptionConfig(ui_hierarchy=False)
+        assert p.ui_hierarchy is False
+        assert p.ocr is True
 
-        ⚠️ 以前 `screenshot` 是 bool，`not p.screenshot` 判的就是「关着」；
-        现在它是枚举字符串（`"off"` 是**真值**）⇒ 用 `can_see_screenshot` 判。
-        """
-        p = PerceptionConfig(screenshot="off")
-        assert p.can_see_screenshot is False
-        assert p.ui_hierarchy and p.ocr
+        q = PerceptionConfig(ocr=False)
+        assert q.ui_hierarchy is True
+        assert q.ocr is False
 
     def test_ocr_config_is_not_shared_between_instances(self):
         """default_factory 而非可变默认值 —— 否则改一个会污染所有实例。"""

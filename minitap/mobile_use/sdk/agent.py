@@ -38,6 +38,7 @@ from minitap.mobile_use.controllers.cloud_device_controller import (
 from minitap.mobile_use.controllers.platform_specific_commands_controller import get_first_device
 from minitap.mobile_use.graph.graph import get_graph
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import resolve_prompt_language
 from minitap.mobile_use.sdk.builders.agent_config_builder import get_default_agent_config
 from minitap.mobile_use.sdk.builders.task_request_builder import TaskRequestBuilder
 from minitap.mobile_use.sdk.types.agent import AgentConfig, CloudDevicePlatform
@@ -720,6 +721,13 @@ class Agent:
                 and agent_profile.llm_config.utils.video_analyzer is not None
             ),
             perception=self._config.perception,
+            # 提示词语言在这里**定案**：任务级 > Agent 级 > 环境变量 > 英文。
+            # 放进 context 之后，各 agent 只管读 context.prompt_language，
+            # 不再各自去读环境变量（环境变量是进程级的，读不了「这次任务」）。
+            prompt_language=resolve_prompt_language(
+                task=request.prompt_language,
+                agent=self._config.prompt_language,
+            ),
         )
 
         self._prepare_tracing(task=task, context=context)
@@ -1297,7 +1305,6 @@ class Agent:
             latest_ui_hierarchy=None,
             latest_ocr_results=None,
             latest_screen_elements=None,
-            latest_screenshot=None,
             focused_app_info=None,
             device_date=None,
             structured_decisions=None,

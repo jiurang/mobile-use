@@ -19,7 +19,8 @@ class ExecutorOutput(BaseModel):
     agent_thought: str = ""           # ≤1 句，为什么是这个动作
     done: bool = False                # 目标达成
     done_reason: str | None = None
-    need_screenshot: bool = False     # 元素表+OCR 不够，要图
+    # ⚠️ 2026-10-23：原来还有 need_screenshot（模型举手要图），
+    # 已随图片通道一起下线 —— 屏幕截图不再进模型。
 
 class ExecutorReport(BaseModel):
     outcome: Literal["completed", "failed", "blocked"]
@@ -124,8 +125,8 @@ START → planner → orchestrator(初始化) → convergence ──continue─�
    （这节 574 tok，**不能删**——它是索引契约的说明书。）
 6. **Tools 文本工具表**：从 `cortex.md:90-120` 搬过来（`## Tools` 节），
    包括 `{{ executor_tools_list }}` 那行。
-7. **感知通道**：`need_screenshot` 什么时候置 true；屏幕状态行（息屏提示）怎么理解。
-8. **Output**：字段表 —— `actions` / `agent_thought` / `done` / `done_reason` / `need_screenshot`。
+7. **感知通道**：两条通道（UI 元素表 / OCR）开着哪几条；屏幕状态行（息屏提示）怎么理解。
+8. **Output**：字段表 —— `actions` / `agent_thought` / `done` / `done_reason`。
 
 > ⚠️ **不要**在 executor.md 里出现 `bind_tools` / JSON schema 相关的任何话。
 > **不要**写「所有工具的完整参数定义」——那正是要避免的 4,008 token。
@@ -287,7 +288,6 @@ update={
     "latest_screen_elements": screen_elements,   # 新增
     "latest_ui_hierarchy": None,                 # 建完表就清空（保持工具侧行为）
     "latest_ocr_results": ocr_results,
-    "latest_screenshot": device_data.base64,
     "focused_app_info": current_app_package,
     "screen_size": (device_data.width, device_data.height),
     "device_date": device_date,
@@ -320,7 +320,6 @@ update={
 [4] HumanMessage    设备状态（息屏 / 前台 app / 日期）
 [5] ...             局部历史（executor_messages 里的 AIMessage/ToolMessage）
 [6] HumanMessage    屏幕元素表（每轮变）        ← **必须在最后**
-[7] HumanMessage    截图（只在 need_screenshot 时追加）
 ```
 
 > 🔴 **[6] 必须放在 [5] 之后**（即元素表在局部历史**后面**）。
@@ -340,7 +339,6 @@ def build_executor_messages(
     failures: list[dict],
     local_messages: list[AnyMessage],
     device_state_lines: list[str],
-    screenshot_message: AnyMessage | None = None,
 ) -> list[BaseMessage]:
     ...
 ```
@@ -357,29 +355,16 @@ ExecutorNode.__call__(state):
      用 _ToolCallStructuredRunnable(llm, ExecutorOutput) 拿结构化输出
      （**不要** bind_tools 那 16 个设备工具！详见 services/llm.py:529）
   4. response: ExecutorOutput
-  5. if response.need_screenshot:
-        **先扣下这一轮的动作**（它此刻只有元素表+OCR，给出的动作是猜的，
-        猜错的那一下可能是「确认支付」）→ 回灌一条 HumanMessage，
-        graph 走 retry 边回 executor（屏幕没变 ⇒ 不重新抓屏）
-        记进 `state.executor_wants_screenshot` ⇒ **下一轮**的 prompt 末尾
-        附当屏截图（**不是**同一轮再问一次 —— 那次二问要白烧一次 LLM 调用）
-        图和元素表是同一次抓屏的产物 ⇒ 编号契约不受影响
-        图通道由 Manager 侧 `perception.screenshot` 控制（**三态字符串枚举**）：
-        `"on_demand"`（默认，Executor 自己决定）/ `"always"`（每轮都带）/ `"off"`（永远不给）。
-        ⚠️ `"off"` 时**图不留任何痕迹**：提示词里没有图相关的词，schema 里也没有
-        `need_screenshot` 字段（模型看不到的东西，不该让它以为有）。
-        老 bool 仍收：`True` → `"on_demand"`、`False` → `"off"`。
-        ⚠️ 「看过图还举手」= 图没帮上忙 ⇒ 不再扣动作（否则无限循环）
-  6. 动作转换：
+  5. 动作转换：
         decisions_json = json.dumps(response.actions, ensure_ascii=False)
         tool_calls = dispatch_decisions(decisions_json, default_thought=response.agent_thought, tools=tools)
-  7. if tool_calls is None:
+  6. if tool_calls is None:
         → **把 dispatcher 的拒绝理由回灌给 Executor**（作为下一轮的 ToolMessage），
           **不要**退回 LLM 重来（那会死循环，见方案 §3.1.1 坑 2）
         → 返回 AIMessage 无 tool_calls + executor_done=False
      else:
         → 返回 AIMessage(content="", tool_calls=tool_calls)
-  8. 写 state：
+  7. 写 state：
         executor_messages: [AIMessage(...)]        # 追加自己的回合
         executor_done: response.done
         executor_steps: state.executor_steps + 1
@@ -423,16 +408,15 @@ class CortexOutput(BaseModel):
     subgoal_completed: bool = False        # 上一个子目标是否达成
     completion_reason: str | None = None   # 为什么
     # 注意：**不要** needs_replan（replan 权只在 Orchestrator，方案 §6.5.1）
-    # 注意：**不要** need_screenshot（Cortex 不看屏了，感知通道下沉到 Executor）
 ```
 
 #### W6.2 Cortex 的 prompt 瘦身
 
 **删掉**（这些都下沉给 Executor 了）：
-- 元素表渲染规则、`## Element targeting`、工具参数表、perception 三通道说明
-- 截图相关的全部内容
+- 元素表渲染规则、`## Element targeting`、工具参数表、perception 两通道说明
+- 截图相关的全部内容（2026-10-23 起图片通道整条下线，这一条已成既成事实）
 - `decisions_reason` / `goals_completion_reason` 两个字段
-- 感知块（元素表 / OCR / 截图）—— **Cortex 不再看屏**
+- 感知块（元素表 / OCR）—— **Cortex 不再看屏**
 
 **保留**：
 - 计划日志（`subgoal_plan_log`）
@@ -650,7 +634,7 @@ class ReporterSummary(BaseModel):
 | T10 | dispatcher 拒绝理由回灌 | Executor 输出未知工具名 → 拒绝理由出现在下一轮 prompt 里 |
 | T11 | dispatcher 只吃数组 | `actions` 恒为 list；单元素数组也能直连 |
 | **T12** | **元素表在 prompt 末尾** | 断言 Executor prompt 里元素表出现在局部历史**之后** |
-| **T13** | **感知通道没丢** | ExecutorOutput 有 `need_screenshot`；`executor.md` 含截图说明 + 设备状态；三条通道由 `perception` 开关控制 |
+| **T13** | **感知通道没丢** | `executor.md` 含两条通道说明 + 设备状态；通道由 `perception` 开关控制；**不含任何图片通道的痕迹**（2026-10-23 起截图不再进模型） |
 
 ---
 

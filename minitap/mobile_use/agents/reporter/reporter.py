@@ -29,7 +29,6 @@ from functools import cache
 from pathlib import Path
 from typing import Literal, cast
 
-from jinja2 import Template
 from langchain_core.messages import (
     AIMessage,
     AnyMessage,
@@ -46,6 +45,11 @@ from minitap.mobile_use.agents.executor.types import ExecutorReport, determine_o
 from minitap.mobile_use.agents.planner.utils import get_current_subgoal
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import (
+    PromptLanguage,
+    load_prompt_template,
+    pick,
+)
 from minitap.mobile_use.services.llm import (
     get_structured_llm,
     invoke_llm_with_timeout_message,
@@ -195,6 +199,7 @@ class ReporterNode:
             outcome=outcome,
             log_text=log_text,
             failed_targets=failed_targets,
+            language=self.ctx.prompt_language,
         )
 
         # 结构化输出按 **provider 能力**分派：llamacpp 走原生 json_schema 语法约束，
@@ -561,12 +566,15 @@ def _contains(haystack: str, needle: str) -> bool:
 
 
 @cache
-def load_reporter_prompt() -> str:
+def load_reporter_prompt(language: PromptLanguage = PromptLanguage.EN) -> str:
     """Reporter 的 system prompt（**完全静态**，没有模板变量）。
 
     静态 = 跨子目标逐字节不变 = 前缀缓存能一直命中。
+
+    ``language`` 进缓存键：中文版是另一个文件（``reporter-zh.md``），
+    两种语言各自的静态块要各自缓存。
     """
-    return Template(REPORTER_PROMPT_PATH.read_text(encoding="utf-8")).render()
+    return load_prompt_template(REPORTER_PROMPT_PATH, language).render()
 
 
 def build_reporter_messages(
@@ -575,6 +583,7 @@ def build_reporter_messages(
     outcome: str,
     log_text: str,
     failed_targets: list[FailedTarget],
+    language: PromptLanguage = PromptLanguage.EN,
 ) -> list[BaseMessage]:
     """组装 Reporter 的 prompt。
 
@@ -584,16 +593,28 @@ def build_reporter_messages(
     结论（outcome）**先给**：模型不该自己猜结论，它只需要写人话、挑证据。
     """
     parts = [
-        f"Subgoal attempted:\n{goal or '(no goal was given)'}",
-        f"Outcome already determined by code: {outcome}",
-        "Actions and their results:\n" + (log_text or "(no action was executed)"),
+        f"{pick('Subgoal attempted:', '尝试的子目标：', language=language)}\n"
+        f"{goal or pick('(no goal was given)', '(没有给出目标)', language=language)}",
+        f"{pick('Outcome already determined by code:', '代码已定好的结论：', language=language)}"
+        f" {outcome}",
+        pick("Actions and their results:", "执行过的动作及结果：", language=language)
+        + "\n"
+        + (log_text or pick("(no action was executed)", "(没有执行任何动作)", language=language)),
     ]
     failure_text = render_failures(failed_targets)
     if failure_text:
-        parts.append("Failed targets (facts, do not reword them):\n" + failure_text)
+        parts.append(
+            pick(
+                "Failed targets (facts, do not reword them):",
+                "失败目标（是事实，别改写）：",
+                language=language,
+            )
+            + "\n"
+            + failure_text
+        )
 
     return [
-        SystemMessage(content=load_reporter_prompt()),
+        SystemMessage(content=load_reporter_prompt(language)),
         HumanMessage(content="\n\n".join(parts)),
     ]
 
