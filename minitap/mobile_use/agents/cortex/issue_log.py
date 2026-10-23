@@ -69,7 +69,5 @@ def count_rule_retries(thoughts: list[str], subgoal_id: str) -> int:
         return 0
     marker = _issue_marker(subgoal_id)
     return sum(
-        1
-        for thought in thoughts
-        if thought.startswith(marker) and RULE_RETRY_MARKER in thought
+        1 for thought in thoughts if thought.startswith(marker) and RULE_RETRY_MARKER in thought
     )

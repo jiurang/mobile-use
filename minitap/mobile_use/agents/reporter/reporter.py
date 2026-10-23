@@ -323,6 +323,7 @@ def blocked_reason_for(state: State) -> str | None:
         "the attempt was stopped before the goal was reached"
     )
 
+
 # ---------------------------------------------------------------------------
 # 事实层：从 state 直搬，逐字
 # ---------------------------------------------------------------------------

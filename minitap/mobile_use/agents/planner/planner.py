@@ -1,8 +1,34 @@
+"""Planner：把「用户目标」拆成一份子目标计划，并在需要时重规划。
+
+两条不能破的契约
+----------------
+
+1. **计划日志只增不改。** ``subgoal_plan_log`` 是 append-only 的：replan 时
+   在尾部追加一段 ``PLAN vN``，旧段一字不改。改写旧段会击穿 cortex 提示词的
+   前缀（实测：一次 replan 差 8,078 token，且这个差随 thoughts 变长而变大）。
+   理由见 :func:`_append_plan_section`。
+
+2. **replan 只返回「剩下的步骤」。** LLM 在重规划时**不**重说已经完成的
+   子目标；代码把 ``SUCCESS`` 的子目标原样带回去（``completed_subgoals +
+   new_subgoals``）。否则模型一重规划就会把做完的事再做一遍。
+
+韧性：解析失败不许杀死整个任务
+------------------------------
+和 cortex 同一个病（MiniMax 偶发返回空响应 ⇒ 解析抛 ⇒ 整个任务当场失败），
+而 ``with_fallback`` 救不了 —— 本机 override 里 fallback 和主模型是同一个模型。
+
+⇒ 失败 → 带 nudge 重试一次 → 仍失败 → **降级**成「重新下发那些失败的子目标」。
+降级**不引入任何新的事实断言**（重新下发一个「还没做完」的子目标是事实）。
+只有**首次规划**没有可退守的东西（没有计划就没有可执行的东西）⇒ 只能抛。
+"""
+
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 
 from minitap.mobile_use.agents.planner.types import PlannerOutput, Subgoal, SubgoalStatus
 from minitap.mobile_use.agents.planner.utils import (
@@ -88,7 +114,7 @@ def _build_subgoals(output: PlannerOutput) -> list[Subgoal]:
 
 
 async def _invoke_planner(
-    llm,
+    llm: Runnable[Any, Any],
     messages: list[SystemMessage | HumanMessage],
     ctx: MobileUseContext,
     used_fallback: bool = False,
@@ -191,7 +217,7 @@ class PlannerNode:
             ctx=self.ctx, name="planner", use_fallback=True
         ).with_structured_output(PlannerOutput)
 
-        async def ask_planner(msgs) -> list[Subgoal]:
+        async def ask_planner(msgs: list[SystemMessage | HumanMessage]) -> list[Subgoal]:
             return await with_fallback(
                 main_call=lambda: _invoke_planner(llm, msgs, self.ctx),
                 fallback_call=lambda: _invoke_planner(
@@ -233,11 +259,7 @@ class PlannerNode:
             try:
                 new_subgoals = await ask_planner([*messages, nudge])
             except Exception as e2:  # noqa: BLE001
-                failed = [
-                    s
-                    for s in state.subgoal_plan
-                    if s.status == SubgoalStatus.FAILURE
-                ]
+                failed = [s for s in state.subgoal_plan if s.status == SubgoalStatus.FAILURE]
                 if not failed:
                     # 首次规划（或没有失败子目标）⇒ 没有可退守的东西，只能抛。
                     logger.warning(

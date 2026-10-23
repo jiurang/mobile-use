@@ -114,5 +114,7 @@ async def analyze_video(
         if compressed_path != video_path and compressed_path.exists():
             try:
                 compressed_path.unlink()
-            except Exception:
-                pass
+            except OSError as e:
+                # 清理失败不该影响已经拿到的分析结果 —— 只记一条，别把
+                # 「结果成功但临时文件没删掉」变成一次失败。
+                logger.debug(f"Could not remove the compressed video: {e}")

@@ -1,3 +1,29 @@
+"""Executor 的工具执行节点：**串行**执行，一个失败就中止后面的。
+
+为什么要自己写一个 ToolNode
+---------------------------
+上游 ``ToolNode`` **并行**跑所有 tool call，而且没有「一个失败就中止后面」
+的公开钩子。而 Executor 依赖这两条语义：
+
+* **串行** —— 元素表的编号只在**那一屏**上成立。一轮执行多个动作，第二个
+  动作的 ``Target.index`` 指向的是**第一个动作执行前**的屏，屏幕已经被改过了。
+* **一个失败就中止** —— 前一个动作失败了，后面的动作多半建立在错误的前提上。
+
+（这两条语义的承载者**不在 LLM 里**，在 ``ExecutorToolNode.__func`` 里面；
+prompt 里写的是软约束，这里是硬兜底。）
+
+⚠️ **这个类依赖 langgraph-prebuilt 的私有 API**（``_parse_input`` /
+``_extract_state`` / ``_run_one`` / ``_arun_one`` / ``_combine_tool_outputs``）。
+它们的签名在 minor 版本之间会变 ⇒ ``pyproject.toml`` 里把 langgraph 锁在
+``>=1.2.0,<1.3.0``。升级前先 diff 上游的 ``ToolNode._func``，并跑
+``tests/mobile_use/test_executor_tool_node.py``。
+
+顺带做的一件事：给「动过屏幕」的工具结果打上动作时刻（``last_action_at``），
+让 contextor 能判断「要不要先等屏幕沉降」。打点放在这里而不是 13 个工具文件
+里各写一遍 —— 工具们各有各的返回形状，在**执行完工具之后**统一处理，
+才是唯一能保证「每个动屏动作都被记到」的位置。
+"""
+
 import asyncio
 import copy
 import time
@@ -163,7 +189,12 @@ class ExecutorToolNode(ToolNode):
                         error_msg = self._get_tool_message(output).content
                     elif tool_message := self._find_tool_message(output):
                         error_msg = tool_message.content
-                except Exception:
+                except Exception as e:
+                    # 提取错误详情失败**不能**盖掉真正的错误：这里只是拿不到
+                    # 更详细的说明，工具本身已经失败了（`failed` 为真）。
+                    # 记一条 debug 保住现场，否则「提取失败」和「工具失败」
+                    # 在日志里长得一模一样。
+                    logger.debug(f"[executor] Could not extract error details: {e}")
                     error_msg = "Could not extract error details"
 
                 logger.info(f"❌ Tool call failed: {call_without_state}")

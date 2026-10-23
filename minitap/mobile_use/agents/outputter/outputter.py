@@ -1,3 +1,22 @@
+"""Outputter：把整条链路的思考过程压成**一份结构化产出**。
+
+它是链路的**最后一跳**，产出物直接给调用方（SDK / TUI），不再回流给任何
+agent。
+
+两条路径
+--------
+
+* **结构化**（``output_config.structured_output`` 有值）⇒ 走
+  ``with_structured_output(schema)``，产出按 schema 校验过的对象。
+  ``schema`` 可以是 dict（原生 JSON schema）或一个 ``BaseModel``。
+* **纯文本** ⇒ 模型直接写内容，按 JSON 解析。
+
+⚠️ ``output_config.output_description`` 不为空时会**多发一条 HumanMessage**
+（把描述当成追加指令）。同时，只要结构化响应对象**自带** ``content`` 字段，
+返回的就是**模型写的 JSON**（``json.loads(response.content)``）而不是
+``model_dump()`` —— 两条路径的数据来源不一样，调用方拿到的东西也不同。
+"""
+
 import json
 from pathlib import Path
 

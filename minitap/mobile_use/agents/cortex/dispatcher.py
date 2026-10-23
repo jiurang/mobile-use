@@ -1,27 +1,40 @@
-"""把 Cortex 的 decisions JSON **确定性地**翻译成 tool_calls，跳过 Executor 的 LLM 往返。
+"""把「动作 JSON」**确定性地**翻译成 tool_calls。
 
-为什么要做这个
---------------
-一条动作在 Cortex 的输出里已经是一个完备、无歧义的动作描述了：
+这个模块是**纯代码**的一层：给出动作 JSON，给出 tool_calls，或者给出一条
+「为什么不行」的理由。它不调 LLM，也不改写动作内容。
+
+输入长什么样
+------------
+一个 JSON 数组字符串，每个元素形如::
 
     [{"action": "tap", "target": {"resource_id": "com.x:id/send", ...}}]
 
-`action` 字段**本身就是工具名**。所以 Executor 那次 LLM 调用做的事情是
-「JSON → tool_calls 的机械转写」——它不重新决策，Cortex 已经决策完了
-（executor.md 第一条规则就是 "Don't reason about strategy - just execute what
-Cortex decided"）。这一轮往返是纯开销：一次完整的 prefill + 一次完整的生成。
+``action`` 字段**本身就是工具名**，其余 key 平铺成 tool args。这和
+``ExecutorOutput.actions`` 的形状**逐字一致**（见
+``agents/executor/types.py``），所以 Executor 吐出来的结构化输出可以直接
+喂进来，中间不需要任何转写。
 
-**Executor 里真正承载语义的那部分不在 LLM 里**：
-- 「按返回顺序串行执行」+「一个失败就中止后面的」实现在
-  `ExecutorToolNode.__func`（串行 for 循环 + failed 标志），
-  不是在 Executor 的 prompt 里。跳过 LLM 不会丢这两条语义。
-- `agent_thought` 由 Cortex 的 `decisions_reason` 提供，信息没有丢。
+为什么要有这一层
+----------------
+「JSON → tool_calls」是**机械转写**，不需要智能：工具名在 ``action`` 里，
+参数就在旁边。而承载真正语义的「按顺序串行执行」「一个失败就中止后面的」
+实现在 ``ExecutorToolNode.__func``（串行 for 循环 + failed 标志），
+**不在 LLM 里** —— 所以这一层不会丢掉任何语义。
 
-失败模式：直连是**快路径**，不是唯一路径
---------------------------------------
-`dispatch_decisions` 任何一步不确定就返回 `None`，调用方退回原来的
-Executor LLM。也就是说最坏情况就是今天的行为（多一次往返），
-绝不会因为 Cortex 的 JSON 写法不标准就把整轮搞挂。
+失败时**不退回 LLM 重新转写**，而是把**拒绝理由**回灌给模型
+--------------------------------------------------------------------
+Executor 的 LLM **就是决策者**（它自己看屏、自己决定下一个动作）。
+「退回 LLM」退回来的是同一个决策者，它看不到自己错在哪 ⇒ 大概率输出
+**同样的坏动作** ⇒ 死循环。
+
+⇒ 所以 :func:`dispatch_decisions_with_reason` 同时返回**给模型看的理由**
+（「你刚才说的 `teleport` 不是个工具」），调用方把它当工具结果回灌，
+让模型带着理由重新决策。这是新架构下唯一正确的失败处理方式。
+
+⚠️ 改造前的老架构（Cortex 出 decisions、Executor 机械转写）里，
+「退回 LLM 重转写」是合理的——转写器重试可能就写对了。老文档里
+「直连是快路径，失败就退回 Executor LLM」的说法**已经失效**，
+照着实现会造出死循环。
 """
 
 from __future__ import annotations
@@ -49,6 +62,7 @@ def _strip_fences(text: str) -> str:
     text = re.sub(r"^```(?:json)?\s*\n?", "", text)
     text = re.sub(r"\n?```\s*$", "", text)
     return text.strip()
+
 
 def _extract_json_array(text: str) -> str | None:
     """取出第一个括号配平的 JSON 数组。
@@ -96,7 +110,8 @@ def parse_actions(decisions: str | None) -> list[dict] | None:
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
+            # JSONDecodeError 是 ValueError 的子类，一句就够。
             continue
         if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
             return parsed
@@ -121,27 +136,19 @@ def _required_args(tool: BaseTool) -> set[str]:
     }
 
 
-def _looks_valid(action: dict, tool: BaseTool, thought: str) -> dict | None:
-    """校验单个动作能否安全直发；不行返回 None。
-
-    校验两件事，方向相反：
-    - 必填参数齐不齐（缺了就交给 Executor LLM 去补）
-    - 有没有模型压根不认识的参数名（Cortex 幻觉出来的字段）
-
-    另外顺手拦一类最常见的形态错误：声明为对象的参数（比如 `target`）
-    传了字符串或数字 —— 这种在 ToolNode 里报错太晚，直接退回 LLM 更划算。
-    """
-    kwargs, _reason = _looks_valid_with_reason(action, tool, thought)
-    return kwargs
-
-
 def _looks_valid_with_reason(
     action: dict, tool: BaseTool, thought: str
 ) -> tuple[dict | None, str | None]:
-    """和 `_looks_valid` 一样，但**同时返回给模型看的拒绝理由**。
+    """校验单个动作能否安全直发；不行返回 ``(None, 拒绝理由)``。
 
-    理由要能直接塞进下一轮 prompt —— 模型得知道**自己错在哪**，
-    光说「不合法」它只会换个方式再犯一次。
+    校验两件事，方向相反：
+    - 必填参数齐不齐（缺了就交给模型去补）
+    - 有没有模型压根不认识的参数名（幻觉出来的字段）
+
+    另外顺手拦一类最常见的形态错误：声明为对象的参数（比如 `target`）
+    传了字符串或数字 —— 这种在 ToolNode 里报错太晚，退回模型重新决定更划算。
+
+    **理由必须说对病因**：笼统地说「不合法」，模型只会换个姿势再犯一次。
     """
     kwargs = {k: v for k, v in action.items() if k not in _NAME_KEYS}
     kwargs["agent_thought"] = kwargs.get("agent_thought") or thought
@@ -167,8 +174,7 @@ def _looks_valid_with_reason(
         if prop.get("type") == "object" and not isinstance(value, dict):
             logger.info(f"Dispatch: arg '{key}' of '{tool.name}' should be an object")
             return None, (
-                f"'{key}' of '{tool.name}' must be an object, "
-                f"e.g. {key}: {{\"index\": 7}}"
+                f"'{key}' of '{tool.name}' must be an object, e.g. {key}: {{\"index\": 7}}"
             )
 
     return kwargs, None
@@ -179,17 +185,21 @@ def dispatch_decisions(
     default_thought: str | None,
     tools: list[BaseTool],
 ) -> list[ToolCall] | None:
-    """Cortex decisions → tool_calls。
+    """动作 JSON → tool_calls（**不返回拒绝理由**的老签名）。
+
+    ⚠️ 新代码用 :func:`dispatch_decisions_with_reason`：它多返回一条
+    「给模型看的拒绝理由」。没有理由就没法回灌，模型只会换个姿势再犯
+    同一个错。
 
     Args:
-        decisions: Cortex 的 `structured_decisions`（JSON 数组字符串）。
-        default_thought: 兜底的 agent_thought（用 Cortex 的 decisions_reason）。
+        decisions: 动作 JSON（JSON 数组字符串）。
+        default_thought: 兜底的 agent_thought。
         tools: 当前会话可用的工具。
 
     Returns:
-        成功时返回按原顺序排列的 tool_calls；**任何一步不确定都返回 None**，
-        调用方必须退回 Executor 的 LLM 路径。空列表也返回 None
-        （没有动作可发，和「解析失败」在调用方的处理方式是一样的）。
+        成功时返回按原顺序排列的 tool_calls；**任何一步不确定都返回 None**。
+        空列表也返回 None（没有动作可发，和「解析失败」在调用方的处理方式
+        是一样的）。
     """
     calls, _reason = dispatch_decisions_with_reason(decisions, default_thought, tools)
     return calls
@@ -259,9 +269,7 @@ def dispatch_decisions_with_reason(
         if kwargs is None:
             return None, reason
 
-        calls.append(
-            ToolCall(name=tool.name, args=kwargs, id=f"dispatch_{uuid.uuid4().hex[:12]}")
-        )
+        calls.append(ToolCall(name=tool.name, args=kwargs, id=f"dispatch_{uuid.uuid4().hex[:12]}"))
 
     logger.info(
         f"Dispatch: direct execution of {len(calls)} action(s) "

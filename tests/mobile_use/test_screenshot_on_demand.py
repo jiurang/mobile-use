@@ -124,6 +124,29 @@ class TestSchemaFollowsTheSwitch:
             schema = executor_output_schema(can_see_screenshot=can_see)
             assert convert_to_openai_tool(schema)["function"]["name"] == "ExecutorOutput"
 
+    def test_tool_description_is_a_contract_not_a_comment(self):
+        """``ExecutorOutput`` 的 docstring = **模型看得见的工具描述**。
+
+        ``convert_to_openai_tool`` 会把 ``cls.__doc__`` 塞进 JSON schema 的
+        ``description``，而这个 schema 每轮都发给模型 ⇒ **改 docstring =
+        改提示词**。
+
+        实测踩过：把 docstring 改写成「更清楚」的版本，A/B 一比就发现发给
+        模型的工具描述变了（字段部分没变，只有 description 变了）—— 而这种
+        改动**没有任何测试会红**，只会悄悄改变模型行为。
+
+        ⇒ 这条测试锁住契约：只要那句「actions 用 list[dict] 是故意的」还在，
+        就说明 docstring 没被动过。真要改，得是有意识地改。
+        """
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        schema = executor_output_schema(can_see_screenshot=True)
+        description = convert_to_openai_tool(schema)["function"].get("description") or ""
+        assert "list[dict]" in description, (
+            "ExecutorOutput 的 docstring 是模型看得见的工具描述 —— "
+            "改动会让发给模型的提示词静默变化"
+        )
+
 
 class TestExecutorDecidesTheScreenshot:
     """Executor 自己举手要图。"""

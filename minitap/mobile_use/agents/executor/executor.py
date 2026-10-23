@@ -33,12 +33,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
+from langchain_core.runnables import Runnable
 
 from minitap.mobile_use.agents.cortex.dispatcher import dispatch_decisions_with_reason
 from minitap.mobile_use.agents.executor.prompt import build_executor_messages
-from minitap.mobile_use.agents.executor.types import ExecutorOutput, executor_output_schema
+from minitap.mobile_use.agents.executor.types import (
+    ExecutorOutput,
+    ExecutorOutputBase,
+    executor_output_schema,
+)
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import (
@@ -94,6 +100,14 @@ def _rejection_code(reason: str | None) -> str:
 
     **只放代码，不放理由原文** —— 理由里可能含屏幕上的文字（用户数据），
     而遥测是落库上报的。理由原文会回灌给模型（那是另一条路，不外传）。
+
+    ⚠️ **这是按子串匹配的，刻意如此**：拒绝理由是 dispatcher 拼给人看的
+    自然语言（``agents/cortex/dispatcher.py``），没有结构化错误码可对。
+    而这个码**只进遥测**（看板上的分布图），不参与任何控制流 ⇒ 匹配失败
+    退化成 ``"unknown"`` 是可以接受的。
+
+    别把它当契约用：改了 dispatcher 那边的措辞，这里的分布会变。
+    真要稳定的码，得让 dispatcher 直接返回码 + 理由（而不是让这里去猜）。
     """
     if not reason:
         return "unknown"
@@ -334,14 +348,19 @@ class ExecutorNode:
         *,
         state: State,
         goal: str,
-    ) -> ExecutorOutput:
+    ) -> ExecutorOutputBase:
         """问一次 LLM，拿结构化输出。
 
         **只绑定 `ExecutorOutput` 这一个 schema**（走 `services/llm.py` 的
         `get_structured_llm`），**不** bind 那 16 个设备工具。
 
         解析失败**不会**返回 None —— 内部已经降级成「空动作 + 说明」，
-        调用方拿到的永远是一个可用的 `ExecutorOutput`。
+        调用方拿到的永远是一个可用的输出对象。
+
+        返回类型是 :class:`ExecutorOutputBase` 而不是 ``ExecutorOutput``：
+        「模型不能看图」那条路上用的是**兄弟类**，两者共享基类。写成
+        ``ExecutorOutput`` 会让静态检查骗过运行时（见
+        ``agents/executor/types.py`` 的基类说明）。
         """
         device_state_lines: list[str] = []
         if state.device_date:
@@ -438,7 +457,7 @@ class ExecutorNode:
                     )
                 ),
             ]
-            response, retry_reason = await self._invoke(runner, retry_messages)
+            response, retry_reason = await self._invoke(runner, retry_messages, schema)
             if response is None:
                 logger.warning(
                     "[executor] Still unparseable after retry "
@@ -530,7 +549,7 @@ class ExecutorNode:
         # on_demand：上一轮举过手 ⇒ 这一轮带图
         return bool(state.executor_wants_screenshot)
 
-    def _should_hold_for_picture(self, *, state: State, response: ExecutorOutput) -> bool:
+    def _should_hold_for_picture(self, *, state: State, response: ExecutorOutputBase) -> bool:
         """模型举了手要图，而这一轮**还没**给过它图 ⇒ 先给图，再让它动手。
 
         为什么不让它先动一下
@@ -614,10 +633,10 @@ class ExecutorNode:
 
     async def _invoke(
         self,
-        runner,
-        messages,
-        schema,
-    ) -> tuple[ExecutorOutput | None, str | None]:
+        runner: Runnable[Any, Any],
+        messages: list[BaseMessage],
+        schema: type[ExecutorOutputBase],
+    ) -> tuple[ExecutorOutputBase | None, str | None]:
         """调一次 LLM；解析失败返回 ``(None, 原因)``（不抛）。
 
         ``with_fallback`` 在这里没用：它切到 fallback 模型，但本机 override 里
@@ -654,6 +673,11 @@ class ExecutorNode:
         # （`tool_calls[0].name = "ExecutorOutput"`，args 完整），却被这里判成
         # 「the answer was not an ExecutorOutput object」→ **动作被丢**，
         # 每轮都退化成空动作列表。
+        #
+        # ⇒ 现在 `schema` 是**参数**：对着实际用的那个类判。
+        # 而且两个变体现在共享 :class:`ExecutorOutputBase`
+        # （见 `agents/executor/types.py`），返回类型也跟着基类走 ——
+        # 静态检查不会再「对着错的类判」。
         if not isinstance(response, schema):
             return None, f"the answer was not an {schema.__name__} object"
         return response, None

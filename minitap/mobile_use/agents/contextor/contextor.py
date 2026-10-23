@@ -1,3 +1,34 @@
+"""Contextor：感知节点 —— 抓屏、判稳、建「屏幕元素表」。
+
+**它是索引契约的产地**
+----------------------
+模型报的 ``Target.index`` 要能还原成「它当时看到的那一行」—— 编号只在
+**那一次裁剪**上成立（执行时会重新 dump 再重新编号，编号可能已经不是同一个
+元素了）。
+
+⇒ 所以「抓屏」和「建表」必须发生在**同一个节点**里：两者之间不可能有任何
+动作插进来，工具读到的就一定是模型看到的那一屏的表。截图同理 —— 它是
+**contextor 刚抓的那一帧**，不是 executor 事后重抓的（重抓会多一次 adb 往返，
+还可能拿到不同帧，图和编号就对不上了）。
+
+三条通道，Manager 侧可开关（``ctx.perception``）
+-------------------------------------------------
+* ``ui_hierarchy`` —— UI 元素表。关掉 ⇒ 不建表 ⇒ 工具侧走 legacy OCR 路径。
+* ``ocr`` —— OCR 文字。关掉 ⇒ **OCR 引擎根本不跑**（不是「跑完再丢掉」：
+  真机实测 381~443ms/步，占整段感知的一大截，而结果被丢掉）。
+* ``screenshot`` —— 截图。**由 Executor 自己决定**要不要（见
+  ``agents/executor/executor.py``），contextor 只负责提供那一帧。
+
+先判稳，再建表
+--------------
+抓早了会拿到**过渡态**（实测：页面导航 49 → 91 → 91 → 228 个元素）。所以抓屏
+前先「等下限 + 确认稳定」—— 两次树级 dump 指纹相同才算定下来。
+
+⚠️ **「静 ≠ 全」**：懒加载的控件可能在静默期之后才挂上（实测 dump#1/dump#2
+内容一样但都不是完整的）。这一挡不住，是**已知代价**。验收看「步数」和
+「失败目标数」，不看「点错率」。
+"""
+
 import asyncio
 import time
 from pathlib import Path
@@ -28,7 +59,6 @@ from minitap.mobile_use.utils.screen_elements import (
 from minitap.mobile_use.utils.screen_stability import (
     is_stable,
     structural_change_count,
-    structural_digest,
     tree_fingerprint,
 )
 from minitap.mobile_use.utils.ui_hierarchy_view import normalize_hierarchy
@@ -532,6 +562,8 @@ class ContextorNode:
     ) -> ContextorOutput:
         """Invoke the LLM to decide whether to relaunch the locked app."""
 
+        # ⚠️ 取**最老**的 25 条（``[:25]``），而 planner 那边取的是**最新**的
+        # 25 条（``[-25:]``）。同名不同向 —— 别照抄 planner 那边的写法。
         MAX_AGENTS_THOUGHTS = 25
 
         system_message = Template(

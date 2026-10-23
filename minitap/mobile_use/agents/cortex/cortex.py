@@ -41,7 +41,7 @@ Executor 自主执行之后，这活儿下沉给了 Executor（它自己看屏�
 import os
 from functools import cache
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from jinja2 import Template
 from langchain_core.messages import (
@@ -50,8 +50,14 @@ from langchain_core.messages import (
     RemoveMessage,
     SystemMessage,
 )
+from langchain_core.runnables import Runnable
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+from minitap.mobile_use.agents.cortex.issue_log import (
+    RULE_RETRY_MARKER,
+    count_goal_issues,
+    count_rule_retries,
+)
 from minitap.mobile_use.agents.cortex.types import CortexOutput
 from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.agents.planner.types import Subgoal
@@ -123,7 +129,7 @@ def load_cortex_prompt() -> str:
 
 
 async def _invoke_cortex(
-    llm,
+    llm: Runnable[Any, Any],
     messages: list[BaseMessage],
     ctx: MobileUseContext,
     used_fallback: bool = False,
@@ -164,10 +170,7 @@ def render_executor_report(report: ExecutorReport | None) -> str:
     （``agents/executor/types.py``），Cortex 看到的就是真的发生了什么。
     """
     if report is None:
-        return (
-            "Executor report: none yet - the Executor has not finished a "
-            "subgoal attempt yet."
-        )
+        return "Executor report: none yet - the Executor has not finished a subgoal attempt yet."
 
     lines = [
         "Executor report (last subgoal attempt):",
@@ -213,7 +216,7 @@ def decide_next_step(
 ) -> CortexDecision:
     """把 Cortex 的输出翻译成「下发什么 / 判完成 / 放弃」。
 
-    纯函数：判断逻辑和 IO 分开，才能单测（不接设备、不调 LLM）。
+    纯逻辑：判断和 IO 分开，才能单测（不接设备、不调 LLM；只写日志）。
 
     编码约定（三个字段怎么组合成三种动作）：
 
@@ -226,7 +229,7 @@ def decide_next_step(
       这一条是「不能无限重发」的兜底（方案 T8'）。
     * 没有汇报 → **issue**（第一次进 Cortex，下发第一个子目标）。
     """
-    reason = response.completion_reason or (report.summary if report else "") or ""
+    reason = response.completion_reason or (report.summary if report else "")
 
     if report is None:
         # 第一次进 Cortex：还没有任何尝试可供判断，只可能是「下发目标」。
@@ -286,16 +289,6 @@ RULE_RETRY_BUDGET = 1
 #
 # 下面三个名字**继续从本模块导出**：既有调用点（L3 的规则换招、测试）都从
 # `agents.cortex.cortex` 导入，改路径会波及它们。
-from minitap.mobile_use.agents.cortex.issue_log import (  # noqa: E402
-    RULE_RETRY_MARKER,
-)
-from minitap.mobile_use.agents.cortex.issue_log import (  # noqa: E402
-    count_goal_issues,
-)
-from minitap.mobile_use.agents.cortex.issue_log import (  # noqa: E402
-    count_rule_retries,
-)
-
 __all__ = [
     "RULE_RETRY_BUDGET",
     "RULE_RETRY_MARKER",
@@ -397,7 +390,7 @@ class CortexNode:
         on_success=lambda _: logger.success("Cortex Agent"),
         on_failure=lambda _: logger.error("Cortex Agent"),
     )
-    async def __call__(self, state: State):
+    async def __call__(self, state: State) -> dict[str, Any]:
         current_locked_app_package = (
             self.ctx.execution_setup.get_locked_app_package() if self.ctx.execution_setup else None
         )
@@ -503,8 +496,7 @@ class CortexNode:
         # 后面所有块的位置漂移。
         messages.append(
             HumanMessage(
-                content=render_failures(state.failed_targets)
-                or "No target has failed recently."
+                content=render_failures(state.failed_targets) or "No target has failed recently."
             )
         )
 
@@ -643,7 +635,7 @@ class CortexNode:
                 )
                 decision_source = "llm"
 
-        update: dict = {
+        update: dict[str, Any] = {
             # latest_ui_hierarchy 没有索引契约，清掉保持工具侧现取
             # （contextor 建完元素表后也清；这里再清一次是兜底）。
             "latest_ui_hierarchy": None,

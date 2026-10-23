@@ -1,3 +1,13 @@
+"""Hopper：从一大坨文本里**捞出**指定的那一份数据。
+
+和 Executor 那条链路无关 —— 它不碰设备、不驱动界面，只做一件事：把
+``data`` 和「要什么」的 ``request`` 一起交给模型，让模型按结构化输出把
+**那一份**数据挑出来。
+
+所以它的 ``temperature=0``（要的是确定性，不是发挥），且失败没有降级路径
+（没有产出就没有产出，调用方自己决定怎么办）。
+"""
+
 from pathlib import Path
 
 from jinja2 import Template

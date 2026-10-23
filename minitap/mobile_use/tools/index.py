@@ -7,11 +7,20 @@ from minitap.mobile_use.tools.mobile.focus_and_clear_text import focus_and_clear
 from minitap.mobile_use.tools.mobile.focus_and_input_text import focus_and_input_text_wrapper
 from minitap.mobile_use.tools.mobile.launch_app import launch_app_wrapper
 from minitap.mobile_use.tools.mobile.long_press_on import long_press_on_wrapper
-from minitap.mobile_use.tools.mobile.macros import (
-    find_macros_wrapper,
-    run_macro_wrapper,
-    save_macro_wrapper,
-)
+# 🔴 **2026-10-23 临时停用宏（脚本）工具。**
+#
+# 三个宏工具（`find_macros` / `save_macro` / `run_macro`）不再注册给 Executor，
+# 提示词里对应的工具表行也一并摘掉了（`agents/executor/executor.md`）。
+#
+# **只摘 LLM 面向的这一层**，宏引擎本体（`minitap/mobile_use/macros/`）和三个工具的
+# 实现（`tools/mobile/macros.py`）都**原封不动** —— 恢复只要把下面三行注释解开。
+#
+# 备份 / 恢复说明：`backup/20261023-disable-macro-tools/README.md`
+# from minitap.mobile_use.tools.mobile.macros import (
+#     find_macros_wrapper,
+#     run_macro_wrapper,
+#     save_macro_wrapper,
+# )
 from minitap.mobile_use.tools.mobile.open_link import open_link_wrapper
 from minitap.mobile_use.tools.mobile.press_key import press_key_wrapper
 from minitap.mobile_use.tools.mobile.stop_app import stop_app_wrapper
@@ -23,11 +32,24 @@ from minitap.mobile_use.tools.mobile.video_recording import (
 )
 from minitap.mobile_use.tools.mobile.wait_for_delay import wait_for_delay_wrapper
 from minitap.mobile_use.tools.mobile.wake_screen import wake_screen_wrapper
-from minitap.mobile_use.tools.scratchpad import (
-    list_notes_wrapper,
-    read_note_wrapper,
-    save_note_wrapper,
-)
+# 🔴 **2026-10-23 临时停用笔记（scratchpad）工具。**
+#
+# 三个笔记工具（`save_note` / `read_note` / `list_notes`）不再注册给 Executor，
+# 提示词里对应的工具表行也一并摘掉了（`agents/executor/executor.md`）。
+#
+# **只摘 LLM 面向的这一层**：`tools/scratchpad.py` 的实现和 `graph/state.py` 里的
+# `scratchpad` 字段都**原封不动** —— 恢复只要把下面几行注释解开。
+#
+# ⚠️ 连带后果：planner 不再被教「用笔记工具做跨 app 数据搬运」
+# （`agents/planner/planner.md` 那段示例已删）⇒ 「把 A app 的内容搬到 B app」
+# 这类任务 planner 规划不出来。
+#
+# 备份 / 恢复说明：`backup/20261023-disable-note-tools/README.md`
+# from minitap.mobile_use.tools.scratchpad import (
+#     list_notes_wrapper,
+#     read_note_wrapper,
+#     save_note_wrapper,
+# )
 from minitap.mobile_use.tools.tool_wrapper import CompositeToolWrapper, ToolWrapper
 
 EXECUTOR_WRAPPERS_TOOLS = [
@@ -46,13 +68,15 @@ EXECUTOR_WRAPPERS_TOOLS = [
     # 屏幕是灭的时候用它点亮 —— 息屏时截图全黑、层级树只剩 systemui 残留，agent 会盲操作
     wake_screen_wrapper,
     # Scratchpad tools for persistent memory
-    save_note_wrapper,
-    read_note_wrapper,
-    list_notes_wrapper,
+    # 🔴 2026-10-23 临时停用 —— 见本文件顶部的说明。恢复：解开下面三行注释。
+    # save_note_wrapper,
+    # read_note_wrapper,
+    # list_notes_wrapper,
     # 宏（脚本）：查 / 存 / 跑。跑宏是**零次 LLM 调用**的一串已决定的动作。
-    find_macros_wrapper,
-    save_macro_wrapper,
-    run_macro_wrapper,
+    # 🔴 2026-10-23 临时停用 —— 见本文件顶部的说明。恢复：解开下面三行注释。
+    # find_macros_wrapper,
+    # save_macro_wrapper,
+    # run_macro_wrapper,
 ]
 
 VIDEO_RECORDING_WRAPPERS = [

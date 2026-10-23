@@ -106,16 +106,6 @@ New plan (only the remaining steps - completed subgoals are kept automatically):
 - Send message
 ```
 
-**Cross-app data transfer (using note tools):**
-```
-Goal: "Copy the recipe ingredients from RecipeApp and add them to my shopping list in ShoppingApp"
-
-✅ Correct subgoals:
-- Open RecipeApp and navigate to the recipe
-- Save the ingredients list using the `save_note` tool
-- Open ShoppingApp
-- Read the saved note using the `read_note` tool and add items to shopping list
-```
 {% if current_foreground_app %}
 
 **Foreground app already open (`{{ current_foreground_app }}`):**

@@ -1,4 +1,29 @@
+"""Orchestrator：验收子目标 + 看门狗。
+
+它是**完成判定的验收方**
+----------------------
+Cortex 只说「我判定这个子目标完成了」，真正把子目标标成 ``SUCCESS`` 的是
+这里（:func:`complete_subgoals_by_ids`）。两处都能判完成，就会出现两个互相
+覆盖的判断源 —— 所以分工是硬的：Cortex 提名，Orchestrator 验收。
+
+它同时是**看门狗**
+----------------
+「计划还走得通吗」这个判断只在这里做：``needs_replaning`` ⇒ 当前子目标标
+``FAILURE`` ⇒ convergence 判出「计划里有失败」⇒ Planner 重规划。
+
+⚠️ 这条链是「子目标失败了没人管」的唯一兜底。真机日志里出现过「跑了很久却
+一次 replan 都没有」的情况 —— 那要么是一次没失败过（正常），要么是**看门狗
+断了**（Cortex 一直重发到撞 recursion_limit）。这两种光看别的指标分不开，
+所以 planner 那边专门埋了 replan 计数来验证这条链还活着。
+
+它是**唯一**会写计划状态的节点
+------------------------------
+除了「验收通过」（标 SUCCESS）和「计划走不通」（标 FAILURE）之外，别的节点
+只读计划不改计划。
+"""
+
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Template
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -32,7 +57,7 @@ class OrchestratorNode:
         on_success=lambda _: logger.success("Orchestrator Agent"),
         on_failure=lambda _: logger.error("Orchestrator Agent"),
     )
-    async def __call__(self, state: State):
+    async def __call__(self, state: State) -> dict[str, Any]:
         no_subgoal_started = nothing_started(state.subgoal_plan)
         current_subgoal = get_current_subgoal(state.subgoal_plan)
 
@@ -139,7 +164,7 @@ async def _get_state_update(
     state: State,
     thoughts: list[str],
     update_plan: bool = False,
-):
+) -> dict[str, Any]:
     update = {
         "agents_thoughts": thoughts,
         "complete_subgoals_by_ids": [],

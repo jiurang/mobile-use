@@ -1,8 +1,24 @@
+"""计划（``list[Subgoal]``）的读写原语。
+
+**所有函数都原地改写传入的 plan**，并把它返回去 —— 这样调用方既可以
+``plan = fail_current_subgoal(plan)``，也可以直接 ``fail_current_subgoal(plan)``
+然后继续用原来的变量。返回的永远是**同一个对象**（不是副本）。
+
+两条约定
+--------
+
+* **状态和时间戳在这里落** —— ``status`` / ``started_at`` / ``ended_at``
+  只有这一处会改，别处只读。
+* **「给模型看的文本」拆成两块**（``render_plan_skeleton`` /
+  ``render_subgoal_status``）—— 因为状态每轮都变，而计划日志只增不改。
+  两块分开渲染，前缀缓存才不会被状态流转击穿。理由见各自的 docstring。
+"""
+
 import random
 import string
+from datetime import UTC, datetime
 
 from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus
-from datetime import datetime, UTC
 
 
 def get_current_subgoal(subgoals: list[Subgoal]) -> Subgoal | None:
@@ -19,15 +35,6 @@ def get_next_subgoal(subgoals: list[Subgoal]) -> Subgoal | None:
 
 def nothing_started(subgoals: list[Subgoal]) -> bool:
     return all(s.status == SubgoalStatus.NOT_STARTED for s in subgoals)
-
-
-def complete_current_subgoal(subgoals: list[Subgoal]) -> list[Subgoal]:
-    current_subgoal = get_current_subgoal(subgoals)
-    if not current_subgoal:
-        return subgoals
-    current_subgoal.status = SubgoalStatus.SUCCESS
-    current_subgoal.ended_at = datetime.now(UTC)
-    return subgoals
 
 
 def complete_subgoals_by_ids(subgoals: list[Subgoal], ids: list[str]) -> list[Subgoal]:
