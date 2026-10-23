@@ -186,8 +186,8 @@ def test_executor_prompt_keeps_element_targeting_contract():
     # 两种寻址方式：元素表用 `index`，只有 OCR 块时用 `ocr_index`
     assert "`index`" in text
     assert "`ocr_index`" in text
-    # 失败的目标不重复上报
-    assert "do not re-report a target that already failed" in text
+    # 失败的目标不重复上报（措辞在失败事实块里 —— 与 zh 版对齐后不再单列规则节）
+    assert "do not reuse them, pick a different element" in text
 
 
 def test_executor_prompt_keeps_text_tools_table():
@@ -215,22 +215,23 @@ def test_executor_prompt_keeps_text_tools_table():
 def test_executor_prompt_keeps_perception_channels():
     """感知通道不能丢：**两条通道**（UI 元素 + OCR）+ 设备状态（息屏）。
 
-    两条通道都由 Manager 侧开关控制（`perception.ui_hierarchy` /
-    `perception.ocr`），提示词必须**按开关渲染**：通道关着却还在教模型
-    用那个通道，模型就会去按一个不存在的通道寻址。
+    2026-10-24：与 zh 版对齐后，system prompt 不再按开关分支渲染 ——
+    两条通道改成一句静态描述（元素表 / OCR 块），开关带来的差异由
+    **每轮消息块**自己说清：无元素表时 `ocr_message` 教 `ocr_index`，
+    两条通道全关时 `device_state_message` 明确告知「没有感知通道」。
 
-    丢了 UI/OCR 通道 ⇒ 模型看不见任何东西；丢了设备状态就会在黑屏上
-    反复空转（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步）。
+    所以这里断言的是「通道信息没有丢」，而不是「必须在 system prompt 里分支」。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "## Perception" in text
-    # 两个通道都在，且**按开关分支**渲染
-    assert "perception.ui_hierarchy" in text
-    assert "perception.ocr" in text
-    # 两个文本通道
-    assert "UI elements" in text
-    assert "OCR" in text
-    assert "device state line" in text
+    # 两个文本通道：元素表 / OCR 块
+    assert "element table" in text
+    assert "OCR block" in text
+    # 开关带来的状态由运行时块承载
+    assert "`ocr_index`" in text
+    assert "NO perception channel is available" in text
+    # 息屏告知（真机教训：30 分钟息屏让任务从 30 步涨到 51 步）
+    assert "Screen is OFF" in text
     assert "wake_screen" in text
 
 
@@ -268,20 +269,21 @@ def test_executor_prompt_output_fields_match_executor_output():
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     for field in ("actions", "agent_thought", "done", "done_reason"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
-    # agent_thought：≤1 句，且不许把目标陈述写进去（方案 §3.1.1 顺带说明）
-    assert "one short sentence" in text
-    assert "Never put the goal statement in it" in text
+    # agent_thought：≤1 句，只解释本动作（与 zh 版字段表对齐）
+    assert "One sentence explaining this action" in text
 
 
 def test_executor_prompt_keeps_the_anchor_rules():
-    """一次一个动作 / 不重复失败目标 / 锚在本次目标上 / 走不动如实说。"""
+    """一次一个动作 / 不重复失败目标 / 目标不变、做不到就如实说。
+
+    2026-10-24：与 zh 版对齐后，规则不再单列一节：
+    - 「不重复失败目标」由失败事实块承载（每轮追加，模型照着换目标）；
+    - 「目标不变、做不到就如实说」写在开头的目标陈述里。
+    """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "One action at a time" in text
-    assert "Never repeat a failed target" in text
-    assert "Stay on this goal" in text
-    assert "still advance *this* goal" in text
-    assert "report the truth" in text
-    assert "Never invent success" in text
+    assert "do not reuse them, pick a different element" in text
+    assert "reach it, or report truthfully that you could not" in text
 
 
 def test_reporter_template_is_static():
