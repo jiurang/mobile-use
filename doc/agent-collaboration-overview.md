@@ -237,9 +237,27 @@ Orchestrator 看执行反馈后说"确实做完了"是另一回事。这道复�
 | `ocr` | 截图 OCR 文本 | 坐标校验退回只看层级树 |
 
 > ⚠️ **2026-10-23：图片通道（`screenshot`）整条下线。**
-> 屏幕截图**不再进模型** —— 提示词里没有多模态内容块，Executor 的输出 schema 里
-> 也没有「我要看图」这个字段。抓屏本身照旧（OCR 与坐标校验都要用那一帧），
-> 只是不再作为图片块发给模型。代价是 agent 读不出颜色、图标与遮挡关系。
+> 屏幕截图**不再作为每轮的屏幕描述进模型** —— 提示词里没有「每轮附图」这件事，
+> Executor 的输出 schema 里也没有「我要看图」这个字段。抓屏本身照旧（OCR 与坐标校验
+> 都要用那一帧）。
+>
+> **2026-10-24：截图改成了按需工具 `take_screenshot`**（`tools/mobile/take_screenshot.py`）。
+> 模型自己喊一声要看图，框架把当屏那张图挂在**工具结果**上（多模态内容块）。
+> 它是上面两条通道的**补充，不是第三条通道**：
+>
+> | | 元素表 / OCR | 截图工具 |
+> |---|---|---|
+> | 给模型的 | 文字 | 像素 |
+> | 能寻址（`[i]`） | ✅ | ❌ 图上没编号 |
+> | 认字 | 元素表靠 UI 文本，OCR 认字更准 | 靠模型自己读 |
+> | 读得出图标 / 颜色 / 遮挡 | ❌ | ✅ |
+> | 成本 | 每轮固定 | 按需，一屏一张（~500 token） |
+>
+> ⇒ 寻址**始终**走元素表；图只补上文字通道给不了的那部分。
+> 实测（2026-10-24，MiniMax-M3.1-Flash-Preview，探针 `scripts/probe_minimax_vision.py`）：
+> 工具结果里带图是**可以**的 —— 模型能读出图里的字（`role=tool` 的多模态 content）。
+> 旧的截图会被新的顶掉（替换内容而不是删消息 —— 删 ToolMessage 会留下孤儿
+> tool_call，端点 400），所以历史里最多留一张图。
 
 **两个时序细节**：
 
@@ -279,7 +297,8 @@ Orchestrator 看执行反馈后说"确实做完了"是另一回事。这道复�
 > ⚠️ 这一段描述的是**改造前**的 Cortex（`decisions` / `need_screenshot` 那套）。
 > 现在的 `CortexOutput` 只有 `next_subgoal` / `subgoal_completed` /
 > `completion_reason` 三个字段（见 `agents/cortex/types.py`），
-> 而 `need_screenshot` 已随图片通道在 2026-10-23 一起下线。
+> 而 `need_screenshot` 已随图片通道在 2026-10-23 一起下线 —— 现在要图走的是
+> **工具** `take_screenshot`（模型自己调），不是 schema 里的一个字段。
 
 **未知子目标 ID 会被过滤**（`cortex.py:129-140`），不让模型幻觉的 ID 污染计划。
 
@@ -407,7 +426,6 @@ Cortex 的 10 个消息块按**首次变化时刻**从早到晚排（`cortex.py:
 [7] HumanMessage    Executor feedback                ← 每轮变
 [8] HumanMessage    Device state                     ← 每轮变
 [9] HumanMessage    屏幕元素表 / OCR                 ← 每轮变
-[10] HumanMessage   截图（on_demand 时才有）          ← 每轮变
 ```
 
 **规则**：越靠前越稳定，被前缀缓存覆盖的公共前缀就越长。
