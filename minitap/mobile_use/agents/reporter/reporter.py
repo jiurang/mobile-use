@@ -56,6 +56,7 @@ from minitap.mobile_use.services.llm import (
     with_fallback,
 )
 from minitap.mobile_use.services.telemetry import telemetry
+from minitap.mobile_use.utils.message_content import content_to_text
 from minitap.mobile_use.utils.failed_targets import FailedTarget, describe, make_key
 from minitap.mobile_use.utils.logger import get_logger
 
@@ -397,6 +398,11 @@ def render_execution_log(messages: list[AnyMessage] | None) -> str:
 
     动作行和结果行分开：Reporter 要从**结果**里挑证据（§6.2.2），
     所以工具结果必须原样出现，不能被压掉。
+
+    ⚠️ **多模态结果只取文字。** 截图工具的结果是 ``[文字块, 图片块]``，
+    ``str(content)`` 会把几十 KB 的 base64 变成一行 Python 字面量 —— 汇报正文
+    里多出一坨噪声，reporter 的 token 也白烧。图对汇报没用（汇报要的是
+    「看到了什么」的事实），所以这里只留文字（见 ``utils/message_content.py``）。
     """
     lines: list[str] = []
     step = 0
@@ -410,11 +416,11 @@ def render_execution_log(messages: list[AnyMessage] | None) -> str:
                     args = format_args(call.get("args") or {})
                     lines.append(f"[{step}] {name}({args})")
             else:
-                content = str(message.content or "").strip()
+                content = content_to_text(message.content).strip()
                 if content:
                     lines.append(f"[note] {content}")
         elif isinstance(message, ToolMessage):
-            content = str(message.content or "").strip()
+            content = content_to_text(message.content).strip()
             marker = "error" if getattr(message, "status", "") == "error" else "result"
             lines.append(f"    <- {marker}: {content}")
     return "\n".join(lines)
@@ -475,7 +481,7 @@ def last_tool_result(messages: list[AnyMessage] | None) -> str | None:
     """最近一条非空的工具结果（代码挑的证据兜底）。"""
     for message in reversed(messages or []):
         if isinstance(message, ToolMessage):
-            content = str(message.content or "").strip()
+            content = content_to_text(message.content).strip()
             if content:
                 return content[:MAX_EVIDENCE_LEN]
     return None

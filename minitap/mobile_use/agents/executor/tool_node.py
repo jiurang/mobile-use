@@ -39,6 +39,7 @@ from pydantic import BaseModel
 
 from minitap.mobile_use.services.telemetry import telemetry
 from minitap.mobile_use.utils.logger import get_logger
+from minitap.mobile_use.utils.message_content import content_to_text
 
 logger = get_logger(__name__)
 
@@ -184,11 +185,13 @@ class ExecutorToolNode(ToolNode):
                 error_msg = ""
                 try:
                     if isinstance(output, ToolMessage):
-                        error_msg = output.content
+                        # 多模态内容（截图那种）要压成文本再记日志 ——
+                        # 直接 str() 一个块列表会打出几十 KB 的 base64 字面量。
+                        error_msg = content_to_text(output.content)
                     elif isinstance(output, Command):
-                        error_msg = self._get_tool_message(output).content
+                        error_msg = content_to_text(self._get_tool_message(output).content)
                     elif tool_message := self._find_tool_message(output):
-                        error_msg = tool_message.content
+                        error_msg = content_to_text(tool_message.content)
                 except Exception as e:
                     # 提取错误详情失败**不能**盖掉真正的错误：这里只是拿不到
                     # 更详细的说明，工具本身已经失败了（`failed` 为真）。
