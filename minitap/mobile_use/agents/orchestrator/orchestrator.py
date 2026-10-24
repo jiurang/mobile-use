@@ -43,7 +43,10 @@ from minitap.mobile_use.prompt_language import load_prompt_template
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
-from minitap.mobile_use.utils.thoughts_compaction import render_thoughts_history
+from minitap.mobile_use.utils.thoughts_compaction import (
+    PLANNER_AUDIENCE,
+    render_thoughts_history,
+)
 
 logger = get_logger(__name__)
 
@@ -99,9 +102,14 @@ class OrchestratorNode:
             # 的第二大消费方（实测 122 轮任务里占 thoughts 总成本的 13%）。
             # 压缩规则与 cortex 完全一致（同一个 render_thoughts_history），
             # 所以两个 agent 看到的摘要形态相同，不会出现口径分裂。
+            #
+            # 受众也跟 cortex 一致（PLANNER_AUDIENCE）：丢掉 executor 的成功
+            # 流水，只留失败类 —— orchestrator 同样是规划者，不看屏、不点元素。
+            # 两个 agent 的口径必须一致，否则「同一个事实两边看到的不一样」。
             agent_thoughts=render_thoughts_history(
                 state.agents_thoughts,
                 enabled=self.ctx.perception.thoughts_compaction,
+                audience=PLANNER_AUDIENCE,
             ),
         )
         messages = [

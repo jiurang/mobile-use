@@ -12,7 +12,9 @@ from __future__ import annotations
 import pytest
 
 from minitap.mobile_use.utils.thoughts_compaction import (
+    PLANNER_AUDIENCE,
     compress_thought,
+    is_planner_relevant,
     render_thoughts_history,
     split_role,
     split_sentences,
@@ -192,3 +194,103 @@ class TestPrefixStability:
             prev = render_thoughts_history(thoughts[:k], enabled=False)
             cur = render_thoughts_history(thoughts[: k + 1], enabled=False)
             assert cur.startswith(prev)
+
+
+class TestPlannerAudience:
+    """规划者受众（cortex / orchestrator）：砍掉 executor 的成功流水。
+
+    依据（实测 2026-10-24，exec 861）：executor 的行占 cortex thoughts 的
+    **60.9%**，而 `cortex.md` 的「What you are given」里没有 thoughts 这一项
+    —— 结果走 Executor report、失败走两个失败块 ⇒ 对规划者是冗余的。
+
+    对应方案：doc/cortex-prompt-cache-optimization-20261024.md
+    """
+
+    def test_drops_successful_executor_line(self):
+        out = render_thoughts_history([EXECUTOR_OK, CORTEX_ZH], audience=PLANNER_AUDIENCE)
+        assert EXECUTOR_OK not in out
+        assert "[cortex]" in out
+
+    def test_keeps_failed_executor_line(self):
+        """失败行是「这条路走不通」的**唯一具体原因** —— 失败块里只有名字。"""
+        out = render_thoughts_history([EXECUTOR_FAIL], audience=PLANNER_AUDIENCE)
+        assert EXECUTOR_FAIL in out
+
+    def test_keeps_orchestrator_milestone(self):
+        out = render_thoughts_history([ORCHESTRATOR], audience=PLANNER_AUDIENCE)
+        assert "[orchestrator]" in out
+
+    def test_keeps_line_without_role_prefix(self):
+        """没有角色前缀的行：不知道是什么，别砍。"""
+        raw = "some line without a role prefix"
+        out = render_thoughts_history([raw], audience=PLANNER_AUDIENCE)
+        assert raw in out
+
+    def test_full_audience_unchanged(self):
+        """默认 `audience="full"` 一个字都没变 —— 归档口径靠它。"""
+        thoughts = [EXECUTOR_OK, EXECUTOR_FAIL, CORTEX_ZH, ORCHESTRATOR, EXECUTOR_OK]
+        out = render_thoughts_history(thoughts)
+        assert len([ln for ln in out.split("\n") if ln.startswith("[executor]")]) == 3
+        assert len([ln for ln in out.split("\n") if ln.startswith("[orchestrator]")]) == 1
+
+    def test_filter_applies_even_when_compression_disabled(self):
+        """受众与压缩是**两个维度**：关掉压缩不该把流水放回来。"""
+        out = render_thoughts_history(
+            [EXECUTOR_OK, CORTEX_ZH], enabled=False, audience=PLANNER_AUDIENCE
+        )
+        assert EXECUTOR_OK not in out
+
+    def test_prefix_property_holds(self):
+        """planner 版同样必须前缀稳定 —— 破了这条，整个优化白做。"""
+        thoughts = [
+            CORTEX_ZH,
+            EXECUTOR_OK,
+            CORTEX_EN,
+            ORCHESTRATOR,
+            EXECUTOR_FAIL,
+            "[cortex] Decisions reason: 第三条推理。第二句。",
+            "[executor] Successfully waited for 60000 milliseconds.",
+        ]
+        for k in range(1, len(thoughts)):
+            prev = render_thoughts_history(thoughts[:k], audience=PLANNER_AUDIENCE)
+            cur = render_thoughts_history(thoughts[: k + 1], audience=PLANNER_AUDIENCE)
+            assert cur.startswith(prev), f"第 {k + 1} 轮击穿了前缀"
+
+    def test_earlier_entries_never_change(self):
+        """第 k 条的去留，在之后任何一轮里都不许变（逐条独立）。"""
+        thoughts = [
+            CORTEX_ZH,
+            EXECUTOR_OK,
+            ORCHESTRATOR,
+            EXECUTOR_FAIL,
+            "[executor] Successfully waited for 60000 milliseconds.",
+        ]
+        snapshots = [
+            render_thoughts_history(thoughts[:k], audience=PLANNER_AUDIENCE)
+            for k in range(1, len(thoughts) + 1)
+        ]
+        for later_k in range(1, len(thoughts)):
+            for earlier_k in range(1, later_k + 1):
+                assert snapshots[later_k].startswith(snapshots[earlier_k - 1])
+
+    def test_position_independence(self):
+        """同一条 thought，无论处在什么位置，去留必须一致。"""
+        assert not is_planner_relevant(EXECUTOR_OK)
+        assert is_planner_relevant(EXECUTOR_FAIL)
+        assert is_planner_relevant(CORTEX_ZH)
+        assert is_planner_relevant(ORCHESTRATOR)
+        # 单独渲染 vs 嵌在别的条目中间 —— 结果必须一样
+        single = render_thoughts_history([EXECUTOR_FAIL], audience=PLANNER_AUDIENCE)
+        embedded = render_thoughts_history(
+            [EXECUTOR_OK, EXECUTOR_FAIL, ORCHESTRATOR], audience=PLANNER_AUDIENCE
+        )
+        assert single in embedded
+
+    def test_planner_output_is_shorter(self):
+        """方案的核心收益：同样的输入，规划者看到的少得多。"""
+        thoughts = [EXECUTOR_OK] * 10 + [CORTEX_ZH] * 3
+        full = render_thoughts_history(thoughts)
+        planner = render_thoughts_history(thoughts, audience=PLANNER_AUDIENCE)
+        assert "[executor]" not in planner
+        assert "[cortex]" in planner
+        assert len(planner) < len(full) * 0.6

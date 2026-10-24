@@ -80,7 +80,10 @@ from minitap.mobile_use.tools.index import (
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.failed_targets import describe, render_failures, render_failure_facts
 from minitap.mobile_use.utils.logger import get_logger
-from minitap.mobile_use.utils.thoughts_compaction import render_thoughts_history
+from minitap.mobile_use.utils.thoughts_compaction import (
+    PLANNER_AUDIENCE,
+    render_thoughts_history,
+)
 
 logger = get_logger(__name__)
 
@@ -454,13 +457,25 @@ class CortexNode:
         thoughts = state.agents_thoughts
         if thoughts:
             compaction_enabled = self.ctx.perception.thoughts_compaction
-            body = render_thoughts_history(thoughts, enabled=compaction_enabled)
+            body = render_thoughts_history(
+                thoughts,
+                enabled=compaction_enabled,
+                audience=PLANNER_AUDIENCE,
+            )
             header = "Agent thoughts history (newest last):"
+            # 头注说清**这里有什么** —— 模型不该以为看到的是全量流水。
+            # （文案硬编码在这里，与本文件既有的做法一致。）
+            notes: list[str] = []
             if compaction_enabled:
-                header += (
-                    "\n(Older cortex reasoning is compressed to its first and last "
-                    "sentence. Executor results and subgoal milestones are verbatim.)"
+                notes.append(
+                    "Older cortex reasoning is compressed to its first and last sentence."
                 )
+            notes.append(
+                "Planning-level entries only: my own reasoning, orchestrator milestones, "
+                "and Executor failures. Successful Executor steps are omitted — the "
+                "Executor report tells you what actually happened."
+            )
+            header += "\n(" + " ".join(notes) + ")"
             messages.append(HumanMessage(content=header + "\n" + body))
 
         # 计划日志（子目标的 ID + 描述）排在 thoughts **之后**。
