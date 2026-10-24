@@ -23,7 +23,7 @@ def _mock_settings(mock_settings, **overrides):
         setattr(mock_settings, key, value)
 
 
-@patch("minitap.mobile_use.services.llm.DeepSeekChatOpenAI")
+@patch("minitap.mobile_use.services.llm.ThinkingAwareChatOpenAI")
 @patch("minitap.mobile_use.services.llm.settings")
 def test_get_deepseek_llm_defaults_to_domestic_endpoint(mock_settings, mock_chat_openai):
     from minitap.mobile_use.services.llm import get_deepseek_llm
@@ -41,7 +41,7 @@ def test_get_deepseek_llm_defaults_to_domestic_endpoint(mock_settings, mock_chat
     assert kwargs.get("extra_body") is None
 
 
-@patch("minitap.mobile_use.services.llm.DeepSeekChatOpenAI")
+@patch("minitap.mobile_use.services.llm.ThinkingAwareChatOpenAI")
 @patch("minitap.mobile_use.services.llm.settings")
 def test_get_deepseek_llm_honours_base_url_override(mock_settings, mock_chat_openai):
     from minitap.mobile_use.services.llm import get_deepseek_llm
@@ -56,7 +56,7 @@ def test_get_deepseek_llm_honours_base_url_override(mock_settings, mock_chat_ope
     ("thinking", "expected"),
     [(None, "<absent>"), (True, "enabled"), (False, "disabled")],
 )
-@patch("minitap.mobile_use.services.llm.DeepSeekChatOpenAI")
+@patch("minitap.mobile_use.services.llm.ThinkingAwareChatOpenAI")
 @patch("minitap.mobile_use.services.llm.settings")
 def test_get_deepseek_llm_thinking_toggle(mock_settings, mock_chat_openai, thinking, expected):
     from minitap.mobile_use.services.llm import get_deepseek_llm
@@ -71,7 +71,7 @@ def test_get_deepseek_llm_thinking_toggle(mock_settings, mock_chat_openai, think
         assert extra_body == {"thinking": {"type": expected}}
 
 
-@patch("minitap.mobile_use.services.llm.DeepSeekChatOpenAI")
+@patch("minitap.mobile_use.services.llm.ThinkingAwareChatOpenAI")
 @patch("minitap.mobile_use.services.llm.settings")
 def test_get_deepseek_llm_does_not_clamp_temperature(mock_settings, mock_chat_openai):
     """Unlike MiniMax, DeepSeek accepts the whole (0, 2] range — pass it through."""

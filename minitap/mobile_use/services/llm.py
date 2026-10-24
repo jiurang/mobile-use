@@ -14,7 +14,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, SecretStr, ValidationError
+from pydantic import BaseModel, PrivateAttr, SecretStr, ValidationError
 
 from minitap.mobile_use.config import (
     AgentNode,
@@ -975,48 +975,85 @@ def get_minimax_llm(
     )
 
 
-class DeepSeekChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
-    """ChatOpenAI variant for DeepSeek's OpenAI-compatible endpoint.
+#: 一次请求的思考状态。
+#:
+#: ``unknown`` = 请求体里**没有**思考这个字段 ⇒ 走服务端自己的默认。
+#:
+#: 用 Literal 而不是裸 ``str``：这三个值是穷举的，返回别的就是 bug
+#: （规则：types-literal-for-fixed-sets）。
+ThinkingState = Literal["on", "off", "unknown"]
+
+
+class ThinkingAwareChatOpenAI(ToolSchemaSurgeryMixin, ChatOpenAI):
+    """「思考开着就不能强制 tool_choice」的那类 OpenAI 兼容端点。
 
     **Do not simplify this back to plain ``ChatOpenAI`` without a live call.**
-    Two DeepSeek-specific constraints, both reproduced against the real API:
+    这类端点（DeepSeek / MiMo）有两个共同约束：
 
-    1. langchain-openai 1.1.x's ``ChatOpenAI.with_structured_output`` defaults to
-       ``method="json_schema"`` (the ``BaseChatOpenAI`` default is still
-       ``"function_calling"``), sending ``response_format=json_schema``. DeepSeek
-       answers ``400 invalid_request_error: This response_format type is
-       unavailable now`` — it only implements ``response_format=json_object``.
-       Every agent node 400s before emitting a token.
-    2. Binding the schema as a tool *with a forced specific ``tool_choice``* also
-       fails while thinking mode is on (DeepSeek's default):
-       ``400 invalid_request_error: Thinking mode does not support this
-       tool_choice``. So we force it only when thinking is **off**; otherwise the
-       tool is offered and the model calls it on its own (verified: it does).
+    1. ``response_format=json_schema`` 不被支持（DeepSeek 明确回 400
+       「This response_format type is unavailable now」）。⇒ 结构化输出必须
+       走「schema 当工具绑」那条路，不能用 langchain 的默认实现。
+    2. **思考模式下强制指定 tool_choice 会被服务端拒绝**：DeepSeek 回 400
+       「Thinking mode does not support this tool_choice」；MiMo 官方文档说
+       开启 thinking 后「tool_calls 输出不完整」，建议调工具时关掉思考。
+       ⇒ 「能不能强制」不是一条写死的常量，而是**这次请求思考开着没有**。
 
     实测（2026-10-24，真实 API）::
 
         deepseek-flash    + 强制 tool_choice                    → HTTP 400（思考模式）
         deepseek-flash    + 强制 tool_choice + thinking.disabled → HTTP 200
-        deepseek-reasoner + 强制 tool_choice                     → HTTP 400（思考模式）
-        deepseek-chat     + 强制 tool_choice                     → HTTP 200（它默认不思考）
-
-    ⇒ 「能不能强制」不是一条写死的常量，而是**这次请求思考开着没有**。
-    渠道把思考关掉时必须真的关掉 —— 以前渠道下发的 thinking 被无视了
-    （只读 .env 的 ``DEEPSEEK_THINKING``），于是每个 agent 节点都在 400。
+        deepseek-reasoner + 强制 tool_choice                    → HTTP 400（思考模式）
+        deepseek-chat     + 强制 tool_choice                    → HTTP 200（它默认不思考）
     """
 
-    def _thinking_disabled(self) -> bool:
-        """这次请求有没有显式关掉思考。"""
+    #: 该端点「**没指定**思考开关时」要不要按「开着思考」处理。
+    #:
+    #: 由渠道目录的 ``thinking_default_on`` 填进来（见
+    #: :func:`build_openai_protocol_client`）。它决定「渠道没说思考开关」时
+    #: 能不能强制 tool_choice：
+    #:
+    #: * DeepSeek 的推理模型**默认开**思考 ⇒ 没说 → 不强制（强制会 400）。
+    #: * MiMo 的思考是**按需开启**的 ⇒ 没说 → 可以强制（思考没开，强制是安全的）。
+    #:
+    #: 用 PrivateAttr 而不是普通字段：普通字段会被 pydantic 当成模型参数，
+    #: 而这个值**只**是客户端的本地知识，不该进请求体。
+    _thinking_default_on: bool = PrivateAttr(default=True)
+
+    def _thinking_state(self) -> ThinkingState:
+        """这次请求的思考状态：``on`` / ``off`` / ``unknown``。"""
         body = self.extra_body or {}
         thinking = body.get("thinking")
         if isinstance(thinking, dict):
-            return thinking.get("type") == "disabled"
-        return False
+            kind = thinking.get("type")
+            if kind == "enabled":
+                return "on"
+            if kind == "disabled":
+                return "off"
+        return "unknown"
 
     def should_force_tool_choice(self) -> bool:
-        # 思考开着（或者没发 thinking 字段 → 走 DeepSeek 的默认，而它的推理
-        # 模型默认是**开**思考）时强制 tool_choice 会被服务端拒。
-        return self._thinking_disabled()
+        # 思考**开着**就不能强制（服务端会拒 / 输出不完整）；关着或明确关掉 → 强制，
+        # 模型更听话，结构化输出也可靠。
+        state = self._thinking_state()
+        if state == "on":
+            return False
+        if state == "off":
+            return True
+        # 没指定 → 按该端点自己的默认。
+        return not self._thinking_default_on
+
+    def set_thinking_default(self, default_on: bool) -> None:
+        """渠道告诉客户端「没说思考开关时，默认算开着还是关着」。
+
+        为什么走**方法**而不是工厂里 ``isinstance(client, ThinkingAwareChatOpenAI)``：
+        测试里这个类会被 ``@patch("...llm.ThinkingAwareChatOpenAI")`` 换成一个 Mock
+        ⇒ ``isinstance`` 的第二个参数变成 Mock 对象，直接抛
+        ``TypeError: isinstance() arg 2 must be a type``。
+
+        ⇒ 改成「问客户端自己要不要这个值」：是这类客户端就调它的方法，
+        不是就压根没有这个方法（``getattr`` 拿不到）。
+        """
+        self._thinking_default_on = default_on
 
     def with_structured_output(self, schema=None, **kwargs):  # type: ignore[override]
         if not isinstance(schema, type) or not issubclass(schema, BaseModel):
@@ -1297,16 +1334,21 @@ def get_llm(
 #: :data:`~minitap.mobile_use.services.channels.ClientKind`）。
 #:
 #: 这里存的是**类名**而不是类本身：类要在模块加载完才都定义好，而且用类名
-#: 延迟解析，测试里 ``patch("...llm.DeepSeekChatOpenAI")`` 那种替换仍然生效
+#: 延迟解析，测试里 ``patch("...llm.ThinkingAwareChatOpenAI")`` 那种替换仍然生效
 #: （直接持有类引用的话，替换发生在引用之后，就拦不住了）。
 #:
 #: 同一个协议，不同供应商对「结构化输出」「工具 schema」「思考链」的处理不一样，
 #: 所以客户端分几个变体 —— 但**协议只有一份实现**（下面的
 #: :func:`build_openai_protocol_client`）。
+#:
+#: ⚠️ **一条渠道 = 一个类**：DeepSeek 和 MiMo 都是「思考感知」那一类，行为
+#: 完全相同，差别只在渠道目录的 ``thinking_default_on`` 里 ⇒ 它们共用
+#: ``thinking_aware``，不再单开一个行为相同的 ``deepseek`` 变体
+#: （两个名字指同一份行为 = 两个所有者，迟早走样）。
 _OPENAI_CLIENT_KINDS: dict[str, str] = {
     "surgery": "SurgeryChatOpenAI",
     "minimax": "MiniMaxChatOpenAI",
-    "deepseek": "DeepSeekChatOpenAI",
+    "thinking_aware": "ThinkingAwareChatOpenAI",
     "siliconflow": "SiliconFlowChatOpenAI",
     "llamacpp": "LlamaCppChatOpenAI",
 }
@@ -1338,9 +1380,9 @@ def _resolve_thinking(
         if not body:
             return None, {}
         return requested, {"thinking": body}
-    if style == "deepseek":
+    if style == "thinking_type":
         if requested is None:
-            # 没指定 → 不发这个字段，走 DeepSeek 的默认（推理模型默认**开**思考）。
+            # 没指定 → 不发这个字段，走该端点自己的默认。
             return None, {}
         return requested, {"thinking": {"type": "enabled" if requested else "disabled"}}
     if style == "chat_template_kwargs":
@@ -1463,7 +1505,17 @@ def build_openai_protocol_client(
         if headers:
             kwargs["default_headers"] = headers
 
-    return client_cls(**kwargs)
+    client = client_cls(**kwargs)
+    # 该端点「没说思考开关时」默认算开着还是关着 —— 客户端据此决定能不能
+    # 强制 tool_choice（见 ThinkingAwareChatOpenAI.should_force_tool_choice）。
+    #
+    # ⚠️ 问**客户端自己**要不要这个值，而不是 ``isinstance`` 判断：测试里
+    # ``ThinkingAwareChatOpenAI`` 会被 patch 成 Mock，isinstance 的第二个参数
+    # 就变成了 Mock 对象 ⇒ 直接抛 TypeError。
+    apply_thinking_default = getattr(client, "set_thinking_default", None)
+    if callable(apply_thinking_default):
+        apply_thinking_default(spec.thinking_default_on)
+    return client
 
 
 @overload

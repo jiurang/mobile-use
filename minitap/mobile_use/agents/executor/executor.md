@@ -70,7 +70,8 @@ For OCR rows, verify any confidence below 0.6 first.
 | `done_reason` | Evidence that the goal is reached; required when `done` |
 
 **Your history contains "the result of the previous step"** (objective facts the
-framework recorded: which app is in the foreground, what is on screen). Read it
+framework recorded: which app is in the foreground, what is on screen, which
+target failed). Read it
 first: if it is not what you want, take a different action; if it is, do not
 mistake a right step for a reached goal.
 
@@ -106,7 +107,7 @@ Your goal:
 {%- endmacro -%}
 
 {%- macro failures_message(failures) -%}
-Targets that already failed in this task — do not reuse them, pick a different element: {% for fact in failures %}{{ fact.desc }} ({{ fact.reason[:80] }}){% if not loop.last %}; {% endif %}{% endfor %}
+Targets that already failed in this task: {% for fact in failures %}{{ fact.desc }} ({{ fact.reason[:80] }}){% if not loop.last %}; {% endif %}{% endfor %}
 {%- endmacro -%}
 
 {%- macro device_state_message(device_date=None, focused_app_info=None, screen_off=False, no_perception=False) -%}

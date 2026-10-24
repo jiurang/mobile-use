@@ -84,7 +84,7 @@ from langchain_core.messages import (
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template
 from minitap.mobile_use.tools.index import format_tools_list
-from minitap.mobile_use.utils.failed_targets import describe
+from minitap.mobile_use.utils.failed_targets import describe_target
 from minitap.mobile_use.utils.ocr_view import render_ocr_rows
 from minitap.mobile_use.utils.screen_elements import ScreenElement, render_screen_rows
 from minitap.mobile_use.utils.thoughts_compaction import split_sentences
@@ -150,12 +150,20 @@ def render_goal_message(goal: str, *, language: PromptLanguage) -> str:
 def render_failures_message(failures: list[dict], *, language: PromptLanguage) -> str:
     """跨子目标的失败事实块；空账本返回空串（调用方据此不发消息）。
 
-    每条事实的描述由 ``describe`` 拼 —— 它和 Cortex / 熔断器看到的是同一份
-    身份格式，搬进模板的只有**措辞**。
+    每条事实的描述由 ``describe_target`` 拼 —— **不带 index**：索引每轮
+    重编号，写进给模型看的失败事实里会让它去点一个完全无关的元素
+    （见 ``utils/failed_targets.py`` 的 ``describe_target``）。
+
+    ⚠️ Reporter 那一路仍然用带 index 的 ``describe``（事实层、逐字搬运），
+    两边**故意不一样**：给 Executor 的是「模型的避坑清单」，给 Reporter 的是
+    「事实原文」。
     """
     facts = [
         {
-            "desc": describe(item.get("index"), item.get("resource_id"), item.get("label")),
+            "desc": describe_target(
+                label=item.get("label"),
+                resource_id=item.get("resource_id"),
+            ),
             "reason": item.get("reason") or "",
         }
         for item in (failures or [])

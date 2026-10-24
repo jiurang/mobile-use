@@ -57,9 +57,12 @@ LLMProtocol = Literal["openai", "anthropic", "google", "vertexai", "azure"]
 #: 「要不要思考」这个开关在请求体里的形状。
 #:
 #: 每个供应商的形状都不一样（llama.cpp 是 ``chat_template_kwargs.enable_thinking``，
-#: minimax 是 ``thinking.type``，DeepSeek 是 ``thinking.type``），那是**供应商的知识**，
+#: minimax 是 ``thinking.type`` 但取值是 ``adaptive``），那是**供应商的知识**，
 #: 所以写在这里的数据里，而不是让渠道自己去猜请求体。
-ThinkingStyle = Literal["none", "minimax", "deepseek", "chat_template_kwargs"]
+#:
+#: ``thinking_type`` = ``{"thinking": {"type": "enabled" | "disabled"}}``
+#: （DeepSeek / MiMo 用这个形状；minimax 因为只认 ``adaptive`` 而单列）。
+ThinkingStyle = Literal["none", "minimax", "thinking_type", "chat_template_kwargs"]
 
 #: 结构化输出走哪条路。
 #:
@@ -88,11 +91,13 @@ EffortStyle = Literal["none", "output_config"]
 #:   折 anyOf），实测省 10.7% token。
 #: * ``minimax`` —— MiniMax 专用：``with_structured_output`` 走「schema 当工具绑」
 #:   那条路（MiniMax 不认 ``response_format``）。
-#: * ``deepseek`` —— DeepSeek 专用：同上，且「思考模式下不能强制 tool_choice」。
+#: * ``thinking_aware`` —— **思考开着就不能强制 tool_choice** 的那类端点
+#:   （DeepSeek / MiMo）。结构化输出走「schema 当工具绑」，且每次请求按
+#:   「这次思考开着没有」决定要不要强制 tool_choice。
 #: * ``siliconflow`` —— 硅基流动：结构化输出先走原生 json_schema，失败再降级到工具。
 #: * ``llamacpp`` —— 本地 llama-server：json_schema 是 GBNF 语法级约束，
 #:   且思考链默认开着会把 token 预算烧光。
-ClientKind = Literal["surgery", "minimax", "deepseek", "siliconflow", "llamacpp"]
+ClientKind = Literal["surgery", "minimax", "thinking_aware", "siliconflow", "llamacpp"]
 
 
 @dataclass(frozen=True)
@@ -163,11 +168,10 @@ class ChannelSpec:
     #: minitap 用它把一次运行里的多次调用串起来（``?sessionId=…``）。
     session_query_param: str | None = None
 
-    #: 能不能强制指定 tool_choice。
-    #:
-    #: 默认 True（多数端点随便强制）。DeepSeek 在思考模式下不行 —— 所以它
-    #: 只能在「思考已关」时强制。
-    force_tool_choice: bool = True
+    #: 「能不能强制指定 tool_choice」**不是一个独立开关** —— 它由两样东西共同决定：
+    #: ``client_kind``（客户端会不会问服务端这个问题）和 ``thinking_default_on``
+    #: （没说思考开关时按开着还是关着算）。所以这里**没有**这个字段：留一个
+    #: 没人读的字段，目录和代码就会对不上 —— 而那正是这套改造要消灭的东西。
 
     #: 思考深度参数的位置。
     effort_style: EffortStyle = "none"
@@ -190,6 +194,13 @@ class ChannelSpec:
     #: 「自定义（OpenAI 兼容）」和 Azure 是：它们没有默认地址，不给端点的话
     #: 请求会打到别处 —— 「密钥是我自己那家的，怎么报的是 OpenAI 的错」。
     requires_base_url: bool = False
+
+    #: 给**使用者**看的提示（界面会显示在这条渠道下面）。
+    #:
+    #: 只放「用户必须知道、否则会踩坑」的事：服务条款限制、密钥过期规则、
+    #: 套餐额度怎么算。**不放**运行时旋钮（那些是 mobile-use 自己发请求时用的
+    #: 知识，导出去只会多一份会过期的副本）。
+    note: str | None = None
 
     #: 要不要开 ``stream_usage``。
     #:
@@ -248,11 +259,12 @@ CHANNELS: dict[str, ChannelSpec] = {
         # （"Thinking mode does not support this tool_choice"）——
         # 2026-10-24 实测：deepseek-flash + 强制 tool_choice = 400，
         # 加上 {"thinking": {"type": "disabled"}} 后 = 200。
-        thinking_style="deepseek",
+        thinking_style="thinking_type",
         thinking_default_on=True,
         thinking_env="DEEPSEEK_THINKING",
-        force_tool_choice=False,
-        client_kind="deepseek",
+        # 和 MiMo 同属「思考感知」那一类（见 ClientKind）—— DeepSeek 只是
+        # 「默认开思考」，MiMo 是「按需开启」，差别在 thinking_default_on 里。
+        client_kind="thinking_aware",
         request_timeout=180.0,
         max_retries=1,
     ),
@@ -376,7 +388,6 @@ CHANNELS: dict[str, ChannelSpec] = {
         thinking_env="LLAMACPP_ENABLE_THINKING",
         # 关思考是**必须**的：开着时 content 恒为空，结构化输出必然失败。
         thinking_fallback=False,
-        force_tool_choice=False,
         # json_schema 是语法级约束（GBNF），实测 5/5 解析成功。
         structured_output="json_schema",
         max_tokens_policy="llamacpp",
@@ -384,6 +395,42 @@ CHANNELS: dict[str, ChannelSpec] = {
         stream_usage=True,
         request_timeout=180.0,
         max_retries=1,
+    ),
+    # ---- 小米 MiMo ------------------------------------------------------------
+    "mimo-token-plan": ChannelSpec(
+        id="mimo-token-plan",
+        label="MiMo Token Plan（小米订阅套餐）",
+        protocol="openai",
+        # 中国集群。其它集群：新加坡 token-plan-sgp / 欧洲 token-plan-ams
+        # （同一后缀，见小米官方文档「Token Plan → 快速接入」）。
+        base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        # Token Plan 个人版覆盖的 6 款模型里能对话的是这两款（另有 asr / tts
+        # 三款是语音，不在本目录里）。官方文档（2026-10-24）：
+        # 「各套餐均支持 mimo-v2.6-pro、mimo-v2.6-flash …」
+        # ⚠️ mimo-v2.5-pro / mimo-v2.5 已于 2026-10-21 下线，不列。
+        models=("mimo-v2.6-pro", "mimo-v2.6-flash"),
+        # 小米文档里这个变量就叫 MIMO_API_KEY。⚠️ 它和「按量付费」那把
+        # （sk- 开头、https://api.xiaomimimo.com/v1）**相互独立、不可混用** ——
+        # 两边要加两个渠道时，环境变量必须分开。
+        api_key_env="MIMO_API_KEY",
+        base_url_env=None,
+        # 思考开关的形状是 ``thinking.type``（小米给 Kilo Code 的示例里就是
+        # ``"thinking": {"type": "enabled"}``）。
+        thinking_style="thinking_type",
+        # 小米文档：「模型在调 tool 的时候开启 thinking 导致的不稳定，输出不完整；
+        # 建议调用 tool calls 的时候关闭 thinking」⇒ 思考开着就别强制 tool_choice。
+        thinking_default_on=False,
+        client_kind="thinking_aware",
+        request_timeout=180.0,
+        max_retries=1,
+        stream_usage=True,
+        note=(
+            "Token Plan 的 key（tp- 开头）按小米条款**只允许用于编程工具**"
+            "（Claude Code / OpenCode / OpenClaw 等），「禁止以 API 调用的形式用于"
+            "自动化脚本、自定义应用程序后端等明显非 Coding 场景」—— 平台可暂停服务、"
+            "封禁 key。把它用在设备自动化这类后端任务上有违约风险。"
+            "要长期跑自动化，请用按量付费那把 sk- key（地址 https://api.xiaomimimo.com/v1）。"
+        ),
     ),
     # ---- Anthropic 协议 -----------------------------------------------------
     "anthropic": ChannelSpec(
@@ -532,6 +579,7 @@ def catalog_payload() -> list[dict[str, Any]]:
             "requiresApiKey": spec.requires_api_key,
             "supportsEndpoint": spec.supports_endpoint,
             "thinkingDefaultOn": spec.thinking_default_on,
+            "note": spec.note,
         }
         for spec in CHANNELS.values()
     ]

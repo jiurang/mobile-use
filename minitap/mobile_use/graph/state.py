@@ -9,7 +9,7 @@ from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.ocr.types import OcrText
-from minitap.mobile_use.utils.failed_targets import FailedTarget
+from minitap.mobile_use.utils.failed_targets import ActionFailureFact, FailedTarget
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.recorder import record_interaction
 from minitap.mobile_use.utils.screen_elements import ScreenElement
@@ -176,6 +176,26 @@ class State(BaseModel):
         list[dict],
         "Append-only ledger of failed targets across subgoals (facts, never rewritten)",
     ] = []
+
+    # 「上一步的动作失败了，目标是谁」—— **瞬时**事实，供 Contextor 并进
+    # 「[上一步的结果]」那一行。
+    #
+    # 为什么要有这个字段：失败事实要**记在产生它的那一步旁边**（模型读历史时
+    # 不用跨块对账），而那一行是 Contextor 写的。工具层拿不到 Contextor 的行、
+    # Contextor 也拿不到工具层手里的目标身份 ⇒ 只能靠一个瞬时字段把
+    # 「上一步失败了、目标是谁」递过去。
+    #
+    # 生命周期：工具层**每次动作都写**（失败写事实、成功写 None）；
+    # Contextor 读完之后写回 None ⇒ 不会被下一轮重复并进。
+    #
+    # ⚠️ **只记事实，不记结论**：内容只有「哪个目标失败了」。
+    # 「换不换目标」是相对于目标的判断，框架不知道目标（见
+    # `agents/contextor/contextor.py` 的 `render_action_result`）。
+    last_action_failure: Annotated[
+        ActionFailureFact | None,
+        "Failure fact of the last action (None when it succeeded); consumed by the Contextor",
+        take_last,
+    ] = None
 
     # Reporter 的产出（Reporter → Cortex / Orchestrator）。
     executor_report: Annotated[

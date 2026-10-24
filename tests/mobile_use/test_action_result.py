@@ -163,3 +163,126 @@ class TestRenderActionResult:
         from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 
         assert EXECUTOR_MESSAGES_KEY == "executor_messages"
+
+
+class TestFailureFactInResultLine:
+    """「上一步失败了，目标是谁」并进 `[上一步的结果]` 那一行（2026-10-24）。
+
+    为什么并进这一行而不是单开一条：失败事实要**记在产生它的那一步旁边**
+    （模型读历史时不用跨块对账），而这一行是 Contextor 写的。
+    """
+
+    def _line(self, failure: dict[str, str]) -> str:
+        line = render_action_result(
+            previous_elements=[_el(1, "视频标题A")],
+            previous_app="com.video",
+            current_elements=[_el(1, "视频标题B")],
+            current_app="com.video",
+            failure=failure,
+        )
+        assert line is not None
+        return line
+
+    def test_failure_fact_is_merged_into_the_line(self):
+        line = self._line({"label": "点赞", "resource_id": "com.app:id/like_button"})
+        assert "这一步失败了" in line
+        assert '"点赞"' in line
+        assert "like_button" in line
+        # 和其它事实**同一行**（不是一个独立块）
+        assert "前台应用没变" in line
+        assert "屏幕上新出现了" in line
+
+    def test_no_bare_index_in_the_line(self):
+        """🔴 索引每轮重编号 —— 带上它会让模型去点一个完全无关的元素。"""
+        line = self._line({"label": "点赞", "resource_id": "com.app:id/like_button"})
+        assert "[48]" not in line
+        assert "48" not in line
+
+    def test_falls_back_to_id_tail_when_there_is_no_label(self):
+        """纯图标按钮没有文字 ⇒ 退回 resource-id 尾段。"""
+        line = self._line({"label": "", "resource_id": "com.app:id/download_btn"})
+        assert "download_btn" in line
+        assert "这一步失败了" in line
+
+    def test_no_conclusion_wording(self):
+        """🔴 **只记录结果，不下结论**。
+
+        「不要再用这个目标」是**相对于目标**的判断 —— 框架不知道目标。
+        失败不总是「元素没了」（也可能是「输入框聚焦失败」），所以连
+        「已经不在屏幕上了」都不能断言。
+        """
+        line = self._line({"label": "点赞", "resource_id": "com.app:id/like_button"})
+        for forbidden in (
+            "不要再用",
+            "换个",
+            "不在屏幕",
+            "无效",
+            "没用",
+            "重复",
+            "进展",
+        ):
+            assert forbidden not in line, f"框架不许下这种结论：{line}"
+
+    def test_no_failure_means_no_failure_clause(self):
+        """动作成功 ⇒ 这一行里不该出现失败。"""
+        line = render_action_result(
+            previous_elements=[_el(1, "视频标题A")],
+            previous_app="com.video",
+            current_elements=[_el(1, "视频标题B")],
+            current_app="com.video",
+            failure=None,
+        )
+        assert line is not None
+        assert "这一步失败" not in line
+
+    def test_empty_identity_does_not_render_a_placeholder(self):
+        """🔴 **占位符不许进模型的提示词**。
+
+        模型只给索引时（label 和 resource_id 都是空的）—— 而索引每轮重编号，
+        不能写进去。这时只说「失败了」，不拿 ``(unknown target)`` 顶替：
+        那个词长得像个元素名，模型会去找一个叫 "unknown target" 的东西。
+        """
+        line = self._line({"label": "", "resource_id": ""})
+        assert "这一步失败了" in line
+        assert "(unknown target)" not in line
+
+
+class TestLastActionFailureFact:
+    """工具层递过来的那个瞬时事实：原始数据，不带 index。"""
+
+    def test_carries_label_and_resource_id_but_no_index(self):
+        from minitap.mobile_use.tools.types import Target
+        from minitap.mobile_use.tools.utils import last_action_failure_fact
+
+        fact = last_action_failure_fact(
+            Target(index=48, resource_id="com.app:id/like_button", text="点赞")
+        )
+        assert fact["label"] == "点赞"
+        assert fact["resource_id"] == "com.app:id/like_button"
+        assert "48" not in str(fact)
+
+    def test_label_is_stripped_and_may_be_empty(self):
+        from minitap.mobile_use.tools.types import Target
+        from minitap.mobile_use.tools.utils import last_action_failure_fact
+
+        fact = last_action_failure_fact(Target(index=1, text="  搜索  "))
+        assert fact["label"] == "搜索"
+        assert fact["resource_id"] == ""
+
+        empty = last_action_failure_fact(Target(index=1))
+        assert empty["label"] == ""
+        assert empty["resource_id"] == ""
+
+    def test_fact_has_exactly_the_two_identity_fields(self):
+        """事实就两个字段：身份。不带 index，也不带结论。
+
+        形状固定 ⇒ 用 TypedDict（``ActionFailureFact``）而不是 ``dict[str, str]``，
+        键名拼错时类型检查器会拦（规则：types-typeddict-over-dict-any）。
+        """
+        from minitap.mobile_use.tools.types import Target
+        from minitap.mobile_use.tools.utils import last_action_failure_fact
+
+        fact = last_action_failure_fact(
+            Target(index=48, resource_id="com.app:id/like_button", text="点赞")
+        )
+        assert set(fact) == {"label", "resource_id"}

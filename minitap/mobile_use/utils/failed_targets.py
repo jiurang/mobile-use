@@ -30,6 +30,8 @@
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 from pydantic import BaseModel
 
 # 连续失败到第几次就不再执行、改为要求模型换目标
@@ -48,6 +50,21 @@ class FailedTarget(BaseModel):
     label: str = ""
     count: int = 1
     reason: str = ""
+
+
+class ActionFailureFact(TypedDict):
+    """「上一步失败的那个目标」的身份 —— **只有身份，没有结论**。
+
+    为什么是 TypedDict 而不是 ``dict[str, str]``：形状固定就这两个字段，
+    而 ``dict[str, str]`` 让每个读取点都只能靠 ``.get("label")`` 猜键名 ——
+    键名拼错了类型检查器也不吭声（规则：types-typeddict-over-dict-any）。
+
+    ⚠️ **不带 index**：索引每轮重编号（同一个 48 在下一屏可能是完全不同的
+    元素），把它写进给模型看的事实里会让模型去点一个完全无关的元素。
+    """
+
+    label: str
+    resource_id: str
 
 
 def make_key(
@@ -69,15 +86,47 @@ def make_key(
     return "|".join(parts) or "unknown"
 
 
-def describe(index: int | None, resource_id: str | None, label: str | None) -> str:
-    """给人（和模型）看的一行描述。"""
+def _identity_bits(label: str | None, resource_id: str | None) -> list[str]:
+    """目标身份的片段：可读文字 + resource-id 尾段。
+
+    这是「身份长什么样」的**唯一定义** —— `describe`（带 index）和
+    `describe_target`（不带 index）共用它，两边不会各写一份然后走样
+    （规则：simplify-extract-after-duplication）。
+    """
     bits: list[str] = []
-    if index is not None:
-        bits.append(f"[{index}]")
     if label:
         bits.append(f'"{label}"')
     if resource_id:
         bits.append(resource_id.split("/")[-1])
+    return bits
+
+
+def describe(index: int | None, resource_id: str | None, label: str | None) -> str:
+    """给人（和模型）看的一行描述。"""
+    bits = [f"[{index}]"] if index is not None else []
+    bits.extend(_identity_bits(label, resource_id))
+    return " ".join(bits) if bits else "(unknown target)"
+
+
+def describe_target(*, label: str | None, resource_id: str | None) -> str:
+    """目标的身份 —— **不带 index**。
+
+    为什么另写一个不带 index 的：索引**每轮重编号**（同一个 48 在下一屏可能是
+    完全不同的元素）。把 index 写进给模型看的事实里，模型会以为「下一屏的
+    48 号还是刚才那个」—— 于是去点一个完全无关的元素。
+
+    ⇒ **给模型看的失败事实只带身份**（可读文字 + resource-id 尾段），
+    不带 index。带 index 的 `describe()` 只留给**给人看**的地方
+    （Reporter 的失败清单、遥测）。
+
+    ⚠️ 这条只改**给模型的措辞**；`FailedTarget.index` 字段照旧保留 ——
+    账本的键（`make_key`）还要用它区分「换了目标」和「重复犯错」。
+
+    ⚠️ **keyword-only**：`describe()` 的参数顺序是 (index, resource_id, label)，
+    而这里只有 (label, resource_id) —— 两处顺序相反，位置参数传错不会报错，
+    只会渲染出另一个元素的身份（规则：api-keyword-only-params）。
+    """
+    bits = _identity_bits(label, resource_id)
     return " ".join(bits) if bits else "(unknown target)"
 
 

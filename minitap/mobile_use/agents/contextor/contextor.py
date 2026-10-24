@@ -50,6 +50,7 @@ from minitap.mobile_use.services.ocr import get_ocr_engine
 from minitap.mobile_use.services.ocr.types import OcrEngine, OcrText
 from minitap.mobile_use.utils.app_launch_utils import launch_app_with_retries
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
+from minitap.mobile_use.utils.failed_targets import ActionFailureFact, describe_target
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.screen_elements import (
     ScreenElement,
@@ -104,16 +105,21 @@ def render_action_result(
     previous_app: str | None,
     current_elements: list[ScreenElement] | None,
     current_app: str | None,
+    failure: ActionFailureFact | None = None,
     max_new_texts: int = 6,
 ) -> str | None:
     """一句话描述「上一步那个动作之后，屏变成了什么样」。
 
-    两样事实，**都是屏上的客观状态**：
-      1. **前台 app** 变了没有、变成了谁；
-      2. **屏幕内容** 变了没有、**新出现了哪些文字**。
+    三样事实：
+      1. **动作本身失败了**（哪个目标失败）—— 只有动作真的失败时才有；
+      2. **前台 app** 变了没有、变成了谁；
+      3. **屏幕内容** 变了没有、**新出现了哪些文字**。
 
     ⚠️ 不说「有没有进展」—— 那是相对目标的判断，框架不知道目标。
     ⚠️ 不说「你重复了几次」—— 「重复」本身不是「无效」（刷短视频就是重复的）。
+    ⚠️ 不说「不要再用这个目标」—— 同理，**那是结论不是事实**。
+       ⇒ 整个框架都不下这种结论：Executor 那边的**跨子目标失败索引**
+       也一并改成了中性措辞（「这些目标在本任务里已经失败过：」）。
 
     Returns:
         渲染好的一行；没有可比的前一屏时返回 None（第一次抓屏没有「上一步」）。
@@ -123,6 +129,19 @@ def render_action_result(
         return None
 
     parts: list[str] = []
+
+    # ---- 0. 上一步的动作失败了（事实，不是结论）----
+    if failure:
+        label = failure["label"]
+        resource_id = failure["resource_id"]
+        if label or resource_id:
+            target = describe_target(label=label, resource_id=resource_id)
+            parts.append(f"{target} 这一步失败了")
+        else:
+            # 目标只有索引 —— 而索引每轮重编号，不能写进去 ⇒ 只说「失败了」。
+            # ⚠️ 不拿 "(unknown target)" 当占位符塞给模型：那个词长得像个
+            # 元素名，模型会去找一个叫 "unknown target" 的东西。
+            parts.append("这一步失败了（没能认出是哪个目标）")
 
     # ---- 1. 前台 app ----
     if previous_app != current_app:
@@ -378,13 +397,19 @@ class ContextorNode:
         #
         # ⚠️ 只有**已经执行过动作**才有「上一步」—— 第一次抓屏时不写。
         # ⚠️ 这是 executor 的局部历史，跟着子目标走（Cortex 下发新目标时清空）。
-        # ⚠️ getattr 兜底：测试替身（精简过的 state）可能没这两个字段 ——
+        # ⚠️ getattr 兜底：测试替身（精简过的 state）可能没这几个字段 ——
         # 和上面 perception 那段同一个理由：不猜，直接当成「没有上一屏」。
+        #
+        # `last_action_failure` 是**工具层递过来的瞬时事实**（「上一步失败了、
+        # 目标是谁」）。并进这一行 ⇒ 失败事实落在**产生它的那一步旁边**，
+        # 模型读历史时不用跨块对账。
+        last_failure = getattr(state, "last_action_failure", None)
         result_line = render_action_result(
             previous_elements=getattr(state, "latest_screen_elements", None),
             previous_app=getattr(state, "focused_app_info", None),
             current_elements=screen_elements,
             current_app=current_app_package,
+            failure=last_failure,
         )
 
         update: dict[str, Any] = {
@@ -403,6 +428,8 @@ class ContextorNode:
             "device_date": device_date,
             "screen_state": screen_state,
             "agents_thoughts": [agent_outcome],
+            # 瞬时事实**用完即清**：不让上一条失败被下一轮重复并进。
+            "last_action_failure": None,
         }
         if result_line:
             update[EXECUTOR_MESSAGES_KEY] = [HumanMessage(content=result_line)]

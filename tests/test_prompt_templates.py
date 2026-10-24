@@ -186,8 +186,8 @@ def test_executor_prompt_keeps_element_targeting_contract():
     # 两种寻址方式：元素表用 `index`，只有 OCR 块时用 `ocr_index`
     assert "`index`" in text
     assert "`ocr_index`" in text
-    # 失败的目标不重复上报（措辞在失败事实块里 —— 与 zh 版对齐后不再单列规则节）
-    assert "do not reuse them, pick a different element" in text
+    # 失败的事实摆出来（措辞 2026-10-24 改成中性说法：只陈述事实、不下结论）
+    assert "Targets that already failed in this task" in text
 
 
 def test_executor_prompt_keeps_text_tools_table():
@@ -311,22 +311,33 @@ def test_executor_prompt_tells_the_model_to_use_the_previous_result():
     assert "上一步的结果" in zh
     # 两边都要说清「结果不对就换动作，别重复验」
     assert "take a different action" in en
-    assert "换个动作" in zh
+    assert "换动作" in zh
     # 也要说清「结果对了就 done，别再验一遍」
-    assert "instead of verifying it again" in en
-    assert "别再验一遍" in zh
+    #
+    # ⚠️ 2026-10-24：断言的是**契约**，不是某一句措辞 ——
+    # 模板压缩过措辞（"instead of verifying it again" → "must not verify again"，
+    # 「别再验一遍」→「禁止再验一遍」），但「不许再验一遍」这件事必须还在。
+    assert "must not verify again" in en
+    assert "禁止再验一遍" in zh
 
 
 def test_executor_prompt_keeps_the_anchor_rules():
-    """一次一个动作 / 不重复失败目标 / 目标不变、做不到就如实说。
+    """一次一个动作 / 失败事实摆出来 / 目标不变、做不到就如实说。
 
     2026-10-24：与 zh 版对齐后，规则不再单列一节：
-    - 「不重复失败目标」由失败事实块承载（每轮追加，模型照着换目标）；
+    - 「失败事实摆出来」由失败事实块承载；
     - 「目标不变、做不到就如实说」写在开头的目标陈述里。
+
+    ⚠️ 2026-10-24（再一次）：失败事实块的措辞改成**中性说法**了 ——
+    「不要再用它们，换一个不同的元素」被删掉，只留事实。
+    理由：框架只陈述事实、不下结论（`contextor.render_action_result` 的纪律），
+    「换不换目标」是相对于目标的判断，框架不知道目标 ⇒ 留给模型。
+    ⇒ 断言的是「事实清单还在」，不是某句指令。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "One action at a time" in text
-    assert "do not reuse them, pick a different element" in text
+    assert "Targets that already failed in this task" in text
+    assert "do not reuse them" not in text
     assert "reach it, or report truthfully that you could not" in text
 
 
@@ -349,12 +360,14 @@ def test_executor_prompt_demands_done_when_the_goal_is_reached():
     flat_en = " ".join(en.split())
     flat_zh = " ".join(zh.split())
 
-    assert "you MUST set `done: true`" in flat_en
-    assert "你必须把 `done` 置为 true" in flat_zh
+    assert "you **MUST** set `done: true`" in flat_en
+    assert "`done: true`" in flat_zh
 
     # 死循环的另一只手：已经验过的条件不要再验。
-    assert "Re-checking a condition you have already checked is not progress" in flat_en
-    assert "把已经验过的条件再验一遍不是进展" in flat_zh
+    #
+    # ⚠️ 2026-10-24：措辞被压缩过（断言的是**契约**，不是原句）。
+    assert "re-checking produces no progress" in flat_en
+    assert "重复验证不产生进展" in flat_zh
 
 
 def test_reporter_template_is_static():

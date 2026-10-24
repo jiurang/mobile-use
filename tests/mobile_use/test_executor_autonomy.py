@@ -41,7 +41,10 @@ from minitap.mobile_use.agents.executor.executor import (  # noqa: E402
     ExecutorNode,
     _rejection_code,
 )
-from minitap.mobile_use.agents.executor.prompt import build_executor_messages  # noqa: E402
+from minitap.mobile_use.agents.executor.prompt import (  # noqa: E402
+    build_executor_messages,
+    render_failures_message,
+)
 from minitap.mobile_use.agents.executor.types import (  # noqa: E402
     ExecutorOutput,
     ExecutorReport,
@@ -166,8 +169,20 @@ def test_t12b_goal_comes_before_history():
     assert goal_idx < history_idx
 
 
-def test_t12c_failed_targets_block_comes_before_history():
-    """失败清单在历史之前（它只增不减 → 前缀稳定，可缓存）。"""
+def test_t12c_failed_targets_block_comes_after_history():
+    """失败清单在历史**之后**。
+
+    ⚠️ 这条测试 2026-10-21 改过方向：它原来断言「失败清单在历史之前」，
+    那是**改布局之前**的旧契约。10-21 真机实测（Redmi Turbo 4）发现
+    设备状态和失败清单卡在历史前面时，executor 的缓存命中率只有 **15.8%**
+    （六个 agent 里最差，而它调用量最大）⇒ 两者都挪到了历史之后。
+
+    （executor-autonomy-plan.md §4.1.1；复现：`scripts/audit_executor_cache_layout.py`）
+
+    ⚠️ 失败清单是**只增不减**的（跨子目标累积），所以它躺在**缓存尾巴**里，
+    每轮全价重发 —— 这是已知代价。把它并进局部历史的改动（失败事实绑定到
+    动作）见 `doc/executor-prompt-v3-mockup.md`。
+    """
     msgs = build_executor_messages(
         ctx=_ctx(),
         goal="g",
@@ -186,7 +201,50 @@ def test_t12c_failed_targets_block_comes_before_history():
     )
     fail_idx = next(i for i, m in enumerate(msgs) if "already failed" in str(m.content))
     history_idx = next(i for i, m in enumerate(msgs) if isinstance(m, ToolMessage))
-    assert fail_idx < history_idx
+    assert fail_idx > history_idx
+
+
+def test_failed_targets_block_has_no_bare_index():
+    """🔴 失败清单里不许带 index（索引每轮重编号，会让模型点错元素）。"""
+    text = render_failures_message(
+        [
+            {
+                "key": "index=48|id=com.app:id/like_button|text=点赞",
+                "index": 48,
+                "resource_id": "com.app:id/like_button",
+                "label": "点赞",
+                "reason": "gone",
+            }
+        ],
+        language=_ctx().prompt_language,
+    )
+    assert "[48]" not in text
+    assert "48" not in text
+    assert "点赞" in text
+    assert "like_button" in text
+
+
+def test_failed_targets_block_has_no_directive():
+    """🔴 **只记录事实，不下结论**：框架不许命令模型换目标。
+
+    「换不换目标」是相对于目标的判断，框架不知道目标 —— 判断留给模型。
+    （索引里原来那句「不要再用它们，换一个不同的元素」是 2026-10-20 exec 340
+    真机实测加的；2026-10-24 按同一条纪律改成了中性说法。）
+    """
+    text = render_failures_message(
+        [
+            {
+                "key": "k",
+                "index": 48,
+                "resource_id": "com.app:id/like_button",
+                "label": "点赞",
+                "reason": "gone",
+            }
+        ],
+        language=_ctx().prompt_language,
+    )
+    for forbidden in ("不要再用", "pick a different element", "换一个不同的元素"):
+        assert forbidden not in text
 
 
 # ---------------------------------------------------------------------------

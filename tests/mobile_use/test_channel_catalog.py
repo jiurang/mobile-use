@@ -122,9 +122,96 @@ def test_every_channel_declares_a_usable_protocol_and_client():
             assert spec.requires_base_url, cid
 
 
+def test_every_channel_client_kind_is_a_declared_kind():
+    """🔴 渠道用的 ``client_kind`` 必须在 ``ClientKind`` 里**声明过**。
+
+    踩过的坑（2026-10-24）：目录里 deepseek 渠道写着 ``client_kind="deepseek"``，
+    而 ``ClientKind`` 字面量里已经没有这个值了。**运行时照样跑** ——
+    ``ChannelSpec`` 是普通 dataclass，不做校验 —— 于是错得很安静；
+    但类型检查直接报错（``Literal['deepseek'] is not assignable to ClientKind``），
+    而且「目录和代码对不上」正是这套改造要消灭的东西。
+
+    ⇒ 这条守住「目录里写的每个值都有人声明过、每个声明过的值都有人用」。
+    """
+    from typing import get_args
+
+    from minitap.mobile_use.services.channels import ClientKind
+    from minitap.mobile_use.services.llm import _OPENAI_CLIENT_KINDS
+
+    declared = set(get_args(ClientKind))
+    for cid, spec in CHANNELS.items():
+        if spec.protocol == "openai":
+            assert spec.client_kind in declared, f"{cid}: {spec.client_kind!r} 不在 ClientKind 里"
+    # 声明过的每个 kind 都得真的能落到一个客户端类上。
+    assert declared == set(_OPENAI_CLIENT_KINDS)
+
+
+def test_thinking_aware_channels_share_one_client_class():
+    """DeepSeek 和 MiMo 行为**完全相同** ⇒ 共用一个客户端类。
+
+    差别只在渠道目录的 ``thinking_default_on`` 里（DeepSeek 默认开思考，
+    MiMo 按需开启）。两个名字指同一份行为 = 两个所有者，迟早走样。
+    """
+    from minitap.mobile_use.services.llm import _OPENAI_CLIENT_KINDS
+
+    assert CHANNELS["deepseek"].client_kind == "thinking_aware"
+    assert CHANNELS["mimo-token-plan"].client_kind == "thinking_aware"
+    assert _OPENAI_CLIENT_KINDS["thinking_aware"] == "ThinkingAwareChatOpenAI"
+    assert "deepseek" not in _OPENAI_CLIENT_KINDS
+
+
 def test_unknown_channel_is_reported_with_the_known_list():
     with pytest.raises(ValueError, match="unknown LLM channel"):
         require_channel("deepseesk")
+
+
+def test_no_channel_carries_a_dead_field():
+    """目录里不能有「代码从不读」的字段。
+
+    留一个没人读的字段，目录就会和代码对不上 —— 而对不上的症状是
+    「目录里写着 False，代码却按 True 跑」，最难查。
+    """
+    from dataclasses import fields
+
+    from minitap.mobile_use.services.llm import (
+        _OPENAI_CLIENT_KINDS,
+        build_openai_protocol_client,
+    )
+
+    read_fields = {
+        "id",
+        "label",
+        "protocol",
+        "base_url",
+        "models",
+        "api_key_env",
+        "base_url_env",
+        "requires_api_key",
+        "supports_endpoint",
+        "thinking_style",
+        "thinking_default_on",
+        "thinking_env",
+        "thinking_fallback",
+        "session_query_param",
+        "effort_style",
+        "temperature_range",
+        "structured_output",
+        "max_tokens_policy",
+        "client_kind",
+        "requires_base_url",
+        "note",
+        "request_timeout",
+        "max_retries",
+        "retry_rules",
+        "stream_usage",
+    }
+    declared = {f.name for f in fields(CHANNELS["openai"])}
+    assert declared == read_fields, f"目录里多/少了字段：{declared ^ read_fields}"
+    # client_kind 必须真的能被客户端工厂用上。
+    for cid, spec in CHANNELS.items():
+        if spec.protocol == "openai":
+            assert spec.client_kind in _OPENAI_CLIENT_KINDS, cid
+    assert build_openai_protocol_client is not None
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +219,7 @@ def test_unknown_channel_is_reported_with_the_known_list():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cid", ["deepseek", "minimax", "siliconflow", "openai"])
+@pytest.mark.parametrize("cid", ["deepseek", "minimax", "siliconflow", "openai", "mimo-token-plan"])
 def test_channel_without_url_uses_the_catalog_default(cid):
     """渠道没给端点 → 用目录里的默认端点，且**不读** .env。
 
@@ -291,8 +378,64 @@ def test_executor_path_forces_tool_choice_once_thinking_is_off():
     assert "tool_choice" in runner._bound.kwargs
 
 
+def test_mimo_forces_tool_choice_when_thinking_is_not_requested():
+    """MiMo 的思考是**按需开启**的 ⇒ 没说思考开关时可以强制 tool_choice。
+
+    与 DeepSeek 相反（它的推理模型默认开思考）。这条规则由渠道目录里的
+    ``thinking_default_on`` 决定，不是写死在客户端里的。
+    """
+    cfg = llm_config_for_single_model("mimo-token-plan", "mimo-v2.6-pro", api_key="k")
+    runner = get_structured_llm_for(cfg)
+    assert "tool_choice" in runner._bound.kwargs
+
+
+def test_mimo_does_not_force_tool_choice_when_thinking_is_on():
+    """MiMo 官方文档：开 thinking 后 tool_calls 输出不完整 ⇒ 不强制。"""
+    cfg = llm_config_for_single_model(
+        "mimo-token-plan", "mimo-v2.6-pro", api_key="k", thinking=True
+    )
+    runner = get_structured_llm_for(cfg)
+    assert "tool_choice" not in runner._bound.kwargs
+
+
 # ---------------------------------------------------------------------------
-# 5. 导给 manager 侧的载荷
+# 5. 小米 MiMo Token Plan 这条渠道本身
+# ---------------------------------------------------------------------------
+
+
+def test_mimo_token_plan_endpoint_and_models():
+    """端点和模型名必须是**官方文档里的那一份**。
+
+    2026-10-24 官方文档（mimo.mi.com/docs/zh-CN/tokenplan/Token Plan/quick-access）：
+      OpenAI 兼容协议 中国集群 https://token-plan-cn.xiaomimimo.com/v1
+      Anthropic 兼容协议 中国集群 https://token-plan-cn.xiaomimimo.com/anthropic
+      个人版 key 格式 tp-xxxxx
+    模型：mimo-v2.6-pro / mimo-v2.6-flash（另有 asr / tts 三款是语音）
+    ⚠️ mimo-v2.5-pro、mimo-v2.5 已于 2026-10-21 下线，不能再列。
+    """
+    spec = get_channel("mimo-token-plan")
+    assert spec is not None
+    assert spec.protocol == "openai"
+    assert spec.base_url == "https://token-plan-cn.xiaomimimo.com/v1"
+    assert "mimo-v2.6-pro" in spec.models
+    assert "mimo-v2.6-flash" in spec.models
+    assert not any(m.startswith("mimo-v2.5") for m in spec.models), "v2.5 系列已下线"
+    assert spec.requires_api_key is True
+
+
+def test_mimo_token_plan_carries_the_terms_of_service_warning():
+    """Token Plan 的 key 按小米条款只允许用于编程工具。
+
+    这条限制必须跟着渠道走到界面上：用在自动化脚本/应用后端属于违反条款，
+    平台可以暂停服务、封禁 key —— 而用户看到 401/封号时根本想不到是条款。
+    """
+    spec = get_channel("mimo-token-plan")
+    assert spec.note is not None
+    assert "编程工具" in spec.note
+
+
+# ---------------------------------------------------------------------------
+# 6. 导给 manager 侧的载荷
 # ---------------------------------------------------------------------------
 
 
@@ -309,7 +452,7 @@ def test_catalog_payload_is_json_serialisable_and_has_what_the_form_needs():
         assert isinstance(item["requiresApiKey"], bool)
         assert isinstance(item["supportsEndpoint"], bool)
         # 「默认地址」是这层改造的核心收益：添加渠道时不用手抄 URL。
-        if item["id"] in {"deepseek", "minimax", "siliconflow", "openai"}:
+        if item["id"] in {"deepseek", "minimax", "siliconflow", "openai", "mimo-token-plan"}:
             assert item["baseUrl"], item["id"]
 
 
@@ -318,7 +461,7 @@ def test_catalog_model_lists_are_not_empty_for_the_channels_we_ship():
 
     所以它们的推荐列表不能空。
     """
-    for cid in ("deepseek", "minimax", "siliconflow", "openai", "anthropic"):
+    for cid in ("deepseek", "minimax", "siliconflow", "openai", "anthropic", "mimo-token-plan"):
         assert get_channel(cid).models, cid
 
 

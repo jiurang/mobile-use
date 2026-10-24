@@ -617,17 +617,24 @@ def test_executor_prompt_does_not_promise_empty_actions_is_valid():
 
     提示词说合法、运行时判非法 ⇒ 模型在「我卡住了」和「我得给个动作」之间
     横跳。现在提示词必须和运行时一致。
+
+    ⚠️ 2026-10-24：措辞被压缩过（Output 表格里现在是「required unless `done`,
+    empty when done」）。断言的是**契约**（空 actions 只在 done 时合法），
+    不是原来那一句。
     """
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
     assert "An empty `actions` is a valid answer" not in text
-    assert 'treated as "you did not decide"' in text
+    assert "required unless `done`, empty when done" in text
 
 
 def test_executor_prompt_says_executor_output_is_the_only_tool():
-    """触发根因的那张「工具表」里全是真实工具名 —— 必须明说它们不能直接调。"""
+    """触发根因的那张「工具表」里全是真实工具名 —— 必须明说它们不能直接调。
+
+    ⚠️ 2026-10-24：措辞被压缩过（现在是「Answer only by calling `ExecutorOutput`」）。
+    """
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
-    assert "the only tool you can call" in text
+    assert "only by calling `ExecutorOutput`" in text

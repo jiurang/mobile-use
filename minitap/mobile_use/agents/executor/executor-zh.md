@@ -70,7 +70,7 @@ OCR 行的置信度低于 0.6 时先核实。
 | `done` | 目标达成时置 true |
 | `done_reason` | 目标达成的证据，`done` 时必填 |
 
-**你的历史里有「上一步的结果」**（框架记的客观事实：前台 app、屏幕上出现了什么）。
+**你的历史里有「上一步的结果」**（框架记的客观事实：前台 app、屏幕上出现了什么、哪个目标失败了）。
 先读它：和你要的不符，就换动作；相符也别把「这一步对了」当成达成。
 
 达成 = 目标里**每个**条件都已在你看的内容里成立。此时**必须** `done: true`，证据写进
@@ -100,7 +100,7 @@ OCR 行的置信度低于 0.6 时先核实。
 {%- endmacro -%}
 
 {%- macro failures_message(failures) -%}
-这些目标在本任务里已经失败过 —— 不要再用它们，换一个不同的元素：{% for fact in failures %}{{ fact.desc }} ({{ fact.reason[:80] }}){% if not loop.last %}; {% endif %}{% endfor %}
+这些目标在本任务里已经失败过：{% for fact in failures %}{{ fact.desc }} ({{ fact.reason[:80] }}){% if not loop.last %}; {% endif %}{% endfor %}
 {%- endmacro -%}
 
 {%- macro device_state_message(device_date=None, focused_app_info=None, screen_off=False, no_perception=False) -%}

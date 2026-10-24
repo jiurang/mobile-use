@@ -18,6 +18,7 @@ from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.tools.utils import (
     check_failure_breaker,
     focus_element_if_needed,
+    last_action_failure_fact,
     move_cursor_to_end_if_bounds,
     record_target_failure,
     record_target_failure_fact,
@@ -98,6 +99,10 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                         "executor_failures": record_target_failure_fact(
                             state=state, target=target, reason=breaker[:200]
                         ),
+                        # 熔断 = **这一步没有执行**，不是「试了但失败」。
+                        # 工具回执里已经把熔断理由说全了，这里不并进
+                        # `[上一步的结果]`（只清空，免得带出上一条的陈旧事实）。
+                        "last_action_failure": None,
                     },
                     agent="executor",
                 ),
@@ -126,6 +131,9 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                         "executor_failures": record_target_failure_fact(
                             state=state, target=target, reason=error_message[:200]
                         ),
+                        # 「上一步失败了，目标是谁」—— 供 Contextor 并进
+                        # `[上一步的结果]` 那一行。
+                        "last_action_failure": last_action_failure_fact(target),
                     },
                     agent="executor",
                 ),
@@ -198,6 +206,11 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
                             target=target,
                             reason=str(result.error or "input failed")[:200],
                         )
+                    ),
+                    # 「上一步失败了，目标是谁」—— 供 Contextor 并进
+                    # `[上一步的结果]` 那一行（成功时清空）。
+                    "last_action_failure": (
+                        None if result.ok else last_action_failure_fact(target)
                     ),
                 },
                 agent="executor",

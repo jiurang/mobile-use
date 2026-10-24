@@ -13,6 +13,7 @@ from minitap.mobile_use.controllers.unified_controller import UnifiedMobileContr
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.utils.failed_targets import (
+    ActionFailureFact,
     FailedTarget,
     append_failure,
     breaker_reason,
@@ -125,6 +126,35 @@ def record_target_failure_fact(
         label=target.text,
         reason=reason,
     )
+
+
+def last_action_failure_fact(target: Target) -> ActionFailureFact:
+    """「上一步失败的目标」—— 给 Contextor 并进 `[上一步的结果]` 那一行。
+
+    **只给身份，不给结论、也不重复原因**：
+
+    * **不给结论**：「不要再用这个目标」是相对于目标的判断，框架不知道目标
+      （见 `agents/contextor/contextor.py` 的 `render_action_result`）。
+    * **不重复原因**：失败原因就在上一行的工具回执里，而错误结果**逐字保留**
+      （不截断）—— 再抄一遍就是每轮白烧 token。
+
+    ⇒ 这里补的是工具回执**没有**的东西：**元素的可读名字**
+    （回执里只有 resource-id）。
+
+    ⚠️ **不带 index**：索引每轮重编号，带上会让模型点错元素
+    （见 `utils/failed_targets.py` 的 `describe_target`）。
+
+    ⇒ 返回**原始数据**（不预先拼字符串）：拼字符串是渲染层的事
+    （`describe_target` 统一负责「文字 + id 尾段」的格式）。
+
+    ⚠️ 两个字段**都可能为空**（模型只给了索引时就是这样）：空身份**不是**
+    「没有失败」，而是「失败了但认不出是哪个目标」—— 由渲染层决定怎么措辞，
+    这里不替它下判断。
+    """
+    return {
+        "label": (target.text or "").strip(),
+        "resource_id": target.resource_id or "",
+    }
 
 
 def find_element_by_text(

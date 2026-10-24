@@ -16,6 +16,7 @@ from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.tools.utils import (
     check_failure_breaker,
+    last_action_failure_fact,
     record_target_failure,
     record_target_failure_fact,
     resolve_target,
@@ -245,6 +246,11 @@ def get_long_press_on_tool(ctx: MobileUseContext) -> BaseTool:
                     EXECUTOR_MESSAGES_KEY: [tool_message],
                     "failed_targets": failed_targets,
                     "executor_failures": executor_failures,
+                    # 「上一步失败了，目标是谁」—— 供 Contextor 并进
+                    # `[上一步的结果]` 那一行（成功时清空）。
+                    "last_action_failure": (
+                        None if not has_failed else last_action_failure_fact(target)
+                    ),
                 },
                 agent="executor",
             ),
