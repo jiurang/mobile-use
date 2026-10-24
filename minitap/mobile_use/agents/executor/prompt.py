@@ -52,8 +52,13 @@ Manager 建 agent 时决定（``sdk/agent.py:722``）。本模块只负责**按�
   判据仍然是 ``has_element_table``，提示侧和工具侧共用同一个。
 * OCR —— 关掉 ⇒ **不给 legacy OCR 块**（不是「关了还偷偷给」）。
 
-⚠️ **屏幕截图不再进模型**（图片通道已于 2026-10-23 下线）：
-prompt 里没有多模态内容块，也没有「要不要图」这个选择。
+⚠️ **屏幕截图不是「每轮通道」，是「按需工具」**（2026-10-24 改）：
+2026-10-23 下线的那条图片通道（``perception.screenshot`` = always/on_demand/off
++ ``need_screenshot`` 字段）**仍然没有**：prompt 里没有「每轮附图」这件事，
+输出 schema 里也没有「我要看图」这个字段。
+现在图是**工具结果**（``take_screenshot``）带进来的 —— 模型自己喊一声要看，
+框架把当屏那张图挂在工具结果上，模型下一轮就能看见。
+⇒ 图只出现在**局部历史**里（工具结果那条消息），不在每轮的屏幕描述块里。
 
 **工具结果截断（L5）**
 --------------------
@@ -85,6 +90,11 @@ from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template
 from minitap.mobile_use.tools.index import format_tools_list
 from minitap.mobile_use.utils.failed_targets import describe_target
+from minitap.mobile_use.utils.message_content import (
+    content_to_text,
+    has_image_block,
+    with_text_replaced,
+)
 from minitap.mobile_use.utils.ocr_view import render_ocr_rows
 from minitap.mobile_use.utils.screen_elements import ScreenElement, render_screen_rows
 from minitap.mobile_use.utils.thoughts_compaction import split_sentences
@@ -395,6 +405,14 @@ def truncate_local_history(messages: list[AnyMessage]) -> list[AnyMessage]:
 
     **载荷类工具豁免**（见 `_PAYLOAD_TOOLS`）：它们的结果不是冗长回显，
     截断等于丢信息。
+
+    ⚠️ **多模态内容（带图的消息）不能整体 `str()`。**
+    截图工具的结果是 ``[文字块, 图片块]`` —— 以前那句
+    ``str(message.content or "")`` 会把整个列表变成 Python 字面量（几十 KB 的
+    base64 混在里面），然后截断再把它**写回成一个字符串** ⇒ 图没了，模型收到
+    的是一坨 base64 噪声。
+    ⇒ 现在：文字部分照常截断，**图片块原样保留**（见
+    ``utils/message_content.with_text_replaced``）。
     """
     names = _tool_name_by_call_id(messages)
     result: list[AnyMessage] = []
@@ -402,7 +420,8 @@ def truncate_local_history(messages: list[AnyMessage]) -> list[AnyMessage]:
         if not isinstance(message, ToolMessage):
             result.append(message)
             continue
-        content = str(message.content or "")
+        raw_content = message.content
+        content = content_to_text(raw_content)
         # 报错逐字保留：模型要靠它知道为什么失败。
         if getattr(message, "status", "") == "error":
             result.append(message)
@@ -413,12 +432,14 @@ def truncate_local_history(messages: list[AnyMessage]) -> list[AnyMessage]:
             result.append(message)
             continue
         truncated = truncate_tool_result(content)
-        if truncated == content:
+        if truncated == content and not has_image_block(raw_content):
             result.append(message)
             continue
         # model_copy 而不是新建：additional_kwargs / artifact / response_metadata
         # 都原样带过去，不在这里丢信息。
-        result.append(message.model_copy(update={"content": truncated}))
+        result.append(
+            message.model_copy(update={"content": with_text_replaced(raw_content, truncated)})
+        )
     return result
 
 
@@ -549,7 +570,9 @@ def build_executor_messages(
     executor 的缓存命中率只有 15.8%（六个 agent 里最差，而它调用量最大）。
 
     🔴 **图片通道下线（2026-10-23）：没有第 [7] 块截图了。**
-    屏幕截图不再进模型 —— prompt 里没有多模态内容块，元素表就是最后一块。
+    屏幕截图不再作为「每轮的屏幕描述」进模型 —— 元素表就是最后一块。
+    图现在只从**工具结果**进来（``take_screenshot`` 挂的那条消息），
+    而工具结果属于**局部历史**，天然排在元素表之前。
 
     Args:
         ctx: 运行上下文。

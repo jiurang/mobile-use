@@ -32,6 +32,7 @@ Available tools: {{ executor_tools_list }}
 | `wait_for_delay` | `time_in_ms` | Wait that many milliseconds |
 | `back`, `erase_one_char` | *(none)* | — |
 | `wake_screen` | *(none)* | Turn the screen on |
+| `take_screenshot` | *(none)* | Take a picture of the current screen. It **supplements** the element table and the OCR text: use it when those two cannot show you the target (icons, images, colors, layout, a popup covering it). The picture carries no row numbers - keep addressing elements by their element-table row |
 | `start_video_recording` | *(none)* | Starts a background screen recording: max 3 min (Android) / 15 min (iOS), no audio; runs until `stop_video_recording` |
 | `stop_video_recording` | optional `prompt` | Stops the recording, then analyzes the video; `prompt` says what to extract (e.g. "what happens after each 10s") |
 
@@ -57,6 +58,8 @@ Origin `(0,0)` is the top-left corner: x grows right, y grows down; the bottom-r
 
 The screen description arrives as at most one separate message per turn: **element table** or **OCR block** (never both); row format and flags are in that message's header.
 For OCR rows, verify any confidence below 0.6 first.
+
+A picture is a **supplement, not a replacement**: `take_screenshot` hands you the pixels of the very screen the element table describes. Use it for what the two text channels cannot show - icons, images, colors, layout, whether a popup covers the thing you need. It adds no row numbers, so keep addressing elements by their element-table row. One picture per screen is enough: it goes stale as soon as the screen changes, and it costs about 1,200 input tokens (measured on the real endpoint).
 
 ## Output
 
@@ -115,7 +118,7 @@ Targets that already failed in this task: {% for fact in failures %}{{ fact.desc
 {%- if device_date %}{% set lines = lines + ["Device date: " ~ device_date] %}{% endif -%}
 {%- if focused_app_info %}{% set lines = lines + ["Focused app info: " ~ focused_app_info] %}{% endif -%}
 {%- if screen_off %}{% set lines = lines + ["Screen is OFF (the device is asleep). The element list only holds systemui leftovers, so there is nothing to act on. Call wake_screen FIRST, then read the screen again on the next turn."] %}{% endif -%}
-{%- if no_perception %}{% set lines = lines + ["NO perception channel is available: the UI element list and the OCR text are both OFF. You have no description of the screen at all - do not invent what is on it. Say plainly in agent_thought that you cannot act without a screen description."] %}{% endif -%}
+{%- if no_perception %}{% set lines = lines + ["NO perception channel is available: the UI element list and the OCR text are both OFF. You have no description of the screen at all - do not invent what is on it. You can still call take_screenshot to see the screen itself; until you have, say plainly in agent_thought that you cannot act without a screen description."] %}{% endif -%}
 {{ lines | join("\n") }}
 {%- endmacro -%}
 

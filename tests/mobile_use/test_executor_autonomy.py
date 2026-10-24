@@ -617,17 +617,23 @@ def test_t13_executor_output_has_no_picture_field():
     }
 
 
-def test_t13b_executor_prompt_has_no_picture_words_but_keeps_wake():
-    """executor.md 里不许有图相关的词，但**息屏唤醒必须留着**。
+def test_t13b_executor_prompt_has_no_picture_channel_but_keeps_the_screenshot_tool():
+    """图片**通道**没回来，截图**工具**回来了；息屏唤醒必须留着。
 
     息屏唤醒是另一回事（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步），
     它和图片通道无关，不能一起删掉。
+
+    2026-10-24：截图从「每轮附图的通道」改成了「模型自己调的**工具**」——
+    所以提示词里必须有 `take_screenshot`（模型得能叫出这个名字），
+    而 `need_screenshot` 这种「举手要图」的字段必须仍然不在（通道没回来）。
     """
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
-    for marker in ("screenshot", "need_screenshot", "picture"):
-        assert marker not in text, f"executor.md 里还留着图片通道的痕迹：{marker}"
+    # 通道没回来：模型不该再学会「举手要图」
+    assert "need_screenshot" not in text
+    # 工具回来了
+    assert "`take_screenshot`" in text
     # 息屏唤醒必须留着
     assert "wake_screen" in text
 

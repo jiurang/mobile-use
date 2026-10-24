@@ -236,17 +236,28 @@ def test_executor_prompt_keeps_perception_channels():
 
 
 def test_executor_prompt_has_no_trace_of_the_picture_channel():
-    """图片通道已下线 ⇒ 提示词里**一个图相关的词都不许有**。
+    """图片**通道**仍然下线，但「按需截图**工具**」回来了 —— 两者必须分清。
 
-    模型看不到的东西，就不该让它以为有：只要提示词里还留着「截图 /
-    screenshot / need_screenshot」，模型就会按着那个幻觉去要图。
+    2026-10-23 下线的是「**每轮附图**」那条通道：模型没有 `need_screenshot`
+    字段可以举手，屏幕描述块里也没有图。
 
-    这条是「下线」的**验收**，不是风格偏好 —— 它挡住了「删了代码但忘了
-    删提示词」这种半吊子状态。
+    2026-10-24 起截图改成**工具** `take_screenshot`：模型自己调，图挂在工具
+    结果上。所以提示词里**必须**出现 `take_screenshot`（模型得能叫出这个名字），
+    而且必须写清它是元素表 / OCR 的**补充** —— 否则模型会以为图能代替元素表，
+    然后报出图上并不存在的编号。
+
+    ⇒ 这里断言两件事：
+    1. **通道**的痕迹（`need_screenshot` 这类「举手要图」的字段）一个都不许有；
+    2. **工具**在，并且「补充」这层关系写出来了。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    for marker in ("screenshot", "Screenshot", "need_screenshot", "picture"):
-        assert marker not in text, f"executor.md 里还留着图片通道的痕迹：{marker}"
+    # 通道的痕迹：模型不该再学会「举手要图」这个动作
+    assert "need_screenshot" not in text
+    # 工具在
+    assert "`take_screenshot`" in text
+    # 并且写清了它是补充（不是替代）
+    assert "supplement" in text.lower()
+    assert "element table" in text
 
 
 def test_executor_prompt_has_no_tool_json_schema():
