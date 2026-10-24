@@ -376,7 +376,144 @@ def _executor_state():
 
 
 # ---------------------------------------------------------------------------
-# 5) 根因：历史在教模型喊设备工具名 —— 必须改写成 ExecutorOutput 的形状
+# 6) invalid_tool_calls：模型**确实调了工具**，但 arguments 不是合法 JSON
+# ---------------------------------------------------------------------------
+#
+# langchain 的 ``parse_tool_call`` 解析不了 ``arguments`` 时，会把整个调用丢进
+# ``msg.invalid_tool_calls``（⚠️ AIMessage 的**顶层属性**，不在 additional_kwargs 里）。
+# 框架以前只读 ``msg.tool_calls`` ⇒ 这类响应被当成「模型什么都没说」
+# ⇒ 报 "your answer was empty" ⇒ **一次本来能救的调用凭空消失**。
+#
+# 实测来源（2026-10-24，DeepSeek deepseek-flash，真实 API）：模型偶尔把
+# arguments 包成 markdown 围栏或前后加说明文字，就落进这一路。
+
+
+def _msg_with_invalid_tool_call(name: str, raw_args: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[],
+        invalid_tool_calls=[
+            {"name": name, "args": raw_args, "id": "call_1", "error": "invalid json"}
+        ],
+    )
+
+
+def test_invalid_tool_call_with_fenced_arguments_is_recovered():
+    """arguments 被包在 ```json 围栏里 ⇒ 救回来，不许当「什么都没说」。"""
+    msg = _msg_with_invalid_tool_call(
+        "ExecutorOutput",
+        '```json\n{"actions": [{"action": "tap", "target": {"index": 39}}]}\n```',
+    )
+    out = _parse(msg)
+    assert out.actions == [{"action": "tap", "target": {"index": 39}}]
+
+
+def test_invalid_tool_call_with_leading_prose_is_recovered():
+    """arguments 前后有说明文字 ⇒ 取第一个配平的 {..} 块救回来。"""
+    msg = _msg_with_invalid_tool_call(
+        "ExecutorOutput",
+        '好的，我来调用。{"actions": [{"action": "tap", "target": {"index": 7}}]} 以上。',
+    )
+    out = _parse(msg)
+    assert out.actions == [{"action": "tap", "target": {"index": 7}}]
+
+
+def test_invalid_tool_call_is_never_reported_as_an_empty_answer():
+    """🔴 核心回归：这类响应以前报 "your answer was empty" ⇒ 调用凭空消失。
+
+    现在要么救回结果，要么报「arguments 不是合法 JSON」，**不能**说成「没说话」。
+    """
+    msg = _msg_with_invalid_tool_call("ExecutorOutput", "{not json at all")
+    with pytest.raises(StructuredOutputError) as excinfo:
+        _runner(msg).invoke([])
+    reason = excinfo.value.reason
+    assert "empty" not in reason.lower(), f"不能把「工具调用被丢弃」说成「没说话」：{reason}"
+    assert "JSON" in reason, f"要说清是哪一环坏了：{reason}"
+
+
+def test_invalid_tool_call_with_the_wrong_name_is_reported_by_name():
+    """invalid_tool_calls 里的错名也要**点名** —— 模型才知道自己喊错了。"""
+    msg = _msg_with_invalid_tool_call("tap", '{"target": {"index": 1}}')
+    with pytest.raises(StructuredOutputError) as excinfo:
+        _runner(msg).invoke([])
+    assert "tap" in excinfo.value.reason
+
+
+def test_invalid_tool_call_count_is_in_the_operator_facing_detail():
+    """``detail`` 是给人看的 ⇒ 必须能看出「有几次调用落在 invalid 里」。"""
+    msg = _msg_with_invalid_tool_call("ExecutorOutput", "{not json at all")
+    with pytest.raises(StructuredOutputError) as excinfo:
+        _runner(msg).invoke([])
+    assert "invalid_tool_calls=1" in excinfo.value.detail
+
+
+# ---------------------------------------------------------------------------
+# 8) 守卫：结构化输出用的 schema，工具名不许带下划线前缀
+# ---------------------------------------------------------------------------
+#
+# 工具名 = pydantic 的**类名**（``convert_to_openai_tool`` 用 ``cls.__name__``），
+# 所以给 schema 起个 ``_FooOutput`` 这样的名字，模型看到的就是 ``_FooOutput``。
+#
+# 实测（2026-10-24，DeepSeek deepseek-flash，三组各 20 轮）：
+
+#   工具名                        描述    结果       失败时喊的名字
+#   ``_PlannerOutput``（下划线）   空      18/20     ``false`` / ``invoke``
+#   ``PlannerOutput``            空      **20/20**  —
+#   ``PlannerOutputDoc``         有      **20/20**  —
+#
+# ⇒ 元凶是**名字**（不是描述 —— 加不加 docstring 测不出差别）。
+#
+# 生产的 7 个 schema 现在都不带下划线 ⇒ 这条是**哨兵**：以后谁加一个
+# ``class _FooOutput``，这里立刻红。
+
+
+def _production_structured_output_schemas() -> list[tuple[str, type]]:
+    from minitap.mobile_use.agents.contextor.types import ContextorOutput
+    from minitap.mobile_use.agents.cortex.types import CortexOutput
+    from minitap.mobile_use.agents.executor.types import ExecutorOutput
+    from minitap.mobile_use.agents.hopper.hopper import HopperOutput
+    from minitap.mobile_use.agents.orchestrator.types import OrchestratorOutput
+    from minitap.mobile_use.agents.planner.types import PlannerOutput
+    from minitap.mobile_use.agents.reporter.reporter import ReporterSummary
+
+    return [
+        ("planner", PlannerOutput),
+        ("orchestrator", OrchestratorOutput),
+        ("cortex", CortexOutput),
+        ("executor", ExecutorOutput),
+        ("reporter", ReporterSummary),
+        ("contextor", ContextorOutput),
+        ("hopper", HopperOutput),
+    ]
+
+
+def test_no_production_schema_produces_an_underscore_prefixed_tool_name():
+    """🔴 工具名带下划线 ⇒ 模型把名字记错 ⇒ 整次调用报废（实测 2/20）。"""
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    for label, schema in _production_structured_output_schemas():
+        name = convert_to_openai_tool(schema)["function"]["name"]
+        assert not name.startswith("_"), (
+            f"{label} 的工具名是 {name!r}（带下划线前缀）—— 实测 DeepSeek 会把这种"
+            f"名字记成编出来的名字（false / invoke），整次调用报废。改类名，别改前缀。"
+        )
+
+
+def test_the_tool_name_is_the_class_name():
+    """工具名 = 类名 —— 这是「改类名就能改工具名」的前提，别哪天悄悄变了。
+
+    变了的话，``_parse`` 里对账用的 ``self._tool_name`` 和模型看到的名字就可能
+    对不上（模型喊的是我们以为的那个，我们等的却是另一个）。
+    """
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    for label, schema in _production_structured_output_schemas():
+        name = convert_to_openai_tool(schema)["function"]["name"]
+        assert name == schema.__name__, f"{label}: 工具名 {name!r} != 类名 {schema.__name__!r}"
+
+
+# ---------------------------------------------------------------------------
+# 9) 根因：历史在教模型喊设备工具名 —— 必须改写成 ExecutorOutput 的形状
 # ---------------------------------------------------------------------------
 #
 # 真机实测（执行 812）：executor 66 次调用里 37 次喊错工具名。

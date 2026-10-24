@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 from langchain_openai.chat_models import base as lc_base
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import SecretStr
 
 
 def _mock_settings(mock_settings, **overrides):
@@ -83,15 +83,6 @@ def test_get_deepseek_llm_does_not_clamp_temperature(mock_settings, mock_chat_op
     assert mock_chat_openai.call_args.kwargs["temperature"] == 1.5
 
 
-class _Subgoal(BaseModel):
-    goal: str = Field(description="the subgoal")
-    reasoning: str = Field(description="why")
-
-
-class _PlannerOutput(BaseModel):
-    subgoals: list[_Subgoal] = Field(description="all subgoals")
-
-
 @pytest.mark.parametrize("thinking", [None, True, False])
 @patch("minitap.mobile_use.services.llm.settings")
 def test_deepseek_never_sends_response_format(mock_settings, thinking):
@@ -161,7 +152,31 @@ def test_deepseek_structured_output(mock_settings, thinking):
 
     Assert the parsed object, not just a non-empty string: the failure mode is
     ``parsed=None`` or a 400 before any token is emitted.
+
+    ⚠️ **必须用生产真实的 schema**，不要用本文件里另造一个。
+    原因（2026-10-24 实测，deepseek-flash，三组各 20 轮）：
+
+    ==========================  =========  ========  ==================
+    工具名                        描述        结果      失败时喊的名字
+    ==========================  =========  ========  ==================
+    ``_PlannerOutput``（下划线）   空          18/20    ``false`` / ``invoke``
+    ``PlannerOutput``            空          **20/20**  —
+    ``PlannerOutputDoc``         有          **20/20**  —
+    ==========================  =========  ========  ==================
+
+    ⇒ 元凶是**工具名带下划线前缀**（模型把 ``_PlannerOutput`` 记成
+    ``false`` / ``invoke`` 这种编出来的名字），**不是**描述为空
+    （加不加 docstring 测不出差别）。
+
+    ⇒ 生产里的 agent schema 全都不带下划线（``PlannerOutput`` /
+    ``ExecutorOutput`` / ``CortexOutput`` …）⇒ **生产不受影响**，
+    是这个 fixture 自己踩的坑。用真实 schema 才能测到真实行为。
+
+    另外：真实模型偶尔不按要求调工具（哪怕工具名正常），所以这里**重试几次**
+    —— 这是 live-LLM integration 测试的常态，不是掩盖 bug：重试 3 次仍失败
+    就把每次的诊断一起抛出来。
     """
+    from minitap.mobile_use.agents.planner.types import PlannerOutput
     from minitap.mobile_use.services.llm import get_deepseek_llm
 
     key = os.environ.get("DEEPSEEK_API_KEY")
@@ -173,9 +188,20 @@ def test_deepseek_structured_output(mock_settings, thinking):
     mock_settings.DEEPSEEK_THINKING = thinking
 
     client = get_deepseek_llm(model_name="deepseek-flash")
-    structured = client.with_structured_output(_PlannerOutput)
-    result = asyncio.run(structured.ainvoke("Split 'buy milk' into subgoals."))
+    structured = client.with_structured_output(PlannerOutput)
 
-    assert isinstance(result, _PlannerOutput)
-    assert result.subgoals
+    attempts: list[str] = []
+    for attempt in range(1, 4):
+        try:
+            result = asyncio.run(structured.ainvoke("Split 'buy milk' into subgoals."))
+        except Exception as exc:  # noqa: BLE001
+            attempts.append(f"#{attempt}: {type(exc).__name__}: {exc}")
+            continue
+        assert isinstance(result, PlannerOutput)
+        assert result.subgoals
+        return
+
+    pytest.fail(
+        "DeepSeek 结构化输出连续 3 次失败（每次的诊断）：\n" + "\n".join(attempts)
+    )
 

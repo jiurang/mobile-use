@@ -754,6 +754,17 @@ class _ToolCallStructuredRunnable(Runnable):
                     return text[start : i + 1]
         return None
 
+    @staticmethod
+    def _call_field(call: Any, field: str) -> Any:
+        """从一条 tool call 里取字段 —— **dict 与对象两种形态都认**。
+
+        langchain 的 ``ToolCall`` / ``InvalidToolCall`` 运行时都是 TypedDict
+        （就是 dict），但测试里常用带属性的替身 ⇒ 两种取法都得认。
+        """
+        if isinstance(call, dict):
+            return call.get(field)
+        return getattr(call, field, None)
+
     def _parse(self, msg: AIMessage) -> BaseModel:
         # 1) tool_calls 路径 (M3 thinking 开 / M2.7 等)
         # Note: LangChain normalises OpenAI tool_calls into ``{"name", "args",
@@ -771,8 +782,8 @@ class _ToolCallStructuredRunnable(Runnable):
         # （真机实测：执行 812 的 executor 66 次调用里 37 次这样，浪费 243 秒。）
         wrong_tools: list[str] = []
         for tc in msg.tool_calls or []:
-            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
-            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+            name = self._call_field(tc, "name")
+            args = self._call_field(tc, "args")
             if args is None:
                 continue
             if name != self._tool_name:
@@ -782,6 +793,41 @@ class _ToolCallStructuredRunnable(Runnable):
                 if isinstance(args, str):
                     return self.schema.model_validate_json(args)
                 return self.schema.model_validate(args)
+            except ValidationError:
+                continue
+
+        # 1b) 🔴 **invalid_tool_calls** —— 模型**确实调了工具**，但 ``arguments``
+        #     不是合法 JSON，langchain 解析失败就把整个调用丢进
+        #     ``msg.invalid_tool_calls``（⚠️ 是 AIMessage 的**顶层属性**，
+        #     **不在** ``additional_kwargs`` 里 —— 查错地方会以为它不存在）。
+        #
+        #     框架以前只读 ``msg.tool_calls`` ⇒ 这类响应被当成
+        #     「模型什么都没说」（"your answer was empty"）⇒ **凭空消失**。
+        #
+        #     实测（2026-10-24，DeepSeek deepseek-flash，真实 API）：模型偶尔
+        #     把 arguments 包成 markdown 围栏或前后加说明文字 ⇒ 落在这一路。
+        #
+        #     这里的 ``args`` 是**原始字符串**（langchain 没解析成功），
+        #     所以要自己救：去掉围栏 / 取第一个配平的 {..} 块再校验。
+        invalid_calls = list(getattr(msg, "invalid_tool_calls", None) or [])
+        for itc in invalid_calls:
+            name = self._call_field(itc, "name")
+            raw_args = self._call_field(itc, "args")
+            if name != self._tool_name:
+                wrong_tools.append(str(name))
+                continue
+            if isinstance(raw_args, dict):
+                try:
+                    return self.schema.model_validate(raw_args)
+                except ValidationError:
+                    continue
+            if not isinstance(raw_args, str):
+                continue
+            recovered = self._extract_json_object(self._strip_markdown_json(raw_args))
+            if not recovered:
+                continue
+            try:
+                return self.schema.model_validate_json(recovered)
             except ValidationError:
                 continue
 
@@ -808,9 +854,12 @@ class _ToolCallStructuredRunnable(Runnable):
         # '...'，现场根本看不出模型到底说了什么，而 with_fallback 正是靠这条
         # message 上报给用户的。带上原文才算可诊断 —— 但它只进异常 message，
         # 不进日志（原文里可能有屏幕上的文字）。
+        invalid_names = [self._call_field(itc, "name") for itc in invalid_calls]
         facts = (
             f"tool_calls={len(msg.tool_calls or [])}, "
+            f"invalid_tool_calls={len(invalid_calls)}, "
             f"wrong_tools={sorted(set(wrong_tools))}, "
+            f"invalid_tool_names={sorted({str(n) for n in invalid_names if n})}, "
             f"finish_reason={getattr(msg, 'response_metadata', {}).get('finish_reason')!r}"
         )
         detail = f"{facts}, content[:1000]={content[:1000]!r}"
@@ -819,6 +868,14 @@ class _ToolCallStructuredRunnable(Runnable):
             reason = (
                 f"you called the tool {listed} but the only tool you may call "
                 f"is '{self._tool_name}' — call '{self._tool_name}' instead"
+            )
+        elif invalid_calls:
+            # 模型调了工具，但 arguments 不是合法 JSON（围栏 / 说明文字），
+            # 而救不回来 ⇒ 说清楚是**哪一环**坏了，别让它以为「什么都没说」。
+            reason = (
+                f"you called '{self._tool_name}' but its arguments were not valid JSON — "
+                f"pass the arguments as a single JSON object with no markdown fences "
+                f"and no extra text"
             )
         elif content.strip():
             reason = (
