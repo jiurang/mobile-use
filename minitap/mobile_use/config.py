@@ -38,9 +38,25 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: SecretStr | None = None
     MINITAP_API_KEY: SecretStr | None = None
     SILICONFLOW_API_KEY: SecretStr | None = None
+    # 小米 MiMo **Token Plan** 的 key（tp- 开头），中国集群。
+    #
+    # ⚠️ 它和「按量付费」那把（sk- 开头，https://api.xiaomimimo.com/v1）是
+    # **两把独立的 key**，混用会 401 —— 两个渠道要加两个环境变量，别共用。
+    #
+    # 🔴 这个字段**必须在这里声明**：``model_config`` 是 ``extra="ignore"``，
+    # 没声明的变量名会被**静默丢弃** ⇒ ``key_or()`` 拿不到 ⇒ 客户端拿占位 key
+    # "sk-local" 去请求 ⇒ 401 "Invalid API Key"，而错误信息完全指不到真正的原因
+    # （真正的原因是「配置根本没接上」）。2026-10-24 实测踩过。
+    MIMO_API_KEY: SecretStr | None = None
 
     OPENAI_BASE_URL: str | None = None
     AZURE_BASE_URL: str | None = None
+    # OpenRouter / xAI 的端点。渠道目录里写了 ``base_url_env``，但这里**没声明**
+    # ⇒ ``extra="ignore"`` 把它们静默丢弃 ⇒ 「在 .env 里改这两个渠道的地址」
+    # 这个旋钮是死的（而且不报错）。2026-10-24 由「渠道引用的环境变量必须
+    # 在 Settings 里声明过」那条守卫测试抓出来。
+    OPEN_ROUTER_BASE_URL: str | None = None
+    XAI_BASE_URL: str | None = None
     MINITAP_API_BASE_URL: str = "https://platform.minitap.ai/api/v1"
     # MiniMax runs two separate platforms whose API keys are NOT interchangeable:
     #   domestic  platform.minimaxi.com -> https://api.minimaxi.com/v1
@@ -87,6 +103,20 @@ class Settings(BaseSettings):
     # on every agent call. Set to false to send {"thinking": {"type": "disabled"}}.
     # None -> we don't send the parameter at all and DeepSeek's default applies.
     DEEPSEEK_THINKING: bool | None = None
+
+    # 小米 MiMo 的「要不要思考」（Token Plan / 按量付费都一样）。
+    #
+    # None = 不发这个字段，走 MiMo 服务端自己的默认 —— 而实测（2026-10-24，
+    # token-plan-cn.xiaomimimo.com，mimo-v2.6-pro）**服务端默认是开着思考的**：
+    # 不下发 thinking 时 usage 里有 ``reasoning_tokens``（13~17）、
+    # message 里有 ``reasoning_content``。
+    #
+    # ⇒ 显式 false 时发 ``{"thinking": {"type": "disabled"}}``：reasoning_tokens
+    # 变成 0、completion_tokens 从 ~35 降到 17，工具调用照样 3/3 命中。
+    # ⇒ 显式 true 时发 ``{"thinking": {"type": "enabled"}}``。
+    #
+    # ⚠️ 同样**必须声明**在这里（``extra="ignore"`` 会静默丢弃没声明的变量名）。
+    MIMO_THINKING: bool | None = None
 
     # ---- llama.cpp / llama-server（本地 OpenAI 兼容端点）----
     #

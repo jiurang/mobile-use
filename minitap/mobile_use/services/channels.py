@@ -417,9 +417,26 @@ CHANNELS: dict[str, ChannelSpec] = {
         # 思考开关的形状是 ``thinking.type``（小米给 Kilo Code 的示例里就是
         # ``"thinking": {"type": "enabled"}``）。
         thinking_style="thinking_type",
-        # 小米文档：「模型在调 tool 的时候开启 thinking 导致的不稳定，输出不完整；
-        # 建议调用 tool calls 的时候关闭 thinking」⇒ 思考开着就别强制 tool_choice。
-        thinking_default_on=False,
+        # 🔴 **服务端默认是开着思考的**（2026-10-24 实测，token-plan-cn，
+        # mimo-v2.6-pro）：不下发 ``thinking`` 时 usage 里 ``reasoning_tokens``
+        # 是 13~17、message 里有 ``reasoning_content``。
+        #
+        # 以前这里写的是 False（依据是「MiMo 的思考是按需开启的」）—— 与实测
+        # 相反。后果：框架以为「没说 = 没开思考」⇒ 允许强制 tool_choice，
+        # 而实际思考是开着的 ⇒ 小米文档警告的那件事就发生了：
+        # 「调 tool 的时候开启 thinking 导致输出不完整」。
+        #
+        # 实测症状（2026-10-24）：max_completion_tokens=64 时推理链把预算吃光
+        # ⇒ finish_reason=length、**没有 tool_calls**、静默失败（不是 DeepSeek
+        # 那种硬 400）。预算放大到 2048 后 6 种组合全部 3/3 命中工具调用 ——
+        # 所以它不是「必然坏」，是「预算一紧就坏」。
+        #
+        # ⇒ 这一项必须如实地反映**服务端默认**：True。
+        thinking_default_on=True,
+        # 思考开关的旋钮。没配 MIMO_THINKING 时不下发这个字段，走服务端默认
+        # （= 开着思考）。配 false 则显式发 {"thinking": {"type": "disabled"}}：
+        # reasoning_tokens 归 0、completion_tokens 从 ~35 降到 17，工具调用稳定。
+        thinking_env="MIMO_THINKING",
         client_kind="thinking_aware",
         request_timeout=180.0,
         max_retries=1,

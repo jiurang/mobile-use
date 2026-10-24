@@ -149,8 +149,9 @@ def test_every_channel_client_kind_is_a_declared_kind():
 def test_thinking_aware_channels_share_one_client_class():
     """DeepSeek 和 MiMo 行为**完全相同** ⇒ 共用一个客户端类。
 
-    差别只在渠道目录的 ``thinking_default_on`` 里（DeepSeek 默认开思考，
-    MiMo 按需开启）。两个名字指同一份行为 = 两个所有者，迟早走样。
+    差别只在渠道目录的 ``thinking_default_on`` 里（DeepSeek 默认开思考；
+    MiMo 实测服务端默认也开思考 —— 2026-10-24 实测 reasoning_tokens 非零）。
+    两个名字指同一份行为 = 两个所有者，迟早走样。
     """
     from minitap.mobile_use.services.llm import _OPENAI_CLIENT_KINDS
 
@@ -378,15 +379,88 @@ def test_executor_path_forces_tool_choice_once_thinking_is_off():
     assert "tool_choice" in runner._bound.kwargs
 
 
-def test_mimo_forces_tool_choice_when_thinking_is_not_requested():
-    """MiMo 的思考是**按需开启**的 ⇒ 没说思考开关时可以强制 tool_choice。
+def test_mimo_does_not_force_tool_choice_when_thinking_is_not_requested():
+    """🔴 MiMo 服务端**默认开着思考** ⇒ 没显式关掉时不能强制 tool_choice。
 
-    与 DeepSeek 相反（它的推理模型默认开思考）。这条规则由渠道目录里的
-    ``thinking_default_on`` 决定，不是写死在客户端里的。
+    2026-10-24 实测（token-plan-cn.xiaomimimo.com，mimo-v2.6-pro）：不下发
+    ``thinking`` 时 usage 里 ``reasoning_tokens`` = 13~17、message 里有
+    ``reasoning_content`` ⇒ 服务端默认就是开思考。
+
+    以前这里断言「可以强制」，依据是「MiMo 的思考是按需开启的」—— 与实测相反。
+    后果：框架在思考**实际开着**的时候强制 tool_choice ⇒ 预算一紧就
+    ``finish_reason=length`` + **没有 tool_calls**（静默失败，不是 400）。
+
+    ⇒ 与 DeepSeek 同规则：没说 = 按开着算 ⇒ 不强制。
     """
     cfg = llm_config_for_single_model("mimo-token-plan", "mimo-v2.6-pro", api_key="k")
     runner = get_structured_llm_for(cfg)
+    assert "tool_choice" not in runner._bound.kwargs
+
+
+def test_mimo_forces_tool_choice_once_thinking_is_off():
+    """显式关掉思考后强制是安全的 —— 而且更省。
+
+    实测：thinking=disabled ⇒ ``reasoning_tokens`` = 0、``completion_tokens``
+    从 ~35 降到 17，工具调用 3/3 命中。
+    """
+    cfg = llm_config_for_single_model(
+        "mimo-token-plan", "mimo-v2.6-pro", api_key="k", thinking=False
+    )
+    runner = get_structured_llm_for(cfg)
     assert "tool_choice" in runner._bound.kwargs
+
+
+def test_mimo_thinking_switch_reaches_the_request_body():
+    """思考开关必须真的进请求体（形状是 ``thinking.type``）。"""
+    from minitap.mobile_use.services.llm import build_openai_protocol_client
+
+    spec = require_channel("mimo-token-plan")
+    client = build_openai_protocol_client(
+        spec,
+        "mimo-v2.6-pro",
+        1,
+        _channel_override("mimo-token-plan", "mimo-v2.6-pro", thinking=False),
+    )
+    assert client.extra_body == {"thinking": {"type": "disabled"}}
+
+
+def test_mimo_declares_a_thinking_knob():
+    """渠道必须给出思考开关的环境变量名，否则用户没地方调。
+
+    以前 mimo 这条没写 ``thinking_env`` ⇒ ``MIMO_THINKING`` 没人读 ⇒
+    「在 .env 里把思考关掉」这件事根本做不到（而且不报错）。
+    """
+    spec = require_channel("mimo-token-plan")
+    assert spec.thinking_env == "MIMO_THINKING"
+    assert spec.thinking_default_on is True, "服务端默认开着思考（2026-10-24 实测）"
+
+
+def test_every_channel_env_var_is_declared_on_settings():
+    """🔴 渠道目录里引用的每个环境变量名，``Settings`` 都必须声明过。
+
+    这是「配置根本没接上」那一类静默失败的**唯一防线**。
+
+    ``Settings.model_config`` 是 ``{"extra": "ignore"}`` ⇒ 没声明的变量名会被
+    **静默丢弃**：``.env`` 里明明写了 ``MIMO_API_KEY=tp-…``，``settings`` 上却
+    没有这个属性 ⇒ ``ProviderOverride.key_or()`` 回退成 ``None`` ⇒ 客户端拿
+    占位 key ``"sk-local"`` 去请求 ⇒ **401 "Invalid API Key"**，
+    而错误信息完全指不到真正的原因。
+
+    2026-10-24 实测踩过：mimo 渠道配好了、key 也对，但 ``Settings`` 里漏了
+    ``MIMO_API_KEY`` ⇒ 整条渠道 100% 401，且不写代码根本看不出来。
+    """
+    from minitap.mobile_use.config import Settings
+
+    declared = set(Settings.model_fields)
+    missing: list[str] = []
+    for cid, spec in CHANNELS.items():
+        for attr in (spec.api_key_env, spec.thinking_env, spec.base_url_env):
+            if attr and attr not in declared:
+                missing.append(f"{cid}: {attr}")
+    assert not missing, (
+        "渠道引用的环境变量没在 Settings 里声明（会被 extra=ignore 静默丢弃）: "
+        + ", ".join(missing)
+    )
 
 
 def test_mimo_does_not_force_tool_choice_when_thinking_is_on():
