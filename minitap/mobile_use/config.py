@@ -77,6 +77,22 @@ class Settings(BaseSettings):
     # 5569ms、high 446.0 / 7036ms、max 389.5 / **4247ms**。两列都**非单调**，
     # max 反而最快 —— 说明这个档位在本负载上不是个有效的旋钮，别再去调它。
     #
+    # 🔴 **2026-10-26 在 executor 负载上复测过一次（n=12，更大的样本）**：
+    # 重放 execution 880 的**真实 executor 提示词**（269 / 443 条消息），
+    # 逐档跑 12 次，量 reasoning / 可见输出 / 延迟 / 动作是否与基准一致：
+    #
+    #   档位    output 中位   相对 max   延迟中位   动作同基准
+    #   low        391 tok      −3.0%     4220ms       9/12
+    #   medium     410 tok      −1.9%     4374ms       8/12
+    #   high       485 tok     +20.3%     4892ms       8/12
+    #   xhigh      409 tok      −1.5%     4510ms       5/12
+    #   max        403 tok       0.0%     3535ms       9/12
+    #
+    # ⚠️ **n=2 时结论完全相反**（那次 high 看着省 60%）—— 样本一上去就翻案。
+    # ⇒ 这个档位**不省 token、也不改质量**，两次独立实测都非单调。
+    # ⇒ **别再调它。** 想降 output token，去降**调用次数**（那是 77% 的
+    # reasoning 的真正来源），不是降思考深度。
+    #
     # 只对 M3.1-Flash-Preview 有意义；M2.x 会忽略，M3 不认这个字段。
     MINIMAX_EFFORT: str | None = "max"
     # 「要不要思考」。None = 不下发 = 走模型自己的默认。
@@ -299,6 +315,16 @@ class LLM(BaseModel):
     #: 其它 provider 收到也忽略 —— 「一个开关对某些供应商无效」比「每个供应商
     #: 一套请求体形状」好维护。
     thinking: bool | None = None
+
+    #: 「思考强度」档位。None = 没指定 = 用服务端默认档位。
+    #:
+    #: 只有目录里声明了 ``effort_style="reasoning_effort"`` 的渠道消费它
+    #: （DeepSeek：Chat Completions 的顶层 ``reasoning_effort``）。
+    #: 合法档位由渠道目录的 ``effort_levels`` 决定（DeepSeek 是 low / high / max）；
+    #: 写错档位会在建客户端时直接报错，而不是静默按默认档位跑。
+    #:
+    #: ``thinking=False`` 时它不生效：思考都关了，强度没有意义。
+    reasoning_effort: str | None = None
 
     #: 缺密钥 / 缺端点时，允不允许从设备本地的环境（.env）里补。
     #:

@@ -87,6 +87,18 @@ class ExecutorOutput(BaseModel):
         default=None,
         description="Why the goal is considered reached. Required when done=true.",
     )
+    failed: bool = Field(
+        default=False,
+        description=(
+            "True when this goal CANNOT be achieved and you are giving up on it. "
+            "Then actions is empty. Use this instead of retrying forever: "
+            "report what you tried and why it did not work."
+        ),
+    )
+    failed_reason: str | None = Field(
+        default=None,
+        description="Why the goal cannot be achieved. Required when failed=true.",
+    )
 
 
 class ExecutorReport(BaseModel):
@@ -126,6 +138,13 @@ class ExecutorReport(BaseModel):
         default=None,
         description="Why the attempt was blocked (step limit / circuit breaker).",
     )
+    failure_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why the executor gave up on this subgoal (it said failed=true). "
+            "Copied verbatim; never reworded."
+        ),
+    )
 
 
 def determine_outcome(
@@ -133,10 +152,12 @@ def determine_outcome(
     done: bool,
     failures: list[dict] | None = None,
     step_limit_reached: bool = False,
+    gave_up: bool = False,
 ) -> Literal["completed", "failed", "blocked"]:
     """**代码**判定 outcome，规则无歧义（见方案 §6.2.1）。
 
     ``done=True``            → ``completed``
+    ``gave_up=True``         → ``failed``（模型明确说「做不到」）
     步数超限 / 熔断          → ``blocked``
     其余一切（没达成）       → ``failed``
 
@@ -153,7 +174,16 @@ def determine_outcome(
 
     这条函数是「事实不丢」的结构性保证：``outcome`` **不经 LLM**，
     所以 Reporter 没有机会把失败说成完成。
+
+    ⚠️ **``gave_up`` 必须排在 ``done`` 前面** —— 两者语义相反
+    （「做成了」vs「做不到」）。历史上 ``done=True`` 被**无条件**映射成
+    ``completed``，那时 executor 没有「放弃」这个出口，「做不到」在契约里
+    **不可表达**，模型只能继续试 ⇒ 原地打转 ⇒ 撞 ``recursion_limit`` 崩掉
+    （真机实测 2026-10-26，mobile-manager execution 880，卡了 70 步、
+    45 分钟、409 万 input token）。
     """
+    if gave_up:
+        return "failed"
     if done:
         return "completed"
     if step_limit_reached:

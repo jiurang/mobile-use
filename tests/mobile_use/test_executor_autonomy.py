@@ -608,12 +608,20 @@ def test_t13_executor_output_has_no_picture_field():
     里，模型就会学会举手要图，而框架已经没有图可以给了。
     """
     assert "need_screenshot" not in ExecutorOutput.model_fields
-    # 剩下的四个字段就是全部
+    # 剩下的字段就是全部。
+    #
+    # ⚠️ 2026-10-26：多了 `failed` / `failed_reason` —— 「做不到」的出口。
+    # 在此之前 executor 唯一能结束子目标的方式是 `done: true`，而 `done`
+    # 的语义是「目标达成」、`determine_outcome` 把它**无条件**映射成
+    # ``completed`` ⇒ **「做不到」在契约里不可表达** ⇒ 模型只能一直试
+    # ⇒ 原地打转 ⇒ 撞 `recursion_limit` 崩掉（真机 execution 880，70 步）。
     assert set(ExecutorOutput.model_fields) == {
         "actions",
         "agent_thought",
         "done",
         "done_reason",
+        "failed",
+        "failed_reason",
     }
 
 
@@ -1067,7 +1075,7 @@ def _stub_decide(steps_per_subgoal: int):
     只替换 LLM 那一层，`ExecutorNode.__call__` 里**计数**的逻辑是真的。
     """
 
-    async def _decide(self, *, state, goal):
+    async def _decide(self, *, state, goal, stall_notice: str = ""):
         if state.executor_steps >= steps_per_subgoal:
             return ExecutorOutput(
                 actions=[],

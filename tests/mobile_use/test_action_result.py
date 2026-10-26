@@ -114,7 +114,8 @@ class TestRenderActionResult:
             current_app="com.miui.home",
         )
         assert line is not None
-        assert "前台应用变成了 com.miui.home" in line
+        # 比较用包名、展示用中文名（com.miui.home = 桌面）
+        assert "前台应用变成了 桌面" in line
 
     def test_new_text_is_reported(self):
         """刷短视频：每次滑一下都出现新标题 ⇒ 「新出现了：…」⇒ 不是「没进展」。"""

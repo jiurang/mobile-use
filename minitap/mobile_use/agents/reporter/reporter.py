@@ -145,6 +145,7 @@ class ReporterNode:
             actions_taken=actions_taken,
             failed_targets=failed_targets,
             blocked_reason=blocked_reason_for(state),
+            failure_reason=failure_reason_for(state),
         )
 
         telemetry.capture_reporter_report(
@@ -189,7 +190,11 @@ class ReporterNode:
         """
         if self.llm_free:
             return (
-                code_summary(outcome=outcome, failed_count=len(failed_targets)),
+                code_summary(
+                    outcome=outcome,
+                    failed_count=len(failed_targets),
+                    failure_reason=failure_reason_for(state),
+                ),
                 pick_evidence(
                     None,
                     log_text=log_text,
@@ -235,14 +240,32 @@ class ReporterNode:
             # 汇报挂掉不该让整条任务挂掉：事实层（outcome / 失败清单）还在，
             # 上层看到的是「没完成 + 失败清单」，比没有汇报强。
             logger.warning(f"[reporter] LLM call failed, falling back to a code summary: {e}")
-            return code_summary(outcome=outcome, failed_count=len(failed_targets)), None
+            return (
+                code_summary(
+                    outcome=outcome,
+                    failed_count=len(failed_targets),
+                    failure_reason=failure_reason_for(state),
+                ),
+                None,
+            )
 
         if response is None:
-            return code_summary(outcome=outcome, failed_count=len(failed_targets)), None
+            return (
+                code_summary(
+                    outcome=outcome,
+                    failed_count=len(failed_targets),
+                    failure_reason=failure_reason_for(state),
+                ),
+                None,
+            )
 
         summary = (response.summary or "").strip()
         if not summary:
-            summary = code_summary(outcome=outcome, failed_count=len(failed_targets))
+            summary = code_summary(
+                outcome=outcome,
+                failed_count=len(failed_targets),
+                failure_reason=failure_reason_for(state),
+            )
 
         evidence = pick_evidence(
             response.evidence,
@@ -281,12 +304,37 @@ def determine_outcome_for(state: State) -> Literal["completed", "failed", "block
     """代码判定 outcome（规则无歧义，见 :func:`determine_outcome`）。"""
     step_limit = step_limit_reached(state)
     # 撞了上限就不是「达成」—— 那个分支里 executor_done 只表示「收尾」。
-    done = bool(state.executor_done) and not step_limit
+    #
+    # ⚠️ **模型明确放弃**（`executor_failed`）同样不是「达成」——
+    # 它是「做不到」。在这之前 `done=True` 会被**无条件**映射成 completed，
+    # 而 executor 当时又没有「做不到」这个出口 ⇒ 「做不到」不可表达
+    # ⇒ 模型只能一直试 ⇒ 原地打转 ⇒ 撞 recursion_limit 崩掉
+    # （真机实测 2026-10-26，mobile-manager execution 880）。
+    done = bool(state.executor_done) and not step_limit and not state.executor_failed
     return determine_outcome(
         done=done,
         failures=state.executor_failures,
         step_limit_reached=step_limit,
+        gave_up=bool(state.executor_failed),
     )
+
+
+def failure_reason_for(state: State) -> str | None:
+    """模型自己说的「做不到的原因」（**逐字**，不改写）。
+
+    不是「放弃」就返回 None。
+
+    ⚠️ 它是**事实层**：这句话是模型的原话，Cortex / Orchestrator 读到的
+    就是它自己说的那句 —— 不重写、不美化（「把失败说成完成」的老毛病
+    在这里没有生存空间）。
+    """
+    if not state.executor_failed:
+        return None
+    for message in reversed(state.executor_messages or []):
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return None
 
 
 def _current_subgoal_id(state: State) -> str:
@@ -704,7 +752,7 @@ def build_reporter_messages(
     ]
 
 
-def code_summary(*, outcome: str, failed_count: int) -> str:
+def code_summary(*, outcome: str, failed_count: int, failure_reason: str | None = None) -> str:
     """纯代码摘要（不调 LLM）。
 
     两种用法：
@@ -715,6 +763,11 @@ def code_summary(*, outcome: str, failed_count: int) -> str:
 
     措辞上不区分这两种情况：上层（Cortex / Orchestrator）读的是
     ``outcome`` 和事实字段，``summary`` 只是给人看的说明。
+
+    ⚠️ ``failure_reason`` 是**模型自己说的「做不到的原因」**（逐字）。
+    带上它，是因为「模型主动放弃」和「模型没放弃只是没做成」在上层看来
+    长得一模一样（都是 outcome=failed）—— 不说清楚，监督者只能重新下发
+    同一个目标，白白再烧一遍。
     """
     if outcome == "completed":
         return "子目标已完成（证据见下方：动作结果 + 屏幕上看到的文字）。"
@@ -724,6 +777,8 @@ def code_summary(*, outcome: str, failed_count: int) -> str:
             # 默认不限 ⇒ blocked 本来不可达；这里是「有人把上限配回来了」的兜底。
             return "子目标未完成，见失败清单。"
         return f"子目标未完成：触到步数上限（{limit} 步），见失败清单。"
+    if failure_reason:
+        return f"子目标做不到（执行器主动放弃）：{failure_reason}"
     if failed_count:
         return f"子目标未完成，见失败清单（{failed_count} 条失败事实）。"
     return "子目标未完成，未记录到失败事实。"

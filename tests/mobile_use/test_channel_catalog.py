@@ -73,6 +73,7 @@ def _channel_override(provider: str, model: str, **kwargs) -> ProviderOverride:
         api_key=llm.api_key,
         base_url=llm.base_url,
         thinking=llm.thinking,
+        reasoning_effort=llm.reasoning_effort,
         strict=not llm.allow_env_fallback,
     )
 
@@ -195,6 +196,8 @@ def test_no_channel_carries_a_dead_field():
         "thinking_fallback",
         "session_query_param",
         "effort_style",
+        "effort_levels",
+        "effort_default",
         "temperature_range",
         "structured_output",
         "max_tokens_policy",
@@ -323,6 +326,67 @@ def test_channel_thinking_is_not_overridden_by_the_local_env(monkeypatch):
         override=_channel_override("deepseek", "deepseek-flash", thinking=False),
     )
     assert client.extra_body == {"thinking": {"type": "disabled"}}
+
+
+# ---------------------------------------------------------------------------
+# 3b. 思考强度（DeepSeek 的 reasoning_effort）必须真的生效
+# ---------------------------------------------------------------------------
+
+
+def test_deepseek_channel_reasoning_effort_reaches_the_request_body():
+    """渠道把强度设成 max → 请求体里必须真的有 ``reasoning_effort: max``。
+
+    只断言客户端的字段不够：字段声明了却没进请求体，症状和没配置一样。
+    """
+    from langchain_core.messages import HumanMessage
+
+    client = get_deepseek_llm(
+        model_name="deepseek-flash",
+        override=_channel_override("deepseek", "deepseek-flash", reasoning_effort="MAX"),
+    )
+    assert client.reasoning_effort == "max"
+    payload = client._get_request_payload([HumanMessage(content="hi")])
+    assert payload["reasoning_effort"] == "max"
+
+
+def test_deepseek_channel_without_effort_sends_nothing():
+    """没指定 → 不发 → 走服务端默认档位（DeepSeek 是 high）。"""
+    client = get_deepseek_llm(
+        model_name="deepseek-flash",
+        override=_channel_override("deepseek", "deepseek-flash"),
+    )
+    assert client.reasoning_effort is None
+
+
+def test_reasoning_effort_is_dropped_when_thinking_is_off():
+    """思考都关了，强度没有意义 —— 不能发一对矛盾参数。"""
+    client = get_deepseek_llm(
+        model_name="deepseek-flash",
+        override=_channel_override(
+            "deepseek", "deepseek-flash", thinking=False, reasoning_effort="max"
+        ),
+    )
+    assert client.reasoning_effort is None
+
+
+def test_unknown_reasoning_effort_fails_loudly():
+    """写错档位必须报错。
+
+    静默回落的症状是「选了低档，花的还是高档的 token」，没有任何地方能看出来。
+    """
+    from minitap.mobile_use.services.llm import _resolve_reasoning_effort
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        _resolve_reasoning_effort(get_channel("deepseek"), None, "xhigh")
+
+
+def test_reasoning_effort_is_ignored_by_channels_without_the_knob():
+    """目录里没有这个旋钮的渠道收到它也**不发**（不是报错）。"""
+    client = get_minimax_llm(
+        model_name="MiniMax-M3",
+        override=_channel_override("minimax", "MiniMax-M3", reasoning_effort="max"),
+    )
+    assert client.reasoning_effort is None
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +592,21 @@ def test_catalog_payload_is_json_serialisable_and_has_what_the_form_needs():
         # 「默认地址」是这层改造的核心收益：添加渠道时不用手抄 URL。
         if item["id"] in {"deepseek", "minimax", "siliconflow", "openai", "mimo-token-plan"}:
             assert item["baseUrl"], item["id"]
+
+
+def test_catalog_carries_the_reasoning_effort_levels_for_deepseek():
+    """思考强度是**界面要渲染的选项**，所以必须跟着目录一起导出。
+
+    这些值来自官方 ``GET /models``（2026-10-26）：low / high / max，默认 high。
+    没这个旋钮的渠道给空列表 —— 前端据此决定要不要渲染那个下拉框。
+    """
+    by_id = {item["id"]: item for item in catalog_payload()}
+    deepseek = by_id["deepseek"]
+    assert deepseek["reasoningEffortLevels"] == ["low", "high", "max"]
+    assert deepseek["reasoningEffortDefault"] == "high"
+
+    assert by_id["minimax"]["reasoningEffortLevels"] == []
+    assert by_id["minimax"]["reasoningEffortDefault"] is None
 
 
 def test_catalog_model_lists_are_not_empty_for_the_channels_we_ship():

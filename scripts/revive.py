@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -116,6 +117,15 @@ def main() -> int:
         if n >= 5:
             print("back to game", flush=True)
             return 0
+        # 广告的落地页会挡住游戏（抖音话题页），按返回键回游戏
+        for _ in range(3):
+            subprocess.run(["adb", "-s", gv.DEVICE, "shell", "input", "keyevent", "4"], check=True)
+            time.sleep(2)
+            img = gv.screencap()
+            if board_tiles(img) >= 5:
+                cv2.imwrite(f"{OUT}/revive_done.png", img)
+                print("back to game via BACK key", flush=True)
+                return 0
 
     img = gv.screencap()
     cv2.imwrite(f"{OUT}/revive_done.png", img)

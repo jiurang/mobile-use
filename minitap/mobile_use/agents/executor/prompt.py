@@ -77,6 +77,7 @@ Manager 建 agent 时决定（``sdk/agent.py:722``）。本模块只负责**按�
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from langchain_core.messages import (
     AnyMessage,
@@ -102,8 +103,13 @@ from minitap.mobile_use.utils.thoughts_compaction import split_sentences
 EXECUTOR_PROMPT_PATH = Path(__file__).parent / "executor.md"
 
 
-def _blocks(language: PromptLanguage):
+def _blocks(language: PromptLanguage) -> Any:
     """模板里的宏集合：``system_message`` + 各运行时消息块。
+
+    **返回 ``Any``**：Jinja 的 ``TemplateModule`` 把宏挂在实例 ``__dict__``
+    上（``context.get_exported()``），静态类型里根本没有这些属性名 ——
+    不标注就全是 ``reportAttributeAccessIssue``。宏名是否真的存在由
+    ``scripts/check_prompt_templates.py`` 在运行期校验，静态类型帮不上忙。
 
     **所有会进 prompt 的文案都住在 ``.md`` 里**，代码只负责挑数据：
     系统消息、目标、失败事实、设备状态、元素表表头、OCR 说明、反馈语。
@@ -238,6 +244,21 @@ def render_no_goal_message(*, language: PromptLanguage) -> str:
 def render_done_fallback(*, language: PromptLanguage) -> str:
     """``done`` 但没有 done_reason / agent_thought 时的收尾文案。"""
     return _blocks(language).done_fallback_message()
+
+
+def render_failed_fallback(*, language: PromptLanguage) -> str:
+    """``failed`` 但没有 failed_reason / agent_thought 时的收尾文案。"""
+    return _blocks(language).failed_fallback_message()
+
+
+def render_stall_notice(description: str, *, language: PromptLanguage) -> str:
+    """「没有进展」的提醒块。
+
+    ⚠️ **它是信息，不是限制** —— 这块只出现在「检测到重复」的那一轮，
+    不截断、不改结果、不替模型做决定（见 ``agents/executor/progress.py``）。
+    它告诉模型两件事：别重复刚才那个动作；做不成就用 ``failed`` 说出来。
+    """
+    return _blocks(language).stall_notice_message(description=description)
 
 
 def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
@@ -552,6 +573,7 @@ def build_executor_messages(
     local_messages: list[AnyMessage],
     device_state_lines: list[str],
     ocr_results: list | None = None,
+    stall_notice: str | None = None,
 ) -> list[BaseMessage]:
     """组装 Executor 每一轮的 prompt。
 
@@ -562,7 +584,8 @@ def build_executor_messages(
         [3] ...             局部历史（动作 + 工具反馈）—— 只追加
         [4] HumanMessage    失败事实清单（每轮变：会增长）
         [5] HumanMessage    设备状态（每轮变：前台 app 会变）
-        [6] HumanMessage    屏幕元素表（每轮变：重编号）—— **必须最后**
+        [6] HumanMessage    「没有进展」提醒（偶发：只在检测到重复的那一轮）
+        [7] HumanMessage    屏幕元素表（每轮变：重编号）—— **必须最后**
 
     ⚠️ **顺序 = 缓存命中率**。前缀缓存只覆盖从头开始的连续前缀：
     任何每轮变的内容排在局部历史**之前**，它之后的整段历史每轮都要满价重算。
@@ -627,6 +650,12 @@ def build_executor_messages(
 
     if device_state_lines:
         messages.append(HumanMessage(content="\n".join(device_state_lines)))
+
+    # 「没有进展」的提醒。放在这里（历史之后、元素表之前）——
+    # 它是**偶发**的（只在检测到重复的那一轮出现），但出现时每轮都变，
+    # 所以同样不能排在局部历史前面。
+    if stall_notice:
+        messages.append(HumanMessage(content=stall_notice))
 
     # 元素表：每轮都变，所以放最后。
     # 判据统一走 has_element_table —— 提示侧和工具侧必须用同一个判据。

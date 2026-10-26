@@ -40,6 +40,11 @@ MIN_TILE_Y = 430
 # 槽位栏（底部木架）
 SLOT_ROI = (60, 2180, 1180, 2470)
 
+# 暗牌识别的接受阈值。实测（scripts/probe_dark_tiles2.py，跨帧）：
+# 正确类型 top1 = 0.49~0.78，与第二名 gap = 0.127~0.432。
+# 取 0.45 收（比 min top1 略低一点，容错），gap 由调用方按需再卡。
+DARK_MIN_SCORE = 0.45
+
 # 卡底色范围（RGB）：浅米色
 CARD_BG_LO = (225, 212, 145)
 CARD_BG_HI = (255, 255, 228)
@@ -64,8 +69,84 @@ def tap(x: int, y: int) -> None:
 # --------------------------------------------------------------------------- 检测
 
 
-def detect_tiles(img: np.ndarray) -> list[dict]:
-    """找出所有「亮牌」（可点的牌）。返回按 (行, 列) 排序的列表。"""
+def normalize_dark_bg(crop: np.ndarray) -> np.ndarray:
+    """把暗牌的灰绿色卡底换成亮牌的浅米色。
+
+    为什么必须做这一步：暗牌（被压住的牌）渲染成**灰绿卡底 + 正常饱和度的图案**
+    （实测放大图 z_darkzoom.png：橙胡萝卜、绿青草、红柄银刃剪刀都看得清），
+    而模板是**浅米卡底**。卡底色不同会直接把 NCC 拖垮 —— 归一化之后，
+    暗牌识别率 8/8（对比：不归一化时只有 0.31~0.69 的勉强相关）。
+    """
+    out = crop.copy()
+    b, g, r = out[:, :, 0].astype(int), out[:, :, 1].astype(int), out[:, :, 2].astype(int)
+    bg = (np.abs(b - g) < 32) & (np.abs(g - r) < 32) & (r > 110) & (r < 200)
+    out[bg] = (209, 254, 246)  # BGR 浅米色
+    return out
+
+
+def detect_dark_tiles(
+    img: np.ndarray,
+    templates: dict[str, np.ndarray],
+    min_area: int = 5000,
+    min_side: int = 120,
+) -> list[dict]:
+    """找出**被压住的暗牌**（灰绿卡底），并识别它们的牌型。
+
+    牌堆几何（实测）：同一摞的牌 **x 相同、y 每层 +73px**（牌高 138，
+    每张只露出上半部分）。所以亮牌正下方 73px 处的暗牌，就是点开它之后
+    露出的那张 —— 这让「点开会不会配对」变成**可提前算出来**的事，
+    而不是盲探测。
+
+    min_area / min_side 可以调低，用来捞**被压得只剩一小块**的牌
+    （第二关棋盘中部有一批几乎被盖住的牌，默认阈值会整批漏掉）。
+    调低后必须靠标注图肉眼复核，否则会混进阴影。
+
+    返回的每项：bbox / kind / score / next_layer_hint 由调用方拼。
+    """
+    b, g, r = img[:, :, 0].astype(int), img[:, :, 1].astype(int), img[:, :, 2].astype(int)
+    gray = (np.abs(b - g) < 28) & (np.abs(g - r) < 28) & (r > 60) & (r < 175)
+    n, _labels, stats, _cent = cv2.connectedComponentsWithStats(gray.astype(np.uint8), 8)
+    out: list[dict] = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < min_area or not (min_side <= w <= 160) or not (min_side <= h <= 160):
+            continue
+        x0, y0 = max(0, x + 2), max(0, y + 2)
+        x1, y1 = min(img.shape[1], x + w - 2), min(img.shape[0], y + int(h * 0.86))
+        patch = img[y0:y1, x0:x1]
+        if patch.size == 0:
+            continue
+        norm = cv2.resize(normalize_dark_bg(patch), (64, 64), interpolation=cv2.INTER_AREA)
+        best_name, best_score = None, -1.0
+        for name, tpl in templates.items():
+            if tpl is None or tpl.shape != (64, 64, 3):
+                continue
+            s = float(cv2.matchTemplate(norm, tpl, cv2.TM_CCOEFF_NORMED)[0, 0])
+            if s > best_score:
+                best_name, best_score = name, s
+        out.append(
+            {
+                "x": int(x),
+                "y": int(y),
+                "w": int(w),
+                "h": int(h),
+                "area": int(area),
+                "cx": int(x + w / 2),
+                "cy": int(y + h / 2),
+                "kind": best_name if best_score >= DARK_MIN_SCORE else None,
+                "score": round(best_score, 3),
+            }
+        )
+    out.sort(key=lambda t: (t["y"], t["x"]))
+    return out
+
+
+def detect_tiles(img: np.ndarray, min_area: int = 4000, min_side: int = 50) -> list[dict]:
+    """找出所有「亮牌」（可点的牌）。返回按 (行, 列) 排序的列表。
+
+    亮牌靠「浅米卡底」判定，阴影不是这个颜色，所以 min_area 可以放心调低，
+    把「只露出一条边」的牌也捞回来（它们的卡底碎片面积只有一千多像素）。
+    """
     b, g, r = img[:, :, 0].astype(int), img[:, :, 1].astype(int), img[:, :, 2].astype(int)
     card = (
         (r >= CARD_BG_LO[0])
@@ -80,7 +161,7 @@ def detect_tiles(img: np.ndarray) -> list[dict]:
     tiles: list[dict] = []
     for i in range(1, n):
         x, y, w, h, area = stats[i]
-        if area < 4000 or w < 50 or h < 50:
+        if area < min_area or w < min_side or h < min_side:
             continue
         tiles.append(
             {
@@ -92,6 +173,25 @@ def detect_tiles(img: np.ndarray) -> list[dict]:
                 "cy": int(y + h / 2),
             }
         )
+    # 丢掉「完全落在另一个连通域框里」的小块 —— 牌面图标里的白色高光
+    # （蓝瓶上的标签之类）会形成独立连通域，被当成一张牌，
+    # 于是张数被高估，策略会把凑不出 3 张的死对点进槽位。
+    if len(tiles) > 1:
+        keep = []
+        for i, t in enumerate(tiles):
+            inside = False
+            for j, o in enumerate(tiles):
+                if i == j:
+                    continue
+                if (o["x"] <= t["x"] and t["x"] + t["w"] <= o["x"] + o["w"]
+                        and o["y"] <= t["y"] and t["y"] + t["h"] <= o["y"] + o["h"]
+                        and o["w"] * o["h"] > t["w"] * t["h"]):
+                    inside = True
+                    break
+            if not inside:
+                keep.append(t)
+        tiles = keep
+
     # 按行聚类（y 差 < 60 视为同一行），行内按 x 排序
     tiles.sort(key=lambda t: (t["y"], t["x"]))
     rows: list[list[dict]] = []
@@ -108,6 +208,64 @@ def detect_tiles(img: np.ndarray) -> list[dict]:
     for ri, row in enumerate(rows):
         for ci, t in enumerate(row):
             t["row"], t["col"] = ri, ci
+    return out
+
+
+SLOT_X0 = 69        # 第 1 格浅米卡底的左边缘
+SLOT_DX = 156       # 相邻槽位间距
+SLOT_N = 7          # 槽位格数
+SLOT_Y = 2214       # 卡面上边缘
+SLOT_W = 136
+SLOT_H = 137
+
+
+def read_slot(img: np.ndarray, templates: dict) -> list[dict]:
+    """按固定槽位逐格读槽位里的牌（比连通域可靠，见模块说明）。
+
+    返回每个占用格：x/y/w/h/cx/cy/kind/score。
+    """
+    out: list[dict] = []
+    b, g, r = img[:, :, 0].astype(int), img[:, :, 1].astype(int), img[:, :, 2].astype(int)
+    mint = (
+        (r >= CARD_BG_LO[0]) & (r <= CARD_BG_HI[0])
+        & (g >= CARD_BG_LO[1]) & (g <= CARD_BG_HI[1])
+        & (b >= CARD_BG_LO[2]) & (b <= CARD_BG_HI[2])
+    )
+    band = np.zeros(img.shape[:2], np.uint8)
+    y_lo = max(0, SLOT_Y - 120)
+    y_hi = min(img.shape[0], SLOT_Y + 180)
+    band[y_lo:y_hi, :] = mint[y_lo:y_hi, :]
+    n, _labels, stats, _c = cv2.connectedComponentsWithStats(band, 8)
+    comps = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < 400:
+            continue
+        comps.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": int(area)})
+
+    for i in range(SLOT_N):
+        x = SLOT_X0 + SLOT_DX * i
+        mine = [c for c in comps if x - 12 <= c["x"] + c["w"] / 2 <= x + SLOT_W + 12]
+        if not mine:
+            continue
+        bx0 = min(c["x"] for c in mine)
+        bx1 = max(c["x"] + c["w"] for c in mine)
+        by0 = min(c["y"] for c in mine)
+        by1 = max(c["y"] + c["h"] for c in mine)
+        # 和棋盘同口径裁剪：pad=2、去掉底部 14%（绿边）
+        crop = tile_crop(img, {"x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0})
+        if crop.size == 0:
+            continue
+        name, score = match_tile(crop, templates)
+        out.append(
+            {
+                "x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0,
+                "cx": (bx0 + bx1) // 2, "cy": (by0 + by1) // 2,
+                "kind": name if score >= 0.85 else None,
+                "score": round(score, 3),
+                "slot_index": i,
+            }
+        )
     return out
 
 
@@ -187,6 +345,11 @@ def match_tile(crop: np.ndarray, templates: dict[str, np.ndarray]) -> tuple[str 
         ncc = float(cv2.matchTemplate(crop, tpl, cv2.TM_CCOEFF_NORMED)[0, 0])
         hist_corr = float(cv2.compareHist(color_hist(tpl), ch, cv2.HISTCMP_CORREL))
         score = min(ncc, hist_corr)
+        # **半露的牌**：被上层压住一角时 NCC 会掉到 0.84 左右，但颜色分布
+        # 仍然是同一类（实测半露黄色滚筒 ncc=0.840 / hist≈1.0）。
+        # 这种要给个及格线，否则每次出现半露牌都要停下来补模板。
+        if hist_corr >= 0.93 and ncc >= 0.75:
+            score = max(score, 0.90)
         if score > best_score:
             best_name, best_score = name, score
     return best_name, best_score

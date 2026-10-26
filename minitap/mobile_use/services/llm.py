@@ -96,6 +96,14 @@ class ProviderOverride:
     #: （见 :func:`get_minimax_llm`）；能不能真关掉由 provider 自己判断。
     thinking: bool | None = None
 
+    #: 渠道下发的「思考强度」。None = 没下发 = 用服务端默认档位。
+    #:
+    #: 消费它的只有目录里 ``effort_style="reasoning_effort"`` 的渠道（DeepSeek）。
+    #: 能不能发、有哪些档位由渠道目录里的 ``effort_levels`` 决定；写错档位是
+    #: **显式报错**而不是静默回落 —— 静默回落的症状是「选了 low，花的还是 high
+    #: 的 token」，没有任何地方能看出来。
+    reasoning_effort: str | None = None
+
     def key_or(self, attr: str, required: bool = True) -> SecretStr | None:
         if self.strict:
             if not self.api_key:
@@ -370,6 +378,7 @@ def get_minitap_llm(
         api_key=effective_api_key,
         base_url=override.base_url,
         thinking=override.thinking,
+        reasoning_effort=override.reasoning_effort,
         strict=override.strict,
     )
 
@@ -1450,6 +1459,45 @@ def _resolve_thinking(
     return None, {}
 
 
+def _resolve_reasoning_effort(
+    spec: ChannelSpec,
+    thinking_value: bool | None,
+    requested: str | None,
+) -> str | None:
+    """把渠道下发的「思考强度」归一化成 ``reasoning_effort`` 的合法取值。
+
+    返回 ``None`` 表示**不发**这个字段（走服务端默认档位）。
+
+    为什么写错档位要报错而不是静默回落：DeepSeek 对不认识的取值要么 400、
+    要么按默认跑 —— 后者的症状是「选了低档，token 还是按高档烧」，没有任何
+    地方能看出来。所以这里把可选档位一并说出来。
+
+    ``thinking=False`` 时直接返回 ``None``：思考都关了，强度没有意义，发出去
+    只会让服务端看到一对矛盾参数。关思考请用 ``thinking``，不要用
+    ``reasoning_effort="none"``。
+    """
+    if spec.effort_style != "reasoning_effort":
+        return None
+    if thinking_value is False:
+        return None
+    if requested is None:
+        return None
+    value = str(requested).strip().lower()
+    if not value:
+        return None
+    if value in spec.effort_levels:
+        return value
+    hint = (
+        "；关掉思考请用 thinking=false，不是 reasoning_effort=none"
+        if value == "none"
+        else ""
+    )
+    raise ValueError(
+        f"渠道 {spec.id!r} 不支持 reasoning_effort={requested!r}；"
+        f"可选：{', '.join(spec.effort_levels)}{hint}"
+    )
+
+
 def build_openai_protocol_client(
     spec: ChannelSpec,
     model_name: str,
@@ -1504,6 +1552,8 @@ def build_openai_protocol_client(
     # ---- 请求体旋钮 ----
     thinking_value, thinking_body = _resolve_thinking(spec, model_name, override)
     extra_body: dict[str, Any] = dict(thinking_body)
+    # 思考强度：只有目录里声明了 ``reasoning_effort`` 的渠道才消费它。
+    reasoning_effort = _resolve_reasoning_effort(spec, thinking_value, override.reasoning_effort)
     if spec.effort_style == "output_config":
         # MiniMax 的思考深度档位。实测这个档位在本负载上不是个有效的旋钮
         # （low/medium/high/max 两列都非单调，max 反而最快）—— 但它决定花多少
@@ -1529,6 +1579,11 @@ def build_openai_protocol_client(
         # **kwargs 逐个参数校验，一堆误报。空的时候给 None（不发这个字段）。
         "extra_body": extra_body or None,
     }
+    if reasoning_effort is not None:
+        # 走 ChatOpenAI 自己的字段，而不是塞进 extra_body：langchain-openai 的
+        # ``_default_params`` 会把它放进 chat/completions 的请求体；塞进
+        # extra_body 反而会在它切到 Responses API 那条分支时变成另一套形状。
+        kwargs["reasoning_effort"] = reasoning_effort
     if spec.stream_usage:
         # 必须显式开：langchain-openai 只有在流式请求且 stream_usage=True 时
         # 才把 provider 报的 usage 转发回来。不开的话，**每一次 LLM 调用的
@@ -1626,6 +1681,8 @@ def get_llm(
         base_url=llm.base_url,
         # 渠道下发的「要不要思考」。None = 没下发 = provider 自己的默认。
         thinking=llm.thinking,
+        # 渠道下发的「思考强度」。None = 没下发 = 服务端默认档位。
+        reasoning_effort=llm.reasoning_effort,
         strict=not llm.allow_env_fallback,
     )
     # 温度同理:渠道给了就用渠道的,没给就用各 agent 调用点的硬编码值

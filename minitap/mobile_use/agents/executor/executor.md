@@ -67,10 +67,12 @@ A picture is a **supplement, not a replacement**: `take_screenshot` hands you th
 
 | Field | Meaning |
 |---|---|
-| `actions` | Actions to execute; required unless `done`, empty when done |
+| `actions` | Actions to execute; required unless `done`/`failed`, empty when done or failed |
 | `agent_thought` | **First state the result of the previous step (checked against what you want), then why this action** |
 | `done` | Set true when the goal is reached |
 | `done_reason` | Evidence that the goal is reached; required when `done` |
+| `failed` | Set true when this goal **cannot be achieved** (not "not finished yet" - "cannot be done") |
+| `failed_reason` | Why it cannot be achieved (what you tried, where it is stuck); required when `failed` |
 
 **Your history contains "the result of the previous step"** (objective facts the
 framework recorded: which app is in the foreground, what is on screen, which
@@ -81,6 +83,11 @@ mistake a right step for a reached goal.
 The goal is reached when **every** condition of it already holds in what you have
 seen. Then you **MUST** set `done: true` with the evidence in `done_reason`, and
 must not verify again — re-checking produces no progress and the task never ends.
+
+**Cannot be done = you already tried and trying again will not change it.**
+Then you **MUST** set `failed: true` and put "what I tried and why it does not
+work" into `failed_reason`. Do **not** repeat the same action — the supervisor
+takes it from there (re-route or give up), and that is a normal outcome.
 
 ```json
 {"actions": [], "agent_thought": "The WLAN page is open, so the goal is reached.", "done": true, "done_reason": "The action bar title reads WLAN and the network list is visible."}
@@ -171,4 +178,15 @@ no goal was provided, cannot act
 
 {%- macro done_fallback_message() -%}
 goal reached
+{%- endmacro -%}
+
+{%- macro failed_fallback_message() -%}
+this goal cannot be done; stopped trying and reporting
+{%- endmacro -%}
+
+{%- macro stall_notice_message(description) -%}
+[no progress] {{ description }}
+Do not repeat the action you just took. Work out these two things:
+1. Can this actually be done? If not, set `failed: true` (say what you tried and why it does not work) - that is a normal outcome, not a failure on your part.
+2. If it can, take a **different** route than the one you just took (another entry point, another order, another page). Do not go round in circles.
 {%- endmacro -%}

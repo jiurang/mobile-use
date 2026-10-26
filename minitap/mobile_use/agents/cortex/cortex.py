@@ -202,6 +202,10 @@ def render_executor_report(report: ExecutorReport | None) -> str:
         )
     if report.blocked_reason:
         lines.append(f"blocked reason: {report.blocked_reason}")
+    if report.failure_reason:
+        # 「做不到」的原因 —— **逐字**。这是「模型主动放弃」和「没做成」
+        # 在上层看来唯一的区别，不说清楚，监督者只能把同一个目标再下发一遍。
+        lines.append(f"failure reason: {report.failure_reason}")
     return "\n".join(lines)
 
 
@@ -702,6 +706,12 @@ class CortexNode:
             if report is None:
                 update[EXECUTOR_MESSAGES_KEY] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
             update["executor_steps"] = 0
+            # 上一次的「做不到」标记要清掉 —— 它是**本子目标内**的信号，
+            # 换目标之后它不成立（留着会让下一个子目标的汇报也判成 failed）。
+            update["executor_failed"] = False
+            # 进展指纹是「本子目标内」的，换目标就重新开始数
+            # （和 `executor_messages` 同一个生命周期）。
+            update["executor_progress"] = []
             # 没判完成就不该有提名：上一次尝试的提名（如果还没被 Orchestrator 消费）
             # 在这里作废，否则 Orchestrator 会验收一个 Cortex 没判完成的子目标。
             update["complete_subgoals_by_ids"] = []

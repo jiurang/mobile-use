@@ -36,7 +36,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from minitap.mobile_use.utils.app_names import APP_NAMES_ZH  # noqa: E402
 from minitap.mobile_use.utils.screen_fingerprint import parse_context  # noqa: E402
+
+#: 新 trace 的「前台应用」已经是**中文应用名**（见 utils/app_names.py）；
+#: 宏的前置条件要的是包名 ⇒ 认识的换回来，不认识的原样当包名用。
+_DISPLAY_NAME_TO_PACKAGE = {name: package for package, name in APP_NAMES_ZH.items()}
 
 RESOURCE_RE = re.compile(r"resource_id='([^']+)'")
 INDEX_COORD_RE = re.compile(r"index=(\d+)\s+coordinates \((\d+),\s*(\d+)\)")
@@ -233,7 +238,8 @@ def parse_focused_package(prompt: dict) -> str | None:
                 continue
             mm = FOCUS_PACKAGE_RE.search(b.get("text") or "")
             if mm:
-                return mm.group(1)
+                raw = mm.group(1)
+                return _DISPLAY_NAME_TO_PACKAGE.get(raw, raw)
     return None
 
 

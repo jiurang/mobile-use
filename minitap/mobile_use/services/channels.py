@@ -79,8 +79,11 @@ StructuredOutputStyle = Literal["tool", "json_schema"]
 #: 思考开/关要两档预算。
 MaxTokensPolicy = Literal["none", "llamacpp"]
 
-#: 「思考深度」参数的位置。MiniMax 的 ``output_config.effort``。
-EffortStyle = Literal["none", "output_config"]
+#: 「思考深度」参数的位置。
+#:
+#: * ``output_config`` —— MiniMax 的 ``output_config.effort``。
+#: * ``reasoning_effort`` —— DeepSeek（Chat Completions）的顶层 ``reasoning_effort``。
+EffortStyle = Literal["none", "output_config", "reasoning_effort"]
 
 #: OpenAI 兼容协议下的**客户端变体**。
 #:
@@ -176,6 +179,19 @@ class ChannelSpec:
     #: 思考深度参数的位置。
     effort_style: EffortStyle = "none"
 
+    #: 渠道支持哪些思考强度档位。空 = 这条渠道没有这个旋钮。
+    #:
+    #: 值来自官方 ``GET /models`` 的 ``effort.supported_levels``（顺序也照它）。
+    #: 它只用于**校验和界面选项**：真正决定发不发、发哪个的是渠道下发的
+    #: ``reasoning_effort``（见 ``services/llm.py`` 的 ``_resolve_reasoning_effort``）。
+    effort_levels: tuple[str, ...] = ()
+
+    #: 没指定强度时服务端用的默认档位（官方 ``effort.default_level``）。
+    #:
+    #: 只用于界面提示（「默认」到底是多少）；**不**表示我们会显式发它 ——
+    #: 没指定时我们什么都不发，把默认留给服务端，和 ``thinking`` 的语义一致。
+    effort_default: str | None = None
+
     #: 温度的合法区间。超了要钳（MiniMax 只收 0..1）。
     temperature_range: tuple[float, float] | None = None
 
@@ -262,6 +278,13 @@ CHANNELS: dict[str, ChannelSpec] = {
         thinking_style="thinking_type",
         thinking_default_on=True,
         thinking_env="DEEPSEEK_THINKING",
+        # 思考强度（Chat Completions 的顶层 ``reasoning_effort``）。
+        # 官方 GET /models（2026-10-26）两个模型都是 low/high/max、默认 high；
+        # 文档另外注明 low / medium 目前会映射为 high、xhigh 映射为 max ——
+        # 所以实际有区别的只有 high 与 max，界面要把这句说清楚。
+        effort_style="reasoning_effort",
+        effort_levels=("low", "high", "max"),
+        effort_default="high",
         # 和 MiMo 同属「思考感知」那一类（见 ClientKind）—— DeepSeek 只是
         # 「默认开思考」，MiMo 是「按需开启」，差别在 thinking_default_on 里。
         client_kind="thinking_aware",
@@ -582,9 +605,12 @@ def protocol_of(channel_id: str) -> LLMProtocol:
 def catalog_payload() -> list[dict[str, Any]]:
     """导出成给 manager 侧的 JSON 载荷。
 
-    只带**界面需要**的字段：选渠道、选模型、默认地址是什么、要不要密钥。
-    运行时旋钮（思考开关的形状、结构化输出策略）**不导出** —— 那是 mobile-use
-    自己发请求时用的知识，manager 侧用不到，导出只会多一份会过期的副本。
+    只带**界面需要**的字段：选渠道、选模型、默认地址是什么、要不要密钥，
+    以及「思考强度能选哪几档」。
+
+    思考开关的**请求体形状**、结构化输出策略这类运行时知识**不导出** ——
+    manager 侧用不到，导出只会多一份会过期的副本。但强度档位是表单要渲染的
+    选项，所以和模型列表一样属于「界面需要」的那部分。
     """
     return [
         {
@@ -596,6 +622,8 @@ def catalog_payload() -> list[dict[str, Any]]:
             "requiresApiKey": spec.requires_api_key,
             "supportsEndpoint": spec.supports_endpoint,
             "thinkingDefaultOn": spec.thinking_default_on,
+            "reasoningEffortLevels": list(spec.effort_levels),
+            "reasoningEffortDefault": spec.effort_default,
             "note": spec.note,
         }
         for spec in CHANNELS.values()

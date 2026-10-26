@@ -15,6 +15,7 @@ import httpx
 from adbutils import AdbClient
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
+from langgraph.errors import GraphRecursionError
 from PIL import Image
 from pydantic import BaseModel
 
@@ -41,6 +42,7 @@ from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.prompt_language import resolve_prompt_language
 from minitap.mobile_use.sdk.builders.agent_config_builder import get_default_agent_config
 from minitap.mobile_use.sdk.builders.task_request_builder import TaskRequestBuilder
+from minitap.mobile_use.sdk.budget import BudgetExhaustedError, build_budget_report
 from minitap.mobile_use.sdk.types.agent import AgentConfig, CloudDevicePlatform
 from minitap.mobile_use.sdk.types.exceptions import (
     AgentError,
@@ -126,7 +128,7 @@ FIXED_SUPER_STEPS = 32
 def compute_recursion_limit(max_steps: int) -> int:
     """把「最多跑多少个动作步」换算成 LangGraph 的 `recursion_limit`。
 
-    `max_steps` 的语义是**动作步数**（用户填「最多跑几步」），
+    `max_steps` 的名义语义是**动作步数**（用户填「最多跑几步」），
     `recursion_limit` 的语义是**图节点执行次数**。两者不是一回事。
 
     公式（系数 9 是实测值，见上面那段注释）：
@@ -134,6 +136,19 @@ def compute_recursion_limit(max_steps: int) -> int:
         recursion_limit = max_steps × 9 + 32
 
     负数按 0 算（`max_steps` 没有下界校验，这里兜住）。
+
+    ⚠️ **2026-10-26：名义与实际的差距要说清楚。**
+    系数 9 是**最坏情况**（每个子目标的固定开销摊到每一个动作步上）。
+    真实循环里**一个动作步 ≈ 4 个 super-step**
+    （contextor + executor + executor_tools + summarizer），
+    ⇒ 实际放行的动作步 ≈ ``(recursion_limit − 32 − 5S) / 4``，
+    也就是 N=80 时**约 176~188 个动作步**，是名义值的 2.3 倍。
+
+    真机实测（mobile-manager execution 880）：**186** 个动作步才撞上限 ——
+    正好落在这个区间。
+
+    ⇒ 这个值是**天花板**，不是配额：撞到了会**优雅收尾 + 上报**
+    （见 `sdk/budget.py`），不是崩。
     """
     return max(max_steps, 0) * SUPER_STEPS_PER_ACTION_STEP + FIXED_SUPER_STEPS
 
@@ -833,6 +848,43 @@ class Agent:
                     cancelled=True,
                 )
                 raise
+            except GraphRecursionError as e:
+                # ---- 预算耗尽 → **优雅收尾 + 上报**，不是崩溃 ----
+                #
+                # 撞 `recursion_limit` 不是「异常」，是**预算用完了**。
+                # 在这里它表现为一句谁也看不懂的话
+                # （"Recursion limit of 752 reached without hitting a stop
+                # condition"），**没有一句人话说清跑到哪了、完成了什么**。
+                #
+                # 真机实测（2026-10-26，mobile-manager execution 880）：
+                # 45 分钟 / 198 次调用 / 409 万 input token 之后崩掉，
+                # 而前 2 个子目标其实做成了。
+                #
+                # ⇒ 这里把最后的状态翻译成一份收尾报告：**做了哪些、停在哪、
+                # 还差什么**。任务仍然是「失败」（目标确实没达成 —— 不能说成
+                # 完成），但失败的原因现在是人话。
+                report = build_budget_report(
+                    last_state,
+                    max_steps=task.request.max_steps,
+                    recursion_limit=compute_recursion_limit(task.request.max_steps),
+                )
+                err = f"[{task_name}] 预算耗尽：\n{report}"
+                logger.warning(err)
+                await task.finalize(
+                    content=report,
+                    state=last_state_snapshot,
+                    error=err,
+                )
+                duration = (datetime.now(UTC) - task_start_time).total_seconds()
+                steps_count = count_action_steps(last_state)
+                telemetry.capture_task_completed(
+                    task_id=task_id,
+                    success=False,
+                    steps_count=steps_count,
+                    duration_seconds=duration,
+                )
+                telemetry.capture_exception(e, {"task_id": task_id, "phase": "budget_exhausted"})
+                raise BudgetExhaustedError(err, report=report) from e
             except Exception as e:
                 err = f"[{task_name}] Error running automation: {e}"
                 logger.error(err)

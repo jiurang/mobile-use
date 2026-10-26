@@ -142,6 +142,37 @@ class State(BaseModel):
         "Steps executed so far in the current subgoal (circuit breaker)",
     ] = 0
 
+    # Executor **明确放弃**了当前子目标（模型自己说「做不到」）。
+    #
+    # 为什么要有这个字段：`executor_done` 只有一个含义 ——「别再动了，收尾」，
+    # 它**不区分**「做成了」和「做不到」。而 Reporter 的 outcome 是**代码判定**的
+    # （`agents/executor/types.py::determine_outcome`），`done=True` 一律映射成
+    # ``completed`` ⇒ 「做不到」这个状态在契约里**不可表达**。
+    #
+    # 真机实测（2026-10-26，mobile-manager execution 880）：executor 在
+    # 「去头条刷热点领现金(0/1)」这一条上卡了 70 步、**从来没发过 done**，
+    # 于是图里没有出口、看门狗没被叫醒，最后撞 `recursion_limit` 崩掉。
+    #
+    # ⇒ 有这个字段，模型就能说「这条做不到」；outcome 判成 ``failed``，
+    # Cortex 换招或放弃，**而不是整个任务崩**。
+    executor_failed: Annotated[
+        bool,
+        "Executor explicitly gave up on the current subgoal (cannot be achieved)",
+    ] = False
+
+    # 本子目标内的**进展指纹**（每步一条），供「有没有在原地打转」的检测用。
+    #
+    # 一条 = ``{"action": <动作指纹>, "screen": <屏幕指纹>, "nudged": <bool>}``。
+    # 由 Executor 节点追加，Cortex 下发新目标时清空（和 ``executor_messages``
+    # 同一个生命周期：属于「本子目标内」）。
+    #
+    # ⚠️ 这里存的是**指纹**（哈希），不是原始内容 —— 它的唯一用途是
+    # 「和上一次比一比是不是同一屏/同一个动作」，不需要原文。
+    executor_progress: Annotated[
+        list[dict],
+        "Per-step progress fingerprints inside the current subgoal (loop detection)",
+    ] = []
+
     # 全任务累计的**动作步**数（跨子目标累加，换目标时**不**归零）。
     #
     # 为什么不能直接用 `executor_steps`：它是「本子目标内」的步数，Cortex 换目标时

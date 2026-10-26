@@ -1,31 +1,14 @@
 """Contextor：感知节点 —— 抓屏、判稳、建「屏幕元素表」。
 
-**它是索引契约的产地**
-----------------------
-模型报的 ``Target.index`` 要能还原成「它当时看到的那一行」—— 编号只在
-**那一次裁剪**上成立（执行时会重新 dump 再重新编号，编号可能已经不是同一个
-元素了）。
+它同时是索引契约的产地：模型报的 ``Target.index`` 只能在**本次裁剪**上还原，
+所以抓屏和建表必须发生在同一个节点里，中间不能插入任何动作。
 
-⇒ 所以「抓屏」和「建表」必须发生在**同一个节点**里：两者之间不可能有任何
-动作插进来，工具读到的就一定是模型看到的那一屏的表。
+``ctx.perception`` 的两条通道：``ui_hierarchy`` 关掉则不建表（工具侧走 legacy
+OCR 路径）；``ocr`` 关掉则 OCR 引擎根本不跑。截图不再进模型，只供 OCR 和坐标
+校验使用。
 
-两条通道，Manager 侧可开关（``ctx.perception``）
----------------------------------------------
-* ``ui_hierarchy`` —— UI 元素表。关掉 ⇒ 不建表 ⇒ 工具侧走 legacy OCR 路径。
-* ``ocr`` —— OCR 文字。关掉 ⇒ **OCR 引擎根本不跑**（不是「跑完再丢掉」：
-  真机实测 381~443ms/步，占整段感知的一大截，而结果被丢掉）。
-
-⚠️ **截图不再进模型**（图片通道 2026-10-23 下线）：抓屏本身照旧（OCR 与
-坐标校验都要用那一帧），但它不再作为多模态内容块发给 Executor。
-
-先判稳，再建表
---------------
-抓早了会拿到**过渡态**（实测：页面导航 49 → 91 → 91 → 228 个元素）。所以抓屏
-前先「等下限 + 确认稳定」—— 两次树级 dump 指纹相同才算定下来。
-
-⚠️ **「静 ≠ 全」**：懒加载的控件可能在静默期之后才挂上（实测 dump#1/dump#2
-内容一样但都不是完整的）。这一挡不住，是**已知代价**。验收看「步数」和
-「失败目标数」，不看「点错率」。
+⚠️ 先判稳再建表，但「静 ≠ 全」：懒加载控件可能在静默期之后才挂上，这是已知
+代价 —— 验收看「步数」和「失败目标数」。
 """
 
 import asyncio
@@ -49,6 +32,7 @@ from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_mes
 from minitap.mobile_use.services.ocr import get_ocr_engine
 from minitap.mobile_use.services.ocr.types import OcrEngine, OcrText
 from minitap.mobile_use.utils.app_launch_utils import launch_app_with_retries
+from minitap.mobile_use.utils.app_names import app_display_name, resolve_app_display_name
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.failed_targets import ActionFailureFact, describe_target
 from minitap.mobile_use.utils.logger import get_logger
@@ -71,32 +55,14 @@ logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 「上一步的结果」—— 把它写进执行器的局部历史（2026-10-24）
+# 「上一步的结果」—— 写进执行器的局部历史
 # ---------------------------------------------------------------------------
 #
-# 🔴 **为什么**（真机 execution 853，Redmi Turbo 4）
+# 执行器的局部历史里只有调用和工具回执，没有「结果」（屏长什么样、前台 app
+# 是谁）。实测它因此把 Home 按了 13 次，每次都以为会回到桌面。
 #
-# 执行器的局部历史里只有**调用**和**工具回执**：
-#
-#     assistant: ExecutorOutput(actions=[{"action":"press_key","key":"Home"}], ...)
-#     tool:      Key Home pressed successfully.
-#
-# **「结果」一个字都没有** —— 屏幕长什么样、前台 app 是谁，一概没记。
-# 执行器于是每轮只能拿当屏去和自己脑子里的几十条记忆比，靠「我刚才按了 Home，
-# 画面变了吗」这种**回忆**判断自己有没有在原地打转。
-#
-# 实测：它把 Home 按了 **13 次**，每一次都以为 Home 会回到桌面（因为历史里
-# 「按了 Home」后面跟的永远是「按成功了」，没有任何东西说「屏幕还是那个」）。
-#
-# ⚠️ **这里只陈述事实，不下结论。**
-# 「这个动作没用」是**相对于目标**的判断，框架做不了 ——
-# 「Home 把我送到看点流」和「滑动让我看到下一个视频」在框架眼里一模一样
-# （同一个 app、动作重复、屏在变）。只有模型知道「我要的是应用抽屉」。
-# ⇒ 框架只负责把**事实**搬进历史，判定留给模型（提示词那一侧配套要求
-# 「先说上一步的结果」）。
-#
-# ⇒ 也因此**不做「重复 N 次 ⇒ 你该换招了」这种提醒**：
-# 刷短视频时连滑 10 次是在正常浏览，提醒它「无效」就是误伤。
+# ⚠️ 只陈述事实，不下结论：「这个动作没用」「重复了就换招」都是相对目标的
+# 判断，框架做不了（刷短视频时连滑 10 次是正常浏览），判定留给模型。
 
 
 def render_action_result(
@@ -105,27 +71,21 @@ def render_action_result(
     previous_app: str | None,
     current_elements: list[ScreenElement] | None,
     current_app: str | None,
+    previous_app_name: str | None = None,
+    current_app_name: str | None = None,
     failure: ActionFailureFact | None = None,
     max_new_texts: int = 6,
 ) -> str | None:
-    """一句话描述「上一步那个动作之后，屏变成了什么样」。
+    """一句话描述「上一步的动作之后，屏变成了什么样」。
 
-    三样事实：
-      1. **动作本身失败了**（哪个目标失败）—— 只有动作真的失败时才有；
-      2. **前台 app** 变了没有、变成了谁；
-      3. **屏幕内容** 变了没有、**新出现了哪些文字**。
-
-    ⚠️ 不说「有没有进展」—— 那是相对目标的判断，框架不知道目标。
-    ⚠️ 不说「你重复了几次」—— 「重复」本身不是「无效」（刷短视频就是重复的）。
-    ⚠️ 不说「不要再用这个目标」—— 同理，**那是结论不是事实**。
-       ⇒ 整个框架都不下这种结论：Executor 那边的**跨子目标失败索引**
-       也一并改成了中性措辞（「这些目标在本任务里已经失败过：」）。
+    三样事实：动作是否失败（失败的是哪个目标）、前台 app 是否变化、屏幕内容
+    是否变化及新增了哪些文字。不说「有没有进展」「重复了几次」—— 那是相对
+    目标的结论，框架不知道目标。
 
     Returns:
-        渲染好的一行；没有可比的前一屏时返回 None（第一次抓屏没有「上一步」）。
+        没有可比的前一屏时返回 None。
     """
     if not previous_elements and previous_app is None:
-        # 没有前一屏 ⇒ 没有「上一步」可谈
         return None
 
     parts: list[str] = []
@@ -138,29 +98,25 @@ def render_action_result(
             target = describe_target(label=label, resource_id=resource_id)
             parts.append(f"{target} 这一步失败了")
         else:
-            # 目标只有索引 —— 而索引每轮重编号，不能写进去 ⇒ 只说「失败了」。
-            # ⚠️ 不拿 "(unknown target)" 当占位符塞给模型：那个词长得像个
-            # 元素名，模型会去找一个叫 "unknown target" 的东西。
+            # 目标只有索引，而索引每轮重编号 ⇒ 不写进去；也不拿
+            # "(unknown target)" 当占位符（模型会去找叫这个名字的元素）。
             parts.append("这一步失败了（没能认出是哪个目标）")
 
-    # ---- 1. 前台 app ----
+    # ---- 1. 前台 app：比较用包名（精确稳定），展示用应用名 ----
     if previous_app != current_app:
         if current_app:
-            parts.append(f"前台应用变成了 {current_app}")
+            parts.append(f"前台应用变成了 {current_app_name or app_display_name(current_app)}")
         else:
             parts.append("前台应用读不到了")
     elif current_app:
-        parts.append(f"前台应用没变（还是 {current_app}）")
+        parts.append(f"前台应用没变（还是 {current_app_name or app_display_name(current_app)}）")
 
-    # ---- 2. 屏幕内容 ----
+    # ---- 2. 屏幕内容：新文字取原文差集里的非噪音项（时钟/电量不算）----
     prev_fp = screen_fingerprint(previous_elements)
     cur_fp = screen_fingerprint(current_elements)
     prev_texts = set(visible_texts(previous_elements))
-    # 新出现的文字 = 原文差集里**非噪音**的那些（时钟/电量不算「新内容」）
     new_texts = [
-        t
-        for t in visible_texts(current_elements)
-        if t not in prev_texts and not is_noise_text(t)
+        t for t in visible_texts(current_elements) if t not in prev_texts and not is_noise_text(t)
     ]
     if prev_fp == cur_fp:
         parts.append("屏幕内容没变")
@@ -189,43 +145,14 @@ class ContextorNode:
     async def __call__(self, state: State) -> dict[str, Any]:
         device_controller = create_device_controller(self.ctx)
 
-        # ---- 屏幕沉降：等下限 + 确认这一屏已经定下来 ----
-        #
-        # 🔴 **2026-10-22 改：原来是「纯等 3 秒」，现在是「等 200ms + 确认稳定」。**
-        #
-        # 原来那个 3 秒的依据（「控件延迟挂载，抓早了拿到半成品」）经真机实测
-        # 拆成了两半：
-        #
-        # * **「防动画」那部分不需要外部下限** —— ``dump_hierarchy`` 自带
-        #   waitForIdle，屏幕还在动的时候它**自己会等**（实测滚动场景里
-        #   dump#0 耗时 609ms，那 609ms 就是它在等）。外部下限在做同一件事，
-        #   只是更粗、更贵。
-        # * **「懒加载」那部分外部下限也挡不住** —— 它挡的是「静默期内才挂上
-        #   的控件」，而那需要时间维度上的多次采样才能发现。
-        #
-        # 所以现在分两步：
-        #
-        # 1. **等下限**（``settle_delay_ms``，默认 200ms）—— 防「动作刚发出、
-        #    屏幕还没开始变」的竞态。
-        # 2. **确认稳定**（``_confirm_tree_stable``）—— 连续两次树级 dump 比
-        #    指纹，相同才算定下来了。**只 dump 树，不截图不跑 OCR**
-        #    （树级 dump 实测 150~250ms，整段 get_screen_data 要 600ms）。
-        #
-        # ⚠️ 「静 ≠ 全」：新页面的控件是懒加载的，实测 dump#1/dump#2 内容已经
-        # 一样（91 个元素）但 228 才是完整的 ⇒ 稳定确认**会漏判**这种情况。
-        # 这是已知代价，验收看「步数 / 失败目标数」，不看「点错率」。
+        # 屏幕沉降：先等下限（防「动作刚发出、屏还没开始变」的竞态），再确认
+        # 已经定下来。动画不用外部等 —— ``dump_hierarchy`` 自带 waitForIdle。
         await self._wait_for_settle(state)
 
-        # ---- 稳定性采样 ----
-        #
-        # * ``fingerprint``（默认，现行）：连续两次**全量树** dump 比指纹。
-        # * ``structural``：**只采一次**，这次采样当「结构基线」；真正的比对放在
-        #   建表那次 dump 之后（``get_screen_data`` 自带一次树 dump）⇒
-        #   常态 **2 次 dump**（现行 3~4 次）。
-        #
-        # 为什么要合并：现行路径把稳定性确认的采样**扔掉**，然后 ``get_screen_data``
-        # 又 dump 一次建表 —— 同一棵屏被抓两遍。视频页上更贵：全量指纹含 text，
-        # 点赞数每秒在跳 ⇒ 永远判不稳 ⇒ 3 次采样全跑满，最后还是「照用」。
+        # 稳定性采样：
+        # * ``fingerprint``（默认）：连续两次全量树 dump 比指纹。
+        # * ``structural``：只采一次当结构基线，真正的比对放在建表那次 dump
+        #   之后 ⇒ 常态省一次 dump，也避开视频页因点赞数跳动而永远判不稳。
         stability_sample: list[dict] | None = None
         if self._structural_mode():
             stability_sample = await device_controller.get_hierarchy_only()
@@ -236,13 +163,8 @@ class ContextorNode:
         else:
             await self._confirm_tree_stable(device_controller, state)
 
-        # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。
-        #
-        # ⚠️ **2026-10-22 改：OCR 通道关掉时，OCR 根本不跑。**
-        # 以前 `perception.ocr` 只管「跑完之后要不要给模型」，OCR 引擎照样
-        # 每步跑一遍 —— 真机实测 **381~443ms/步**，占整段感知的一大截，
-        # 而结果被丢掉。Manager 把通道关掉的意思是「这条链路不要了」，
-        # 不是「照跑但别给」。
+        # OCR 走 on_screenshot 回调，在 u2 采集线程里就地跑。通道关掉时 OCR
+        # 根本不跑（不是「跑完再丢掉」：实测 381~443ms/步，结果还是被丢掉）。
         ocr_enabled = self.ctx.perception.ocr
         if not ocr_enabled:
             logger.info("[contextor] OCR channel is OFF; skipping OCR entirely")
@@ -257,36 +179,21 @@ class ContextorNode:
             finally:
                 ocr_done = True
 
-        # ---- 屏幕是不是灭的 ----
-        #
-        # 息屏时 uiautomator **仍然**会返回元素 —— 2026-10-21 真机实测
-        # （Redmi Turbo 4 / Android 16）熄屏后拿到的是 **19 个 systemui 残留**
-        # （通知面板容器、状态栏、keyguard 容器……），截图才是全黑的。
-        #
-        # 「层级树为空 ⇒ 屏幕灭了」这个判据因此**永远不会触发** —— 它是被实测
-        # 证伪的，不是推断错的。唤醒功能等于没接上。所以这里改成**无条件**读
-        # 电源状态（`dumpsys power` 的 `mWakefulness`），那是系统的权威状态。
-        #
-        # 代价被并发吃掉了：`dumpsys power` 要 ~100ms，和抓屏**同时**跑，
-        # 这 100ms 就藏进了 dump 的等待窗口里（真机实测 698ms → 589ms，
-        # 8 轮元素数稳定，没有连接池被抽干）。
+        # 屏幕是不是灭的：息屏时 uiautomator 仍会返回 19 个 systemui 残留元素，
+        # 所以「树为空 ⇒ 灭屏」永远不触发。改为无条件读 `dumpsys power` 的
+        # mWakefulness（系统权威状态）。
         screen_state: str | None = None
         power_task: asyncio.Task[str] | None = None
         power_reader = getattr(device_controller, "get_screen_power_state", None)
         if power_reader is not None:
             power_task = asyncio.create_task(power_reader())
-        # 设备日期：**和抓屏并发**。原来它是抓屏之后的**串行** adb 往返
-        # （`device.shell("date")`，实测中位 88ms），全额计入关键路径。
-        # 改成 to_thread 之后它和 dump 的等待窗口重叠，净增 ≈ 0。
-        #
-        # ⚠️ 保留读**设备**时钟而不是用本机时钟：设备时区可能和 PC 不同，
-        # 那会让 prompt 里的 "Device date" 说错时间。（iOS 那条路本来就用
-        # 本机时钟，那是另一回事。）
+        # 电源状态和设备日期都和抓屏**并发**：它们只是 adb 往返（~100ms / 88ms），
+        # 叠进 dump 的等待窗口里就净增 ≈ 0。日期必须读**设备**时钟，设备时区
+        # 可能和 PC 不同，否则 prompt 里的 "Device date" 会说错。
         date_task = asyncio.create_task(asyncio.to_thread(get_device_date, self.ctx))
         if power_reader is not None:
-            # `create_task` 只是把协程排进日程表，**不会**立刻开跑 —— 要等当前
-            # 协程让出控制权。这一行显式让一次，电源状态 / 日期那两个 adb 调用
-            # 才会真正启动，然后和下面的抓屏重叠跑（否则就退化成串行 +100ms）。
+            # create_task 只是排进日程表，不会立刻开跑 —— 显式让出一次控制权，
+            # 否则两个 adb 调用退化成串行。
             await asyncio.sleep(0)
         device_date: str = ""
         try:
@@ -299,13 +206,12 @@ class ContextorNode:
                     # OCR 通道关着 ⇒ 不挂回调，控制器也就不跑 OCR 引擎。
                     device_data = await device_controller.get_screen_data()
             except TypeError:
-                # 自定义控制器没跟上新签名时不能整轮挂掉，退回原来的串行路径。
+                # 自定义控制器没跟上新签名时不能整轮挂掉，退回串行路径。
                 logger.warning("Controller does not support on_screenshot; using serial path")
                 device_data = await device_controller.get_screen_data()
         finally:
-            # 抓屏炸了也要把电源状态和日期收回来，不能留两个悬空的 task
-            # （悬空 task 会在事件循环关闭时报 "Task exception was never
-            # retrieved"，把真正的异常盖掉）。
+            # 抓屏炸了也要回收这两个 task，否则事件循环关闭时报
+            # "Task exception was never retrieved"，把真正的异常盖掉。
             if power_task is not None:
                 screen_state = await power_task
             device_date = await date_task
@@ -314,11 +220,10 @@ class ContextorNode:
             logger.warning("[contextor] Screen is OFF — agent will be told to wake it up.")
 
         if ocr_enabled and not ocr_done:
-            # 回调没被调用（平台不支持 / 提前抛错）——补跑一次。
+            # 回调没被调用（平台不支持 / 提前抛错）—— 补跑一次。
             ocr_box.append(await self._run_ocr(device_data.base64))
 
-        # 结构稳定性判定（``structural`` 模式）：基线 = 上面那次采样，
-        # 当前 = 建表用的这棵树（``get_screen_data`` 自带的那次 dump）。
+        # structural 模式：基线 = 上面那次采样，current = 建表用的这棵树。
         if stability_sample is not None:
             await self._verify_structural_stability(
                 device_controller=device_controller,
@@ -327,10 +232,7 @@ class ContextorNode:
                 current=cast(list[dict], device_data.elements),
             )
 
-        # 前台包名：**从刚抓回来的树里推**，不再单独跑一次
-        # `dumpsys window | grep mCurrentFocus`（那是 127ms 的串行 adb 往返，
-        # 实测省掉它整段感知快 40%）。详见
-        # `utils/screen_elements.foreground_package_from_tree`。
+        # 前台包名从刚抓回来的树里推，省掉一次串行的 `dumpsys window`（127ms）。
         current_app_package = foreground_package_from_tree(device_data.elements)
         agent_outcome: str | None = None
         if self.ctx.execution_setup and self.ctx.execution_setup.app_lock_status:
@@ -358,20 +260,11 @@ class ContextorNode:
 
         ocr_results = ocr_box[0] if ocr_box else None
 
-        # ---- 屏幕元素表：UI 层级树 + OCR 合成**一张**统一索引的表 ----
+        # 屏幕元素表：UI 层级树 + OCR 合成**一张**统一索引的表。表就是索引契约
+        # 本身，所以必须和抓屏在同一个节点里建（见模块 docstring）。
         #
-        # 为什么建在这里（以前在 cortex 里建）：这张表**就是索引契约**本身 ——
-        # 模型报的 `Target.index` 要还原成「它当时看到的那一行」，编号只在
-        # **那一次裁剪**上成立（屏可能已经变了，执行时重新 dump 再重新编号，
-        # 编号会和模型看到的不一致）。
-        #
-        # 所以建表必须和抓屏在**同一个节点**里做完：抓屏和建表之间不可能有
-        # 任何动作插进来，工具读到的就一定是模型看到的那一屏的表。
-
-        # `perception.ui_hierarchy` 是「要不要把层级树给模型看」的开关（不是抓不抓，
-        # 控制器照样把树返回来）。关掉时整条层级树通道都不走，表里也不会有 UI 行。
-        # 用 getattr 兜底：精简过的 perception 对象（测试替身）可能没这个字段，
-        # 缺省按 PerceptionConfig 的默认值 True（= 开）处理。
+        # `ui_hierarchy` 是「要不要把层级树给模型看」的开关，关掉则表里没有 UI 行。
+        # getattr 兜底：测试替身可能没这个字段，缺省按 PerceptionConfig 的默认值。
         use_ui_hierarchy = getattr(self.ctx.perception, "ui_hierarchy", True)
         tree_rows: list[dict[str, Any]] | None = None
         if use_ui_hierarchy and device_data.elements:
@@ -384,43 +277,35 @@ class ContextorNode:
                 ocr_results=(ocr_results if self.ctx.perception.ocr else None),
                 foreground_package=current_app_package,
             )
-        # tree_rows is None = 层级树形状不认识（iOS / 云设备）→ 建不出表，
-        # 元素表留空。工具侧会因此走 `latest_ocr_results` 的老路径
-        # （tools/utils.py:384-398），那边**不用改**。
+        # tree_rows 为 None = 层级树形状不认识（iOS / 云设备）→ 元素表留空，
+        # 工具侧改走 `latest_ocr_results` 的老路径，**不用改**。
         # 这里是「不猜」：猜错就是静默剥夺别的平台的感知能力。
 
-        # ---- 「上一步的结果」写进执行器的局部历史 ----
-        #
-        # 局部历史原来只有「调用 + 工具回执」，**没有结果**（见
-        # ``render_action_result`` 上面那段）。这里把客观事实补进去，
-        # 执行器下一轮就能读到「我刚才那一步之后，屏变成什么样」。
-        #
-        # ⚠️ 只有**已经执行过动作**才有「上一步」—— 第一次抓屏时不写。
-        # ⚠️ 这是 executor 的局部历史，跟着子目标走（Cortex 下发新目标时清空）。
-        # ⚠️ getattr 兜底：测试替身（精简过的 state）可能没这几个字段 ——
-        # 和上面 perception 那段同一个理由：不猜，直接当成「没有上一屏」。
-        #
-        # `last_action_failure` 是**工具层递过来的瞬时事实**（「上一步失败了、
-        # 目标是谁」）。并进这一行 ⇒ 失败事实落在**产生它的那一步旁边**，
-        # 模型读历史时不用跨块对账。
+        # 「上一步的结果」写进执行器的局部历史：只有动作执行过才有「上一步」，
+        # 第一次抓屏不写。`last_action_failure` 是工具层递过来的瞬时事实，
+        # 并进这一行 ⇒ 失败事实落在产生它的那一步旁边，模型不用跨块对账。
+        # getattr 兜底：测试替身（精简过的 state）可能没这几个字段。
         last_failure = getattr(state, "last_action_failure", None)
+        previous_app_package = getattr(state, "focused_app_info", None)
+        # 展示名：切 app 时才走一次 adb（进程内缓存），读不到退回内置表/包名。
+        current_app_name = await resolve_app_display_name(self.ctx, current_app_package)
+        previous_app_name = await resolve_app_display_name(self.ctx, previous_app_package)
         result_line = render_action_result(
             previous_elements=getattr(state, "latest_screen_elements", None),
-            previous_app=getattr(state, "focused_app_info", None),
+            previous_app=previous_app_package,
+            previous_app_name=previous_app_name,
             current_elements=screen_elements,
             current_app=current_app_package,
+            current_app_name=current_app_name,
             failure=last_failure,
         )
 
         update: dict[str, Any] = {
-            # 索引契约本身，**不能被清空**：工具要把 Target.index 还原成
-            # 当屏那一行的真实坐标，只有这一次裁剪的结果算数。
-            # 下一次 contextor 会整体覆盖它。
+            # 索引契约本身，不能被清空：工具靠它把 Target.index 还原成当屏坐标，
+            # 只有这一次裁剪算数。下一次 contextor 会整体覆盖它。
             "latest_screen_elements": screen_elements,
-            # 建完表就清空层级树：它没有索引契约，工具侧走
-            # controller.get_ui_elements() 现取即可。留着它会让工具侧
-            # 按 id / 文字查找的分支复活（tools/utils.py:178,197）——
-            # 那是行为变更，不在本次范围内。
+            # 层级树没有索引契约，建完表就清空。留着会让工具侧按 id / 文字查找
+            # 的分支复活 —— 那是行为变更。
             "latest_ui_hierarchy": None,
             "latest_ocr_results": ocr_results,
             "focused_app_info": current_app_package,
@@ -428,7 +313,7 @@ class ContextorNode:
             "device_date": device_date,
             "screen_state": screen_state,
             "agents_thoughts": [agent_outcome],
-            # 瞬时事实**用完即清**：不让上一条失败被下一轮重复并进。
+            # 瞬时事实用完即清，避免下一轮重复并进。
             "last_action_failure": None,
         }
         if result_line:
@@ -441,12 +326,9 @@ class ContextorNode:
         )
 
     async def _wait_for_settle(self, state: State) -> float:
-        """抓屏之前，等屏幕沉降到配置的下限。
+        """抓屏之前等屏幕沉降到配置的下限，返回实际等待的秒数。
 
-        返回实际等待的秒数（0 表示没等）。
-
-        ⚠️ **它现在只是「起步下限」，不再是完整的沉降保证。**
-        「这一屏定下来没有」由 :meth:`_confirm_tree_stable` 判。
+        它只是「起步下限」；「这一屏定下来没有」由 :meth:`_confirm_tree_stable` 判。
         """
         delay_ms = self.ctx.perception.settle_delay_ms
         if delay_ms <= 0 or state.last_action_at is None:
@@ -478,32 +360,12 @@ class ContextorNode:
     ) -> bool:
         """结构摘要判稳（video-safe）。
 
-        为什么视频页必须换判据
-        ----------------------
-        现行指纹含 ``text``。**视频页每秒都在变** —— 点赞数、倒计时、进度、
-        推荐流内容 ⇒ 指纹**永远不相等** ⇒ ``_confirm_tree_stable`` 每次都跑满
-        重试次数，最后还是「判定不稳，照用」：**三倍的 dump，换同一个结果**。
+        现行指纹含 text，视频页每秒都在变（点赞数、倒计时、进度）⇒ 永远判不稳，
+        跑满重试还是「照用」。新判据只比**可交互元素的身份 + 位置**，不看内容：
+        视频页判稳，弹窗 / 翻页 / 懒加载挂上则判不稳。
 
-        新判据只比「**可交互元素的身份 + 位置**」，**不看内容**。依据是本仓库
-        已经写下的结论（``tools/live_target.py``）：
-
-            OCR 的**内容会变**（点赞数在跳、时钟在走）
-            **位置比内容稳**
-
-        视频页上这套判据会怎么判
-        ----------------------
-        * 点赞数 / 倒计时在跳 → 那些 text 变了，但**身份+位置没变** → **判稳** ✓
-        * 视频画面在动 → 画面不是可交互元素 → 摘要不变 → **判稳** ✓
-        * 弹窗 / 翻页 → 可交互元素增删或位移 → 摘要变 → **判不稳** ✓
-          （要挡的正是这个 —— 过渡态的按钮位置还没最终确定）
-        * 懒加载控件挂上 → 可交互元素变多 → 摘要变 → **判不稳** → 补采一次 ✓
-
-        判不稳时为什么可以照用
-        --------------------
-        执行时是**按 resource-id 重新定位**的（``tools/live_target.py``）：元素
-        挪了位置也能点对；元素真没了，live_target 会给出精确失败原因（"不再在屏
-        上"而不是"指错了"），让模型重读屏幕。所以「位置没定下来」不是致命的，
-        致命的是「模型报了一个屏上根本没有的东西」—— 那和稳不稳无关。
+        判不稳也照用：执行时按 resource-id 重新定位，元素挪了位置也能点对；
+        真正的致命问题是「模型报了屏上根本没有的东西」，那和稳不稳无关。
         """
         changed = structural_change_count(baseline, current)
         if changed == 0:
@@ -538,36 +400,13 @@ class ContextorNode:
         return False
 
     async def _confirm_tree_stable(self, device_controller, state: State) -> bool:
-        """确认这一屏已经定下来 —— 连续两次树级 dump 的指纹相同。
+        """连续两次树级 dump 指纹相同，才算这一屏定下来了。
 
-        为什么要有这一步
-        ----------------
-        沉降下限从 3000ms 降到 200ms 之后，「抓早了」的风险回来了。实测
-        （Redmi Turbo 4 / Android 16）动作后立刻抓屏会拿到**过渡态**：
+        沉降下限降到 200ms 后，「抓早了」会拿到过渡态（页面导航实测
+        49 → 91 → 91 → 228 个元素），这一步把它挡掉。
 
-            页面导航（点进 WLAN）：49 → 91 → 91 → **228** 个元素
-            列表滚动：           292 → 267 → 240 → **239** 个元素
-            返回键：             **141**（一次就稳）
-
-        这一步就是**把「还在动」挡掉**：连续两次采样内容一样 ⇒ 屏定下来了。
-
-        代价（为什么说它便宜）
-        --------------------
-        * **只 dump 树**，不截图、不跑 OCR —— 树级 dump 实测 150~250ms，
-          整段 ``get_screen_data`` 要 600ms（截图 166 + PNG 编码 79 + OCR 381）。
-        * **不做无谓的重抓**：没动过屏的步骤（读笔记、等一下）**完全跳过**。
-        * 两次采样**连着发**，中间不额外等 —— ``dump_hierarchy`` 自带
-          waitForIdle，屏幕还在动的时候它自己会等。
-
-        什么时候做
-        ----------
-        **上一次动作动过屏**（``last_action_at`` 有值）才做。只读步骤不动屏，
-        屏早就是稳的，没必要多花两次 dump。
-
-        ⚠️ **已知误判面：「静 ≠ 全」**
-        懒加载的控件可能在静默期之后才挂上（实测 dump#1/dump#2 内容一样
-        但都不是完整的）。这一挡不住。**验收看「步数」和「失败目标数」**，
-        不看「点错率」。
+        代价很低：只 dump 树（150~250ms），不截图不跑 OCR；只读步骤完全跳过。
+        ⚠️ 已知误判面：「静 ≠ 全」，懒加载控件在静默期之后才挂上时挡不住。
         """
         max_retries = getattr(self.ctx.perception, "settle_max_retries", 0)
         if max_retries <= 0 or getattr(state, "last_action_at", None) is None:
@@ -577,7 +416,7 @@ class ContextorNode:
         for attempt in range(max_retries + 1):
             elements = await device_controller.get_hierarchy_only()
             if not elements:
-                # 拿不到树就当「没法确认」——保留现状，别在这里把流程卡住。
+                # 拿不到树就当「没法确认」—— 别在这里把流程卡住。
                 logger.warning("[contextor] Could not dump hierarchy for stability check")
                 return False
 
@@ -612,12 +451,10 @@ class ContextorNode:
         return get_ocr_engine(self.ctx)
 
     def _recognize_ocr(self, screenshot_base64: str) -> list[OcrText] | None:
-        """**同步**跑 OCR。只能在已经不在事件循环上的线程里调用。
+        """**同步**跑 OCR，只能在不跑事件循环的线程里调用。
 
-        复用 `get_screen_data()` 已经取到的**原分辨率**截图，不再单独截一次 ——
-        OCR 的框要精确到能当点击目标用，拿压缩过的图会把框算歪。
-
-        失败只降级不中断：OCR 是增强感知，层级树和截图还在。
+        复用 `get_screen_data()` 的原分辨率截图（压缩过的图会把框算歪）。
+        OCR 是增强感知，失败只降级不中断。
         """
         engine = self._resolve_ocr_engine(screenshot_base64)
         if engine is None:
@@ -701,8 +538,8 @@ class ContextorNode:
     ) -> ContextorOutput:
         """Invoke the LLM to decide whether to relaunch the locked app."""
 
-        # ⚠️ 取**最老**的 25 条（``[:25]``），而 planner 那边取的是**最新**的
-        # 25 条（``[-25:]``）。同名不同向 —— 别照抄 planner 那边的写法。
+        # ⚠️ 取**最老**的 25 条（``[:25]``），planner 那边取的是**最新**的
+        # 25 条（``[-25:]``）。同名不同向 —— 别照抄 planner 的写法。
         MAX_AGENTS_THOUGHTS = 25
 
         system_message = load_prompt_template(

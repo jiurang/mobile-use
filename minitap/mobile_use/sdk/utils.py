@@ -83,7 +83,7 @@ def _llm_entry(spec: Mapping[str, Any]) -> dict[str, Any]:
             f"请在 manager 的渠道配置里补上 API Key。"
         )
     entry: dict[str, Any] = {"provider": provider, "model": model}
-    for key in ("base_url", "api_key", "temperature", "thinking"):
+    for key in ("base_url", "api_key", "temperature", "thinking", "reasoning_effort"):
         value = spec.get(key)
         if value is not None:
             entry[key] = value
@@ -110,6 +110,7 @@ def llm_config_for_single_model(
     api_key: str | None = None,
     temperature: float | None = None,
     thinking: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> LLMConfig:
     """把「一条渠道」铺成一份完整的 LLMConfig —— 每个角色都用它。
 
@@ -131,6 +132,9 @@ def llm_config_for_single_model(
         thinking: 「要不要思考」。None 表示沿用该 provider 自己的默认。
             llama.cpp 和 minimax 消费它（MiniMax 那边只有 MiniMax-M3 真能关，
             M3.1 / M2.x 官方强制思考、关不掉）。
+        reasoning_effort: 「思考强度」。None 表示用服务端默认档位。
+            只有目录里声明了 ``reasoning_effort`` 的渠道（DeepSeek）消费它，
+            合法档位由渠道目录的 ``effort_levels`` 决定。
 
     Raises:
         ValueError: provider/model 缺失，或 provider 需要密钥而 api_key 为空。
@@ -143,6 +147,7 @@ def llm_config_for_single_model(
             "api_key": api_key,
             "temperature": temperature,
             "thinking": thinking,
+            "reasoning_effort": reasoning_effort,
         }
     )
 
