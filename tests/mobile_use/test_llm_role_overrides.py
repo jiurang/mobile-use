@@ -53,7 +53,7 @@ BASE = {
 
 
 def test_base_channel_still_covers_every_role():
-    """单渠道的语义一个字都没变：8 个角色全用基础渠道。"""
+    """单渠道的语义一个字都没变：10 个角色全用基础渠道。"""
     cfg = llm_config_for_role_overrides(BASE)
 
     nodes = [
@@ -62,12 +62,15 @@ def test_base_channel_still_covers_every_role():
         cfg.contextor,
         cfg.cortex,
         cfg.executor,
+        cfg.reporter,
+        cfg.vision,
         cfg.utils.outputter,
         cfg.utils.hopper,
         cfg.utils.video_analyzer,
     ]
-    assert len(nodes) == 8
+    assert len(nodes) == 10
     for node in nodes:
+        assert node is not None
         assert node.provider == "minimax"
         assert node.model == "MiniMax-M3.1-Flash-Preview"
         assert node.api_key is not None
@@ -95,6 +98,8 @@ def test_all_role_names_matches_the_config_shape():
 
     2026-10-21：新增 `reporter`（Executor 自主执行改造的汇报角色，
     见 doc/executor-autonomy-plan.md §2.1.1）。
+    2026-10-28：新增 `vision`（`Target.vision` 的视觉定位小调用）——
+    manager 下发渠道时要能单独指定它，否则 grounding 模型换不了。
     """
     assert set(ALL_ROLE_NAMES) == {
         "planner",
@@ -103,11 +108,12 @@ def test_all_role_names_matches_the_config_shape():
         "cortex",
         "executor",
         "reporter",
+        "vision",
         "outputter",
         "hopper",
         "video_analyzer",
     }
-    assert len(ALL_ROLE_NAMES) == 9
+    assert len(ALL_ROLE_NAMES) == 10
 
 
 # ---------------------------------------------------------------------------

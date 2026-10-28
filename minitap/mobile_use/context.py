@@ -119,7 +119,9 @@ class PerceptionConfig(BaseModel):
     字段全部清干净。
 
     ⇒ 感知只剩**两条文字通道**：UI 元素表 + OCR。
-    截图本身仍用于 **OCR** 与**坐标校验**（框架内部取数，不进消息）。
+    截图本身仍用于 **OCR** 与**坐标校验**（框架内部取数，不进消息）；
+    ``Target.vision`` 的按需视觉定位也走截图，但那是**一次独立的小调用**
+    （``services/vision.py``），图同样不进 Executor 的 prompt。
     """
 
     ui_hierarchy: bool = True

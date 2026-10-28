@@ -38,6 +38,7 @@ from minitap.mobile_use.agents.executor.prompt import (
     render_retry_nudge,
     render_stall_notice,
     render_step_limit_message,
+    render_vision_failure,
 )
 from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import MobileUseContext
@@ -48,6 +49,7 @@ from minitap.mobile_use.services.llm import (
     invoke_llm_with_timeout_message,
 )
 from minitap.mobile_use.services.telemetry import telemetry
+from minitap.mobile_use.services.vision import resolve_vision_targets
 from minitap.mobile_use.tools.index import (
     EXECUTOR_WRAPPERS_TOOLS,
     VIDEO_RECORDING_WRAPPERS,
@@ -233,6 +235,21 @@ class ExecutorNode:
                 "for one screen)"
             )
 
+        # 视觉定位：模型用 `target.vision` 描述一个两条文字通道都叫不出名字的
+        # 目标时，在这里把它解析成当屏坐标（一次截图 + 一次小视觉调用）。
+        #
+        # 失败就**不派发** —— 和 dispatcher 拒绝同一条出口：把具体原因回灌给模型，
+        # 让它改用 index 或换个描述。绝不能带着空的 target 去执行（那会点空）。
+        actions, vision_error = await resolve_vision_targets(self.ctx, actions)
+        if vision_error:
+            logger.info(f"[executor] Vision lookup failed: {vision_error}")
+            return await emit(
+                AIMessage(content=response.agent_thought or ""),
+                HumanMessage(
+                    content=render_vision_failure(vision_error, language=self.ctx.prompt_language)
+                ),
+            )
+
         decisions_json = json.dumps(actions, ensure_ascii=False)
         tool_calls, reject_reason = dispatch_decisions_with_reason(
             decisions=decisions_json,
@@ -404,5 +421,6 @@ class ExecutorNode:
             return None, f"the answer was not an {schema.__name__} object"
         return response, None
 
-    # 屏幕截图不进模型：只看 UI 元素表和 OCR，提示词与输出 schema 里都没有图。
-    # 截图本身仍用于 OCR 与坐标校验。
+    # 屏幕截图不进 Executor 的 prompt：它只有 UI 元素表和 OCR 两条文字通道。
+    # 截图本身仍用于 OCR、坐标校验，以及 `target.vision` 的按需视觉定位
+    # （services/vision.py：一次独立小调用，图不进本地历史，也不动前缀缓存）。

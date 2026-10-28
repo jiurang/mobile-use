@@ -197,6 +197,15 @@ def render_dispatch_rejection(reason: str, *, language: PromptLanguage) -> str:
     return _blocks(language).dispatch_rejection_message(reason=reason)
 
 
+def render_vision_failure(reason: str, *, language: PromptLanguage) -> str:
+    """视觉定位失败时的回灌（和 dispatch 拒绝同一条出口：不派发，模型重决定）。
+
+    它必须带上**具体原因**（看不见 / 模型不支持图片 / 息屏），否则模型只会把
+    同一句话原样再报一遍。
+    """
+    return _blocks(language).vision_failure_message(reason=reason)
+
+
 def render_retry_nudge(reason: str | None, *, language: PromptLanguage) -> str:
     """解析失败后重试一次时的提醒，必须带上具体的失败原因。"""
     return _blocks(language).retry_message(reason=reason)
@@ -483,6 +492,12 @@ def rewrite_history_tool_calls(messages: list[AnyMessage]) -> list[AnyMessage]:
                 "action": name,
                 **{k: v for k, v in args.items() if k != "agent_thought"},
             }
+            # 视觉目标：历史里**只留模型自己写的那句话**。`bounds` 是框架定位后
+            # 填进去的；留在历史里，模型会读成「我给过坐标、框架用的就是它」，
+            # 于是反复怀疑视觉没生效（真机实测 2026-10-28，连着 3 轮这么想）。
+            target = action.get("target")
+            if isinstance(target, dict) and target.get("vision"):
+                action["target"] = {"vision": target["vision"]}
             new_calls.append(
                 {
                     **call,

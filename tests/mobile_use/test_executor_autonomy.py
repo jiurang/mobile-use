@@ -146,9 +146,7 @@ def test_t12_screen_elements_come_after_local_history():
 
     history_idx = next(i for i, m in enumerate(msgs) if isinstance(m, ToolMessage))
     screen_idx = next(
-        i
-        for i, m in enumerate(msgs)
-        if isinstance(m, HumanMessage) and "Row 1" in str(m.content)
+        i for i, m in enumerate(msgs) if isinstance(m, HumanMessage) and "Row 1" in str(m.content)
     )
     assert screen_idx > history_idx, (
         f"元素表位置 {screen_idx} 必须在局部历史 {history_idx} 之后 —— "
@@ -346,8 +344,7 @@ def test_t7b_completed_wins_over_failures():
 def test_t7c_step_limit_wins_over_failures():
     """步数超限 → blocked（比 failed 更具体）。"""
     assert (
-        determine_outcome(done=False, failures=[{"key": "x"}], step_limit_reached=True)
-        == "blocked"
+        determine_outcome(done=False, failures=[{"key": "x"}], step_limit_reached=True) == "blocked"
     )
 
 
@@ -838,6 +835,35 @@ def test_reporter_falls_back_to_executor():
         utils=LLMConfigUtils(outputter=llm, hopper=llm),
     )
     assert cfg.get_agent("reporter") == cfg.get_agent("executor")
+
+
+def test_vision_falls_back_to_executor_and_can_be_overridden():
+    """vision 没单独配 → 回落 executor；配了就用它自己的。
+
+    两个方向都要锁：回落保证老 override（没有 vision 键）行为不变；
+    覆盖保证「换 grounding 更强的模型」这条配置真的生效。
+    """
+    from minitap.mobile_use.config import LLMConfig as Cfg
+
+    executor = LLMWithFallback(
+        provider="openai", model="gpt-5-nano", fallback=LLM(provider="openai", model="gpt-5-mini")
+    )
+    vision = LLMWithFallback(
+        provider="siliconflow",
+        model="Qwen/Qwen3-VL-32B-Instruct",
+        fallback=LLM(provider="siliconflow", model="Qwen/Qwen3-VL-8B-Instruct"),
+    )
+    common = dict(
+        planner=executor,
+        orchestrator=executor,
+        contextor=executor,
+        cortex=executor,
+        executor=executor,
+        utils=LLMConfigUtils(outputter=executor, hopper=executor),
+    )
+
+    assert Cfg(**common).get_agent("vision") == executor
+    assert Cfg(**common, vision=vision).get_agent("vision") == vision
 
 
 # ---------------------------------------------------------------------------
@@ -1691,6 +1717,7 @@ def test_t25c_rule_retry_budget_is_bounded_and_counted_from_the_thoughts():
 # ``reporter → orchestrator → convergence → replan → planner``。
 # **每一次真正走到 replan，就证明这条链是通的**；反过来「跑了很久却一次
 # replan 都没有」有两种可能（一次没失败过 / 看门狗断了），光看别的指标分不开。
+
 
 class _FakePlannerLLM:
     """只记录调用次数的假 planner LLM。"""

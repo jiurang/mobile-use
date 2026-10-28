@@ -266,6 +266,11 @@ AgentNode = Literal[
     "cortex",
     "executor",
     "reporter",
+    # 视觉定位（`Target.vision`）用的小调用。**不是决策 agent**：它只看一张截图、
+    # 回答一个框。单独成一个角色是为了能指向 grounding 更强的模型 —— 真机实测
+    # （2026-10-28）：同一个模型在「红色屋顶房子」上给对了框，在「纯黑色的照片」
+    # 上却高置信度地给错框，定位质量完全取决于模型。
+    "vision",
 ]
 AgentNodeWithFallback = AgentNode
 
@@ -426,6 +431,17 @@ class LLMConfig(BaseModel):
     # 全部变成 ValidationError（doc/executor-autonomy-plan.md 附录 A.1、审计发现 E6）。
     # None = 没单独配 → get_agent() 回落到 executor 的配置。
     reporter: LLMWithFallback | None = None
+    # 视觉定位模型。**可选**：None = 没单独配 → get_agent() 回落 executor，
+    # 行为与引入这个角色之前一字不差。
+    #
+    # 为什么必须能单独配：`Target.vision` 的框会跳过 IoU 校验，定位质量直接
+    # 决定点得对不对。真机实测（2026-10-28，MiniMax-M3.1）：带区分度的描述
+    # （红色屋顶房子）稳定给对框，模糊/带方位的描述（纯黑色的照片）会高置信度
+    # 地给错框。grounding 能力是模型属性 —— 想换更强的模型，只能靠这个角色。
+    #
+    # 也做成可选而不是必填：仓库里所有 `LLMConfig(...)` 构造点和老 override
+    # 文件都不带这个键，必填会把它们全部变成 ValidationError。
+    vision: LLMWithFallback | None = None
     utils: LLMConfigUtils
 
     def validate_providers(self):
@@ -437,6 +453,9 @@ class LLMConfig(BaseModel):
         # Reporter 没配就不校验：它走回落，用的是 executor 那条渠道的密钥。
         if self.reporter:
             self.reporter.validate_provider("Reporter")
+        # Vision 同理：没单独配就走回落，用的是 executor 的配置。
+        if self.vision:
+            self.vision.validate_provider("Vision")
         self.utils.outputter.validate_provider("Outputter")
         self.utils.hopper.validate_provider("Hopper")
         if self.utils.video_analyzer:
@@ -447,6 +466,9 @@ class LLMConfig(BaseModel):
         reporter = (
             self.reporter if self.reporter is not None else f"↩️ Executor fallback ({self.executor})"
         )
+        vision = (
+            self.vision if self.vision is not None else f"↩️ Executor fallback ({self.executor})"
+        )
         return f"""
 📃 Planner: {self.planner}
 🎯 Orchestrator: {self.orchestrator}
@@ -454,6 +476,7 @@ class LLMConfig(BaseModel):
 🧠 Cortex: {self.cortex}
 🛠️ Executor: {self.executor}
 📰 Reporter: {reporter}
+👁️ Vision: {vision}
 🧩 Utils:
     🔽 Hopper: {self.utils.hopper}
     📝 Outputter: {self.utils.outputter}
@@ -462,9 +485,10 @@ class LLMConfig(BaseModel):
 
     def get_agent(self, item: AgentNode) -> LLMWithFallback:
         value = getattr(self, item)
-        # Reporter 是唯一可选的角色（见上面 reporter 字段的注释）。
-        # 没单独配就回落 Executor —— 它只写摘要 + 挑证据，快模型就够
-        # （doc/executor-autonomy-plan.md §2.1.1、附录 A.1）。
+        # 可选角色（reporter / vision）：没单独配就回落 Executor。
+        # reporter 只写摘要 + 挑证据，快模型就够（doc/executor-autonomy-plan.md
+        # §2.1.1、附录 A.1）；vision 是「看一张截图、答一个框」的小调用，默认
+        # 与 executor 同档，想换 grounding 更强的模型时单独配。
         if value is None:
             return self.executor
         return value

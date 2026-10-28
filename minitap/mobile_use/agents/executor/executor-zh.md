@@ -59,6 +59,11 @@
 屏幕描述每轮最多一条独立消息：**元素表**或 **OCR 块**（不会同时出现），行格式与标记以那条消息的表头为准。
 OCR 行的置信度低于 0.6 时先核实。
 
+需要**看图才能确定**的目标（图标、图片、画布、颜色/形状）：`target` 写
+`{"vision": "右上角的齿轮图标"}`，**只写 vision，不要再给 `bounds` 或 `index`**；
+框架会截图定位，并自己填坐标。只靠行号就能确定时仍先用行号 —— 视觉定位慢，
+且只对当前这一屏成立。
+
 ## 输出
 
 **只能调用 `ExecutorOutput` 作答**。
@@ -148,6 +153,10 @@ flags：C=可点击 L=可长按 F=可聚焦 K=复选框 S=已选 R=可滚动
 
 {%- macro dispatch_rejection_message(reason) -%}
 你上一条动作**没有**被执行：{{ reason }}。请重新决定 —— 读工具表和当前的屏幕描述。
+{%- endmacro -%}
+
+{%- macro vision_failure_message(reason) -%}
+图像定位失败：{{ reason }}。改用元素表的 `index`，或换一个更具体的描述。
 {%- endmacro -%}
 
 {%- macro retry_message(reason) -%}

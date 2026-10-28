@@ -49,6 +49,11 @@
         "model": "gpt-5-mini"
       }
     },
+    // Vision **故意不写**：和 reporter 同一个理由 —— 底座上写死 openai 的话，
+    // 任何「按老模板抄、没写 vision」的 override 都会让 vision 独自留在 openai，
+    // validate_providers() 会直接索要 OPENAI_API_KEY。
+    // 不写 = 回落 executor（默认 preset 里本来就是 openai，行为一样）。
+    // 要换 grounding 更强的视觉模型，就在 override 里显式写一个 "vision" 对象。
     "utils": {
       "hopper": {
         // Needs at least a 256k context window.
@@ -131,6 +136,16 @@
         "model": "claude-sonnet-4-6"
       }
     },
+    // Vision：只做「看一张截图、答一个框」。Haiku 4.5 有视觉；grounding 要求
+    // 更高时换 Sonnet。
+    "vision": {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001",
+      "fallback": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6"
+      }
+    },
     "utils": {
       "hopper": {
         "provider": "anthropic",
@@ -203,6 +218,17 @@
         "fallback": {
           "provider": "minimax",
           "model": "MiniMax-M3.1-Flash-Preview"
+        }
+      },
+      // Vision：只做「看一张截图、答一个框」。真机实测（2026-10-28）M3.1 对
+      // 有区分度的描述稳定给对框，模糊描述会自信地给错框 —— 如果有 grounding
+      // 更强的渠道，把这个角色单独指过去。
+      "vision": {
+        "provider": "minimax",
+        "model": "MiniMax-M3.1-Flash-Preview",
+        "fallback": {
+          "provider": "minimax",
+          "model": "MiniMax-M3"
         }
       },
       "utils": {
@@ -282,6 +308,9 @@
         "model": "deepseek-flash"
       }
     },
+    // ⚠️ Vision **故意不写**：DeepSeek 这两个模型都是纯文本，看不了图。
+    // 不写 = 回落 executor ⇒ 视觉定位会如实返回「模型用不了」，模型退回 index，
+    // 不会点错。想启用视觉定位，把 vision 显式指到别的渠道（并补对应密钥）。
     "utils": {
       "hopper": {
         // Needs at least a 256k context window; both DeepSeek models do 1M.
@@ -378,6 +407,16 @@
         "model": "Qwen/Qwen2.5-72B-Instruct"
       }
     },
+    // Vision：只回答「目标在哪」，走 json_schema 结构化输出 ⇒ Qwen3-VL。
+    // （GLM-4.5V 不支持 json 模式，不适合这条路径；强制 tool_choice 也不行。）
+    "vision": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-32B-Instruct",
+      "fallback": {
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen3-VL-8B-Instruct"
+      }
+    },
     "utils": {
       // Hopper 的温度被调用点写死成 0（可复现），这里别去覆盖它。
       "hopper": {
@@ -451,6 +490,15 @@
       "fallback": {
         "provider": "minitap",
         "model": "meta-llama/llama-3.3-70b-instruct"
+      }
+    },
+    // Vision：坐标定位要 grounding 强的模型 —— Gemini 系列在这条路径上实测可用。
+    "vision": {
+      "provider": "minitap",
+      "model": "google/gemini-3-flash-preview",
+      "fallback": {
+        "provider": "minitap",
+        "model": "google/gemini-2.5-flash"
       }
     },
     "utils": {

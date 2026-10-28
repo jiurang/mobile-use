@@ -58,6 +58,12 @@ Origin `(0,0)` is the top-left corner: x grows right, y grows down; the bottom-r
 The screen description arrives as at most one separate message per turn: **element table** or **OCR block** (never both); row format and flags are in that message's header.
 For OCR rows, verify any confidence below 0.6 first.
 
+For targets that need a screenshot to identify them (icons, images, canvas, colors,
+shapes), write `{"vision": "the gear icon at the top right"}` in `target` - **only
+`vision`, no `bounds` or `index`**; the framework locates it on the current screen and
+fills in the coordinates itself. When a row `index` alone identifies the target,
+use it first - visual lookup is slower and only valid for the current screen.
+
 ## Output
 
 **Answer only by calling `ExecutorOutput`.**
@@ -159,6 +165,10 @@ Text on screen (OCR), one per line: [i] "text" (x,y,WxH) conf
 
 {%- macro dispatch_rejection_message(reason) -%}
 Your previous action was NOT executed: {{ reason }}. Decide again — read the Tools table and the current screen description.
+{%- endmacro -%}
+
+{%- macro vision_failure_message(reason) -%}
+Visual lookup failed: {{ reason }}. Use an element-table `index` instead, or describe the target differently.
 {%- endmacro -%}
 
 {%- macro retry_message(reason) -%}

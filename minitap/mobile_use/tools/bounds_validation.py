@@ -233,6 +233,12 @@ def coordinates_look_like_hierarchy_derived_from_elements(
     if not target.bounds:
         return True, None  # 没有坐标可校验，交由原有逻辑处理
 
+    if target.vision:
+        # 视觉定位框是**量出来的**（和 OCR 框同类），不是从截图目测的；
+        # 它本来就指向层级树里可能没有的东西（图标、图片、画布），
+        # 拿 IoU 去比等于把这条通道整个否掉。
+        return True, None
+
     if not elements:
         # 拿不到层级树时不能拒绝点击 —— 否则 dump 失败会变成全面不可用。
         return True, None

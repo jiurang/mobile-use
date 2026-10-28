@@ -111,6 +111,7 @@ def test_executor_templates_own_every_message_block():
         "screen_elements_message",
         "ocr_message",
         "dispatch_rejection_message",
+        "vision_failure_message",
         "retry_message",
         "extra_actions_message",
         "step_limit_message",

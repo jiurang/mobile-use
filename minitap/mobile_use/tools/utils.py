@@ -61,7 +61,9 @@ def target_key(target: Target) -> str:
     return make_key(
         index=target.index if target.index is not None else target.ocr_index,
         resource_id=target.resource_id,
-        label=target.text or None,
+        # 视觉目标没有文字 / id，用描述当身份 —— 否则键退化成 "unknown"，
+        # 「同一个 vision 目标连着失败」就判不出来（见 target_key 的文档）。
+        label=target.text or target.vision or None,
     )
 
 
@@ -70,7 +72,7 @@ def target_label(target: Target) -> str:
     return describe(
         target.index if target.index is not None else target.ocr_index,
         target.resource_id,
-        target.text,
+        target.text or target.vision,
     )
 
 
