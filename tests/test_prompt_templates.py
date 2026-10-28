@@ -51,9 +51,10 @@ def _render_executor_system(variables: dict[str, object], path: Path = _EXECUTOR
 def _perception(
     ui_hierarchy: bool = True,
     ocr: bool = True,
+    vision: bool = True,
 ):
     """感知开关的替身（和 `scripts/check_prompt_templates.py` 里的是同一个类）。"""
-    return _load()._Perception(ui_hierarchy, ocr)
+    return _load()._Perception(ui_hierarchy, ocr, vision)
 
 
 def test_prompt_templates_render():
@@ -106,12 +107,10 @@ def test_executor_templates_own_every_message_block():
     macros = (
         "system_message",
         "goal_message",
-        "failures_message",
         "device_state_message",
         "screen_elements_message",
-        "ocr_message",
         "dispatch_rejection_message",
-        "vision_failure_message",
+        "vision_subjects_message",
         "retry_message",
         "extra_actions_message",
         "step_limit_message",
@@ -175,7 +174,7 @@ def test_executor_prompt_keeps_element_targeting_contract():
 
     ⚠️ 2026-10-23：提示词由作者本人重写过（`## Element targeting` →
     `## Screen composition`，整段措辞被压缩）。所以这条断言的是**契约本身**
-    —— 行格式、1-based、`index` 与 `ocr_index` 两种寻址、失败目标不重复上报 ——
+    —— 行格式、1-based、`index` 寻址 ——
     而不是某一段标题或某一句措辞：标题和措辞还能再变，契约不能丢。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
@@ -184,11 +183,8 @@ def test_executor_prompt_keeps_element_targeting_contract():
     assert "id=" in text
     # 编号是 1-based（OCR 块行首的 `[i]`）
     assert "1-based" in text
-    # 两种寻址方式：元素表用 `index`，只有 OCR 块时用 `ocr_index`
+    # 唯一寻址方式：元素表（UI 行 + OCR 行）统一用 `index`
     assert "`index`" in text
-    assert "`ocr_index`" in text
-    # 失败的事实摆出来（措辞 2026-10-24 改成中性说法：只陈述事实、不下结论）
-    assert "Targets that already failed in this task" in text
 
 
 def test_executor_prompt_keeps_text_tools_table():
@@ -214,22 +210,22 @@ def test_executor_prompt_keeps_text_tools_table():
 
 
 def test_executor_prompt_keeps_perception_channels():
-    """感知通道不能丢：**两条通道**（UI 元素 + OCR）+ 设备状态（息屏）。
+    """感知通道不能丢：元素表（UI 行 + OCR 行）+ 设备状态（息屏）。
 
     2026-10-24：与 zh 版对齐后，system prompt 不再按开关分支渲染 ——
-    两条通道改成一句静态描述（元素表 / OCR 块），开关带来的差异由
-    **每轮消息块**自己说清：无元素表时 `ocr_message` 教 `ocr_index`，
+    两条通道改成一句静态描述，开关带来的差异由**每轮消息块**自己说清：
     两条通道全关时 `device_state_message` 明确告知「没有感知通道」。
+
+    2026-10-28：UI 行和 OCR 行已经是同一张元素表，不再有独立的 OCR 块。
 
     所以这里断言的是「通道信息没有丢」，而不是「必须在 system prompt 里分支」。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "## Perception" in text
-    # 两个文本通道：元素表 / OCR 块
+    # 同一张表里包含两种行
     assert "element table" in text
-    assert "OCR block" in text
+    assert "OCR text rows" in text
     # 开关带来的状态由运行时块承载
-    assert "`ocr_index`" in text
     assert "NO perception channel is available" in text
     # 息屏告知（真机教训：30 分钟息屏让任务从 30 步涨到 51 步）
     assert "Screen is OFF" in text
@@ -260,10 +256,10 @@ def test_executor_prompt_has_no_trace_of_the_picture_channel():
             "图片感知",
         ):
             assert marker not in text, f"{path.name} 里还有截图痕迹：{marker}"
-    # 两条**文字**通道还在
+    # 两条**文字**通道还在：元素表 / 视觉主体列表
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "element table" in text
-    assert "OCR block" in text
+    assert "visual-subjects" in text
 
 
 def test_executor_prompt_has_no_tool_json_schema():
@@ -339,22 +335,15 @@ def test_executor_prompt_tells_the_model_to_use_the_previous_result():
 
 
 def test_executor_prompt_keeps_the_anchor_rules():
-    """一次一个动作 / 失败事实摆出来 / 目标不变、做不到就如实说。
+    """一次一个动作 / 目标不变、做不到就如实说。
 
     2026-10-24：与 zh 版对齐后，规则不再单列一节：
-    - 「失败事实摆出来」由失败事实块承载；
-    - 「目标不变、做不到就如实说」写在开头的目标陈述里。
+    「目标不变、做不到就如实说」写在开头的目标陈述里。
 
-    ⚠️ 2026-10-24（再一次）：失败事实块的措辞改成**中性说法**了 ——
-    「不要再用它们，换一个不同的元素」被删掉，只留事实。
-    理由：框架只陈述事实、不下结论（`contextor.render_action_result` 的纪律），
-    「换不换目标」是相对于目标的判断，框架不知道目标 ⇒ 留给模型。
-    ⇒ 断言的是「事实清单还在」，不是某句指令。
+    2026-10-28：Executor 的失败事实块已移除。
     """
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
     assert "One action at a time" in text
-    assert "Targets that already failed in this task" in text
-    assert "do not reuse them" not in text
     assert "reach it, or report truthfully that you could not" in text
 
 

@@ -11,6 +11,7 @@ from minitap.mobile_use.controllers.types import (
 )
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.services.vision import resolve_vision_index
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.utils.failed_targets import (
     ActionFailureFact,
@@ -23,7 +24,11 @@ from minitap.mobile_use.utils.failed_targets import (
 )
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ocr_view import resolve_ocr_index
-from minitap.mobile_use.utils.screen_elements import ScreenElement, resolve_screen_index
+from minitap.mobile_use.utils.screen_elements import (
+    ScreenElement,
+    resolve_screen_index,
+    scan_cache_fingerprint,
+)
 from minitap.mobile_use.utils.ui_hierarchy import (
     ElementBounds,
     Point,
@@ -42,28 +47,37 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _identity_label(target: Target) -> str | None:
+    """目标的身份标签：优先用文字；纯视觉目标用 ``vision#[i]``。
+
+    视觉目标没有文字也没有 resource-id。给它一个稳定的身份，熔断账本才能
+    分清「同一个视觉目标连着失败」和「换了一个目标」。
+    """
+    if target.text:
+        return target.text
+    if target.vision_index is not None:
+        return f"vision#{target.vision_index}"
+    return None
+
+
 def target_key(target: Target) -> str:
     """给一个 target 算账本键：索引 + 元素身份。
 
-    ⚠️ **必须把 ``ocr_index`` 也算进去**（2026-10-21 补）。
-
-    没有统一元素表时（iOS / 云设备 / `perception.ui_hierarchy=False`），
-    模型只能填 ``Target.ocr_index`` —— 工具侧的 ``resolve_target`` 就是按它
-    索引 ``latest_ocr_results`` 的。
-
-    而如果这里只读 ``target.index``，那条路径下 ``index`` 恒为 None，
-    键会退化成 ``text=...`` 或 ``"unknown"``：
+    ⚠️ **把 ``ocr_index`` 也算进去**：它是历史字段，模型现在一律填 ``index``，
+    但回放 / 存量调用里可能只带 ``ocr_index``。只读 ``target.index`` 时，
+    这类输入的键会退化成 ``text=...`` 或 ``"unknown"``：
     * 熔断账本把「同一个 ocr_index 连着失败」判成「换了目标」→ 连续失败计数失效；
     * ``render_failure_facts`` 渲染成 ``[unknown] "点赞"`` → 模型看不到是第几行。
 
-    ⇒ 取 ``index or ocr_index``：两条路径下键都稳定。
+    ⇒ 取 ``index or ocr_index``：两种输入下键都稳定。
+
+    视觉目标（`vision_index`）没有文字 / id，用 ``vision#[i]`` 当身份 ——
+    否则键退化成 ``"unknown"``，「同一个视觉目标连着失败」就判不出来。
     """
     return make_key(
         index=target.index if target.index is not None else target.ocr_index,
         resource_id=target.resource_id,
-        # 视觉目标没有文字 / id，用描述当身份 —— 否则键退化成 "unknown"，
-        # 「同一个 vision 目标连着失败」就判不出来（见 target_key 的文档）。
-        label=target.text or target.vision or None,
+        label=_identity_label(target),
     )
 
 
@@ -72,7 +86,7 @@ def target_label(target: Target) -> str:
     return describe(
         target.index if target.index is not None else target.ocr_index,
         target.resource_id,
-        target.text or target.vision,
+        _identity_label(target),
     )
 
 
@@ -97,7 +111,7 @@ def record_target_failure(
         key=target_key(target),
         index=target.index,
         resource_id=target.resource_id,
-        label=target.text,
+        label=_identity_label(target),
         reason=reason,
     )
 
@@ -125,7 +139,7 @@ def record_target_failure_fact(
         key=target_key(target),
         index=target.index,
         resource_id=target.resource_id,
-        label=target.text,
+        label=_identity_label(target),
         reason=reason,
     )
 
@@ -400,10 +414,18 @@ def has_valid_selectors(target: Target) -> bool:
     has_coordinates = target.bounds is not None
     has_resource_id = target.resource_id is not None and target.resource_id != ""
     has_text = target.text is not None and target.text != ""
-    # index / ocr_index 单独就能定位：它们还原成一个带 bounds 的具体元素
+    # index / ocr_index / vision_index 单独就能定位：它们还原成一个带 bounds 的具体元素
     has_index = target.index is not None
     has_ocr_index = target.ocr_index is not None
-    return has_coordinates or has_resource_id or has_text or has_index or has_ocr_index
+    has_vision_index = target.vision_index is not None
+    return (
+        has_coordinates
+        or has_resource_id
+        or has_text
+        or has_index
+        or has_ocr_index
+        or has_vision_index
+    )
 
 
 def _apply_element(target: Target, element: ScreenElement) -> Target:
@@ -434,10 +456,10 @@ def resolve_target(state: State, target: Target) -> tuple[Target, str | None]:
 
     两条路径
     --------
-    1. **有屏幕元素表**（Android，层级树能归一化）：`index` 和 `ocr_index`
+    1. **有屏幕元素表**（所有平台，Contextor 统一建）：`index` 和 `ocr_index`
        都索引这张表，**同一个编号空间**。UI 行和 OCR 行都在里面。
-    2. **没有元素表**（iOS / 云设备，层级树形状不认识）：只有 `ocr_index`，
-       它索引 `latest_ocr_results`，这是改造前的行为，保持不变。
+    2. **没有元素表**（两条通道都关 / 这一屏没有任何可寻址行）：只有
+       `ocr_index`，它索引 `latest_ocr_results`，这是改造前的兼容路径。
     """
     elements = state.latest_screen_elements or []
 
@@ -476,7 +498,47 @@ def resolve_target(state: State, target: Target) -> tuple[Target, str | None]:
         # 连文本一起填上：工具回显时要用，模型才知道索引点到了什么。
         return target.model_copy(update={"bounds": ocr_hit.bounds, "text": ocr_hit.text}), None
 
+    if target.vision_index is not None:
+        return _resolve_vision_target(state, target)
+
     return target, None
+
+
+def _resolve_vision_target(state: State, target: Target) -> tuple[Target, str | None]:
+    """把 ``Target.vision_index`` 还原成扫描缓存里的那一行。
+
+    三条拒绝理由都必须**明确回给模型**，不能静默退化成「点别的地方」：
+
+    * 没有缓存：还没扫描过（或扫描失败），让它先调 ``scan_visual_subjects``；
+    * 指纹过期：扫描之后屏幕已经变了，旧编号可能指向别的东西；
+    * 越界：编号不在这次扫描的范围内。
+    """
+    elements = state.vision_elements or []
+    if not elements:
+        return target, (
+            f"vision_index={target.vision_index} cannot be used: there are no visual "
+            "subjects on this screen - call scan_visual_subjects first"
+        )
+
+    expected = state.vision_scan_fingerprint
+    current = scan_cache_fingerprint(state.latest_screen_elements, state.latest_ocr_results)
+    if expected and expected != current:
+        return target, (
+            "the visual-subject list is from a previous screen and is no longer valid - "
+            "call scan_visual_subjects again on the current screen"
+        )
+
+    element = resolve_vision_index(elements, target.vision_index)
+    if element is None:
+        return target, (
+            f"vision_index={target.vision_index} is out of range; the visual list had "
+            f"{len(elements)} item(s), valid range is 1..{len(elements)}"
+        )
+
+    return (
+        target.model_copy(update={"bounds": element.bounds, "text": element.label}),
+        None,
+    )
 
 
 class IdSelectorRequest(BaseModel):

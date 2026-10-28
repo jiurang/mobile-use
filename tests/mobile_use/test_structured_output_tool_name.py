@@ -758,12 +758,15 @@ def test_executor_prompt_does_not_promise_empty_actions_is_valid():
     ⚠️ 2026-10-24：措辞被压缩过（Output 表格里现在是「required unless `done`,
     empty when done」）。断言的是**契约**（空 actions 只在 done 时合法），
     不是原来那一句。
+
+    ⚠️ 2026-10-28：新增 `failed` 出口后，合法收尾变成 `done` 或 `failed`，
+    措辞同步成「required unless `done`/`failed`, empty when done or failed」。
     """
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
     assert "An empty `actions` is a valid answer" not in text
-    assert "required unless `done`, empty when done" in text
+    assert "required unless `done`/`failed`, empty when done or failed" in text
 
 
 def test_executor_prompt_says_executor_output_is_the_only_tool():

@@ -23,6 +23,7 @@ from minitap.mobile_use.tools.mobile.long_press_on import long_press_on_wrapper
 # )
 from minitap.mobile_use.tools.mobile.open_link import open_link_wrapper
 from minitap.mobile_use.tools.mobile.press_key import press_key_wrapper
+from minitap.mobile_use.tools.mobile.scan_visual_subjects import scan_visual_subjects_wrapper
 from minitap.mobile_use.tools.mobile.stop_app import stop_app_wrapper
 from minitap.mobile_use.tools.mobile.swipe import swipe_wrapper
 from minitap.mobile_use.tools.mobile.tap import tap_wrapper
@@ -73,9 +74,11 @@ EXECUTOR_WRAPPERS_TOOLS = [
     # 实现文件 `tools/mobile/take_screenshot.py` 一并删除，提示词里的工具表行、
     # 「图片感知」通道、`state.executor_screenshot` 字段全部清干净。
     #
-    # ⇒ 感知只剩两条**文字**通道：UI 元素表 + OCR。
-    #
     # 备份 / 恢复说明：`backup/20261027-remove-screenshot-tool/README.md`
+    #
+    # ⚠️ 2026-10-28 的 `scan_visual_subjects` **不是它的复活**：那个工具不接受
+    # 「看什么」的描述，只返回当屏全部视觉主体的编号表；图仍然不进 Executor 的
+    # prompt。它按 `ctx.perception.vision` 开关注册，见 `executor_wrappers()`。
     # Scratchpad tools for persistent memory
     # 🔴 2026-10-23 临时停用 —— 见本文件顶部的说明。恢复：解开下面三行注释。
     # save_note_wrapper,
@@ -92,6 +95,24 @@ VIDEO_RECORDING_WRAPPERS = [
     start_video_recording_wrapper,
     stop_video_recording_wrapper,
 ]
+
+#: 按需视觉扫描。**不放进 `EXECUTOR_WRAPPERS_TOOLS`**：它受
+#: `ctx.perception.vision` 开关控制，统一由 `executor_wrappers()` 拼装。
+VISION_WRAPPERS = [scan_visual_subjects_wrapper]
+
+
+def executor_wrappers(ctx: MobileUseContext) -> list[ToolWrapper]:
+    """Executor 这次能用的工具集合。
+
+    Executor 节点和它的 prompt 必须用**同一份**：工具表里写着、实际却调不到
+    （或反过来）会让模型反复报一个不存在的工具。
+    """
+    wrappers = list(EXECUTOR_WRAPPERS_TOOLS)
+    if ctx.video_recording_enabled:
+        wrappers.extend(VIDEO_RECORDING_WRAPPERS)
+    if ctx.perception.vision:
+        wrappers.extend(VISION_WRAPPERS)
+    return wrappers
 
 
 def get_tools_from_wrappers(

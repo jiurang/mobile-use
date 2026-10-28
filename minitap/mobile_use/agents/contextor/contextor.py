@@ -3,9 +3,10 @@
 它同时是索引契约的产地：模型报的 ``Target.index`` 只能在本次裁剪上还原，所以
 抓屏和建表必须发生在同一个节点里，中间不能插入任何动作。
 
-``ctx.perception`` 的两条通道：``ui_hierarchy`` 关掉则不建表（工具侧走 legacy
-OCR 路径）；``ocr`` 关掉则 OCR 引擎根本不跑。截图不再进模型，只供 OCR 和坐标
-校验使用。
+``ctx.perception`` 的两条常驻通道：``ui_hierarchy`` 关掉则表里没有 UI 行；
+``ocr`` 关掉则 OCR 引擎根本不跑。两条都关时才没有元素表。截图不再进模型，
+只供 OCR 和坐标校验使用。第三条「视觉主体」不在这里扫描 —— 它由 Executor 按需调用
+``scan_visual_subjects`` 触发；这里只负责在屏幕变化时把旧扫描缓存清掉。
 
 先判稳再建表，但「静 ≠ 全」：懒加载控件可能在静默期之后才挂上，这是已知代价，
 验收看「步数」和「失败目标数」。
@@ -41,6 +42,7 @@ from minitap.mobile_use.utils.screen_elements import (
     build_screen_elements,
     foreground_package_from_tree,
     is_noise_text,
+    scan_cache_fingerprint,
     screen_fingerprint,
     visible_texts,
 )
@@ -261,6 +263,9 @@ class ContextorNode:
         # 屏幕元素表：UI 层级树和 OCR 合成一张统一索引的表。表就是索引契约本身，
         # 所以必须和抓屏在同一个节点里建（见模块 docstring）。
         #
+        # 所有平台都建这一张表：层级树形状认识时表里是 UI 行 + OCR 行，形状不认识
+        # （iOS / 云设备）时只剩 OCR 行 —— 屏幕描述始终只有一种形态、一套 index。
+        #
         # `ui_hierarchy` 是「要不要把层级树给模型看」的开关，关掉则表里没有 UI 行。
         # getattr 兜底：测试替身可能没这个字段，缺省按 PerceptionConfig 的默认值。
         use_ui_hierarchy = getattr(self.ctx.perception, "ui_hierarchy", True)
@@ -268,16 +273,24 @@ class ContextorNode:
         if use_ui_hierarchy and device_data.elements:
             tree_rows = normalize_hierarchy(device_data.elements)
 
-        screen_elements: list[ScreenElement] = []
-        if tree_rows is not None:
-            screen_elements = build_screen_elements(
-                tree_rows=tree_rows,
-                ocr_results=(ocr_results if self.ctx.perception.ocr else None),
-                foreground_package=current_app_package,
-            )
-        # tree_rows 为 None 表示层级树形状不认识（iOS、云设备），元素表留空，
-        # 工具侧改走 `latest_ocr_results` 的老路径，不用改。这里不猜：猜错就是
-        # 静默剥夺别的平台的感知能力。
+        screen_elements = build_screen_elements(
+            tree_rows=tree_rows,
+            ocr_results=(ocr_results if self.ctx.perception.ocr else None),
+            foreground_package=current_app_package,
+        )
+
+        # 视觉扫描缓存：工具扫描时记下那一屏的元素表指纹。这里每步重建表，
+        # 指纹不一致就说明屏已经变了，旧编号绝不能再被 `vision_index` 使用。
+        # 保留时**原样保留整个列表**：编号、描述、框都来自同一次扫描，不能拆开。
+        previous_vision_elements = getattr(state, "vision_elements", None) or []
+        previous_vision_fp = getattr(state, "vision_scan_fingerprint", None)
+        current_fp = scan_cache_fingerprint(screen_elements, ocr_results)
+        if previous_vision_elements and previous_vision_fp == current_fp:
+            vision_elements = previous_vision_elements
+            vision_scan_fingerprint = previous_vision_fp
+        else:
+            vision_elements = []
+            vision_scan_fingerprint = None
 
         # 「上一步的结果」写进执行器的局部历史：只有动作执行过才有「上一步」，
         # 第一次抓屏不写。`last_action_failure` 是工具层递过来的瞬时事实，并进
@@ -302,6 +315,9 @@ class ContextorNode:
             # 索引契约本身，不能被清空：工具靠它把 Target.index 还原成当屏坐标，
             # 只有这一次裁剪算数。下一次 contextor 会整体覆盖它。
             "latest_screen_elements": screen_elements,
+            # 按需视觉扫描的缓存：扫描工具写，这里负责在屏变了时清掉。
+            "vision_elements": vision_elements,
+            "vision_scan_fingerprint": vision_scan_fingerprint,
             # 层级树没有索引契约，建完表就清空。留着会让工具侧按 id 或文字查找
             # 的分支复活，那是行为变更。
             "latest_ui_hierarchy": None,

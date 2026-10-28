@@ -332,22 +332,28 @@ class AgentConfigBuilder:
         """
         Configure which perception channels the Executor receives.
 
-        This is the **Manager-side control surface** for perception: two
+        This is the **Manager-side control surface** for perception: three
         independent switches, each one only removes that channel's information
-        and cost - the other one is unaffected.
+        and cost - the others are unaffected.
 
-        * ``ui_hierarchy`` - the screen element table. Off => no table, the
-          Executor addresses things by ``ocr_index`` instead.
+        * ``ui_hierarchy`` - the UI rows of the screen element table. Off => the
+          table keeps only OCR rows; the Executor still addresses things by
+          ``index``.
         * ``ocr`` - OCR text. Off => Contextor does not run OCR at all
-          (measured 381~443ms per step saved) and the Executor gets no OCR block.
+          (measured 381~443ms per step saved) and the table has no OCR rows.
+        * ``vision`` - the on-demand ``scan_visual_subjects`` tool. Off => the
+          tool is not offered to the Executor at all. On => the Executor can call
+          it when the text channels are not enough; it costs one screenshot and
+          one small vision call per call, and zero when unused.
 
-        Note: the screen image is **not** a channel any more (retired
-        2026-10-23). It never reaches the model - the prompt has no image
-        words and the output schema has no "ask for a picture" field.
+        Note: the screen image is **not** a channel (retired 2026-10-23). It
+        never reaches the model - the prompt has no image words and the output
+        schema has no "ask for a picture" field. ``scan_visual_subjects``
+        returns a numbered text list of visual subjects, not an image.
 
         Args:
-            perception: UI hierarchy / OCR switches, plus the OCR
-                engine configuration.
+            perception: UI hierarchy / OCR switches, the on-demand visual scan
+                switch, plus the OCR engine configuration.
 
         Example:
             >>> from minitap.mobile_use.context import PerceptionConfig

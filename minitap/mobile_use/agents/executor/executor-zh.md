@@ -33,6 +33,7 @@
 | `wait_for_delay` | `time_in_ms` | 等待整数毫秒 |
 | `back`、`erase_one_char` | *(无)* | — |
 | `wake_screen` | *(无)* | 点亮屏幕 |
+{% if perception.vision %}| `scan_visual_subjects` | *(无)* | 看一眼当前屏幕，把它能看到的**全部**视觉主体（图标、图片、画布、无文字控件）列出来并编号。文字通道不足以确认屏幕内容时就用它。 |{% endif %}
 | `start_video_recording` | *(无)* | 开始后台录屏：最长 3 分钟（Android）/ 15 分钟（iOS），不录音频；一直录到调用 `stop_video_recording` |
 | `stop_video_recording` | 可选 `prompt` | 停止录制，然后分析视频；`prompt` 说明要提取什么（例如「每 10 秒发生了什么」） |
 
@@ -56,13 +57,15 @@
 
 ## 感知
 
-屏幕描述每轮最多一条独立消息：**元素表**或 **OCR 块**（不会同时出现），行格式与标记以那条消息的表头为准。
+你的屏幕描述**只有文字**：一块**元素表**（UI 行和 OCR 文本行合并、共用一套编号），
+外加视觉扫描生效时的一块**视觉主体编号表**。行格式与标记以各自消息的表头为准。
 OCR 行的置信度低于 0.6 时先核实。
 
-需要**看图才能确定**的目标（图标、图片、画布、颜色/形状）：`target` 写
-`{"vision": "右上角的齿轮图标"}`，**只写 vision，不要再给 `bounds` 或 `index`**；
-框架会截图定位，并自己填坐标。只靠行号就能确定时仍先用行号 —— 视觉定位慢，
-且只对当前这一屏成立。
+{% if perception.vision %}
+元素表（含 OCR 行）看不到图标、图片、画布和无文字控件，也看不见**选中/高亮状态、遮挡与浮层、控件之间的布局关系**。**同一动作反复无效时，用视觉判断**：下一步必须调用 `scan_visual_subjects`，下一轮用 `target: {"vision_index": <i>}` 选它列出的主体。
+
+元素表里已有 `index` 的对象，**第一次尝试**可以直接用；但如果这次动作没有产生预期变化，下一步必须先 `scan_visual_subjects`，不能继续换 index 或坐标硬点。视觉编号只对当前屏有效，屏幕变了就重扫，也不能和 `index`、`bounds` 混用。
+{% endif %}
 
 ## 输出
 
@@ -90,32 +93,22 @@ OCR 行的置信度低于 0.6 时先核实。
 ```json
 {"actions": [], "agent_thought": "WLAN 页面已打开，所以目标达成。", "done": true, "done_reason": "操作栏标题是 WLAN，且网络列表可见。"}
 ```
+
 {%- endmacro -%}
 
-{#- ==========================================================================
-    运行时消息块（**不进** system prompt）
-
-    上面的正文渲染成系统消息；下面的宏由 prompt.py / executor.py 各自单独渲染
-    成一条消息，按固定顺序追加（顺序见 prompt.build_executor_messages）：
-
-        目标 → 局部历史 → 失败事实 → 设备状态 → 屏幕元素表 / OCR 块
-
-    反馈类宏（拒绝 / 重试 / 多余动作 / 收尾）只在需要的那一轮追加。
-
-    ⚠️ 每轮会变的块一律排在局部历史之后 —— 前缀缓存只认从头开始的连续前缀。
-    ========================================================================== -#}
-
 {%- macro goal_message(goal) -%}
+
+## 目标
+
 你的目标：
 {{ goal }}
 {%- endmacro -%}
 
 {%- macro task_started_message(task_started_at) -%}
-任务开始时间：{{ task_started_at }}
-{%- endmacro -%}
 
-{%- macro failures_message(failures) -%}
-这些目标在本任务里已经失败过：{% for fact in failures %}{{ fact.desc }} ({{ fact.reason[:80] }}){% if not loop.last %}; {% endif %}{% endfor %}
+## 任务
+
+任务开始时间：{{ task_started_at }}
 {%- endmacro -%}
 
 {%- macro device_state_message(device_date=None, focused_app_info=None, screen_off=False, no_perception=False) -%}
@@ -123,69 +116,96 @@ OCR 行的置信度低于 0.6 时先核实。
 {%- if device_date %}{% set lines = lines + ["设备日期：" ~ device_date] %}{% endif -%}
 {%- if focused_app_info %}{% set lines = lines + ["前台应用：" ~ focused_app_info] %}{% endif -%}
 {%- if screen_off %}{% set lines = lines + ["屏幕是关的（设备已息屏）。元素表里只剩 systemui 残留，没有可操作的东西。先调用 wake_screen，下一轮再重新读屏。"] %}{% endif -%}
-{%- if no_perception %}{% set lines = lines + ["没有任何感知通道可用：UI 元素表和 OCR 文本都关着。你完全看不到屏幕描述 —— 不要凭空想象屏幕上有什么。在 agent_thought 里如实说明：没有屏幕描述就无法行动。"] %}{% endif -%}
+{%- if no_perception %}{% set lines = lines + ["没有任何感知通道可用：UI 元素表、OCR 文本和视觉扫描都关着。你完全看不到屏幕描述 —— 不要凭空想象屏幕上有什么。在 agent_thought 里如实说明：没有屏幕描述就无法行动。"] %}{% endif -%}
+{%- if lines -%}
+
+## 设备状态
+
 {{ lines | join("\n") }}
+{%- endif -%}
 {%- endmacro -%}
 
 {%- macro screen_elements_message(rows) -%}
+
+## UI和OCR感知
+
 屏幕元素，每行一条：[i] "text" | id=<id 尾段> | Class | (x,y,WxH) | flags
 flags：C=可点击 L=可长按 F=可聚焦 K=复选框 S=已选 R=可滚动
+`[i]` 是 1-based，原样填进 `target.index`。
 所有行共用一个编号。没有 id= 的行是 OCR 文本。id= 是 resource-id 的尾段（省略包名），
 只在文字缺失或重复时给出。
 {{ rows }}
 {%- endmacro -%}
 
-{%- macro ocr_message(rows) -%}
-本屏没有屏幕元素表：设备没报上来（或者 UI 元素通道关着），所以下面的 OCR 块就是整屏的描述。
-
-用 **`ocr_index`** 寻址那些行 —— OCR 块行首的 `[i]`，1-based，原样照填。
-这里**不要**用 `index`：没有表就没有行可指，每个 `index` 目标都会失败并报：
-"index=N is not a row in the screen element table (no table)"。
-
-```json
-{"action": "tap", "target": {"ocr_index": 3}}
-```
-
-屏幕文本（OCR），每行一条：[i] "text" (x,y,WxH) conf
-
-{{ rows }}
-{%- endmacro -%}
-
 {%- macro dispatch_rejection_message(reason) -%}
+
+## 反馈
+
 你上一条动作**没有**被执行：{{ reason }}。请重新决定 —— 读工具表和当前的屏幕描述。
 {%- endmacro -%}
 
-{%- macro vision_failure_message(reason) -%}
-图像定位失败：{{ reason }}。改用元素表的 `index`，或换一个更具体的描述。
+{%- macro vision_subjects_message(rows) -%}
+
+## 感知
+
+当前屏幕的视觉主体（图标 / 图片 / 画布 / 无文字控件），每行一条：[i] "描述" (x,y,WxH)
+
+这张表来自你上一次 `scan_visual_subjects` 调用，只对当前这一屏有效。要操作其中
+一项，`target` 写 `{"vision_index": i}` —— 不要自己给 bounds。动作之前屏幕变了，
+就重新扫描。
+{{ rows }}
 {%- endmacro -%}
 
 {%- macro retry_message(reason) -%}
+
+## 反馈
+
 你上一条回答无法使用：{{ reason }}。你必须调用 ExecutorOutput，按 `## 输出` 里的字段作答；纯文本回答会被丢弃。
 {%- endmacro -%}
 
 {%- macro extra_actions_message(count) -%}
+
+## 反馈
+
 你的 {{ count }} 个动作里只有第一个被执行了，其余的被丢弃，下一轮必须重新决定。
 {%- endmacro -%}
 
 {%- macro step_limit_message(limit) -%}
+
+## 收尾
+
 已达到 {{ limit }} 步上限；停止并上报。
 {%- endmacro -%}
 
 {%- macro no_goal_message() -%}
+
+## 收尾
+
 没有提供目标，无法行动。
 {%- endmacro -%}
 
 {%- macro done_fallback_message() -%}
+
+## 收尾
+
 目标已达成。
 {%- endmacro -%}
 
 {%- macro failed_fallback_message() -%}
+
+## 收尾
+
 这个目标做不到，已停止尝试并上报。
 {%- endmacro -%}
 
 {%- macro stall_notice_message(description) -%}
+
+## 反馈
+
 [没有进展] {{ description }}
 先别重复刚才那个动作。想清楚下面两件事：
 1. 这一条到底能不能做成？不能做就 `failed: true`（写清试过什么、为什么不行）—— 这是正常流程。
 2. 能做的话，换一条**和刚才不同**的路走（换入口、换顺序、换页面），别原地再来一遍。
+
+如果你还在同一个目标或同一块区域上打转，先调用 `scan_visual_subjects` 看一眼当前屏幕，再决定换哪条路。换一个 index 不算换路。
 {%- endmacro -%}

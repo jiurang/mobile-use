@@ -38,7 +38,6 @@ from minitap.mobile_use.agents.executor.prompt import (
     render_retry_nudge,
     render_stall_notice,
     render_step_limit_message,
-    render_vision_failure,
 )
 from minitap.mobile_use.agents.executor.types import ExecutorOutput
 from minitap.mobile_use.context import MobileUseContext
@@ -49,12 +48,7 @@ from minitap.mobile_use.services.llm import (
     invoke_llm_with_timeout_message,
 )
 from minitap.mobile_use.services.telemetry import telemetry
-from minitap.mobile_use.services.vision import resolve_vision_targets
-from minitap.mobile_use.tools.index import (
-    EXECUTOR_WRAPPERS_TOOLS,
-    VIDEO_RECORDING_WRAPPERS,
-    get_tools_from_wrappers,
-)
+from minitap.mobile_use.tools.index import executor_wrappers, get_tools_from_wrappers
 from minitap.mobile_use.utils.app_names import resolve_app_display_name
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
@@ -123,9 +117,7 @@ class ExecutorNode:
                 agent="executor",
             )
 
-        wrappers = list(EXECUTOR_WRAPPERS_TOOLS)
-        if self.ctx.video_recording_enabled:
-            wrappers.extend(VIDEO_RECORDING_WRAPPERS)
+        wrappers = executor_wrappers(self.ctx)
         tools = get_tools_from_wrappers(self.ctx, wrappers)
 
         # 全任务累计动作步数：本节点每跑一轮 +1。
@@ -235,21 +227,9 @@ class ExecutorNode:
                 "for one screen)"
             )
 
-        # 视觉定位：模型用 `target.vision` 描述一个两条文字通道都叫不出名字的
-        # 目标时，在这里把它解析成当屏坐标（一次截图 + 一次小视觉调用）。
-        #
-        # 失败就**不派发** —— 和 dispatcher 拒绝同一条出口：把具体原因回灌给模型，
-        # 让它改用 index 或换个描述。绝不能带着空的 target 去执行（那会点空）。
-        actions, vision_error = await resolve_vision_targets(self.ctx, actions)
-        if vision_error:
-            logger.info(f"[executor] Vision lookup failed: {vision_error}")
-            return await emit(
-                AIMessage(content=response.agent_thought or ""),
-                HumanMessage(
-                    content=render_vision_failure(vision_error, language=self.ctx.prompt_language)
-                ),
-            )
-
+        # 视觉主体：模型自己调用 `scan_visual_subjects` 之后，结果会缓存进
+        # state，下一轮由 prompt 作为一块表重发给它。这里不做任何派发前解析 ——
+        # Executor 只按 `vision_index` 选，定位由 vision 在扫描时完成。
         decisions_json = json.dumps(actions, ensure_ascii=False)
         tool_calls, reject_reason = dispatch_decisions_with_reason(
             decisions=decisions_json,
@@ -323,7 +303,11 @@ class ExecutorNode:
             # app lock / 宏前置条件要精确包名。
             focused_app_info=await resolve_app_display_name(self.ctx, state.focused_app_info),
             screen_off=state.screen_state == "off",
-            no_perception=not (self.ctx.perception.ui_hierarchy or self.ctx.perception.ocr),
+            no_perception=not (
+                self.ctx.perception.ui_hierarchy
+                or self.ctx.perception.ocr
+                or self.ctx.perception.vision
+            ),
             language=self.ctx.prompt_language,
         )
         device_state_lines = [device_state] if device_state else []
@@ -332,12 +316,10 @@ class ExecutorNode:
             ctx=self.ctx,
             goal=goal,
             screen_elements=state.latest_screen_elements,
-            failures=state.executor_failures,
             local_messages=state.executor_messages,
             device_state_lines=device_state_lines,
-            # iOS / 云设备：无统一元素表时用 legacy OCR 块
-            # （编号与 latest_ocr_results 下标严格对应）。
-            ocr_results=state.latest_ocr_results,
+            # 最近一次按需视觉扫描的缓存；屏幕变了 Contextor 会把它清空。
+            vision_elements=state.vision_elements,
             stall_notice=stall_notice,
         )
 
@@ -421,6 +403,6 @@ class ExecutorNode:
             return None, f"the answer was not an {schema.__name__} object"
         return response, None
 
-    # 屏幕截图不进 Executor 的 prompt：它只有 UI 元素表和 OCR 两条文字通道。
-    # 截图本身仍用于 OCR、坐标校验，以及 `target.vision` 的按需视觉定位
-    # （services/vision.py：一次独立小调用，图不进本地历史，也不动前缀缓存）。
+    # 屏幕截图不进 Executor 的 prompt：它只有 UI 元素表、OCR 和按需视觉主体
+    # 列表三条文字通道。截图本身仍用于 OCR、坐标校验和视觉扫描；视觉扫描是
+    # 一次独立的小调用（services/vision.py），图不进本地历史，也不动前缀缓存。

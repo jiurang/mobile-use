@@ -378,7 +378,6 @@ def test_stall_notice_is_placed_after_the_local_history():
         ctx=_ctx(),
         goal="do the thing",
         screen_elements=_elements(2),
-        failures=[],
         local_messages=[AIMessage(content="old step")],
         device_state_lines=[],
         stall_notice="[no progress] same page again",

@@ -104,28 +104,36 @@ class PerceptionConfig(BaseModel):
     关掉任何一条都是**纯粹减少**该通道带来的信息与开销，不会改变另外一条的
     行为：
 
-    - `ui_hierarchy`（UI 元素表）：关掉后**不再有元素表**，Executor 只拿到
-      OCR 块，寻址字段从 `index` 变成 `ocr_index`（`agents/executor/prompt.py`
-      的 `has_element_table` 是这条的唯一判据，工具侧 `tools/utils.py`
+    - `ui_hierarchy`（UI 元素表）：关掉后表里**没有 UI 行**，只剩 OCR 行；
+      Executor 仍然用 `index` 寻址（`agents/executor/prompt.py` 的
+      `has_element_table` 是「有没有表」的唯一判据，工具侧 `tools/utils.py`
       的 `resolve_target` 看的是同一份 `state.latest_screen_elements`）。
     - `ocr`（OCR 文本）：关掉后 Contextor **根本不跑 OCR**（真机实测 381~443ms
-      /步），Executor 也拿不到 OCR 块。
+      /步），元素表里也就没有 OCR 行。
+    - `vision`（视觉主体扫描）：关掉后 Executor **看不到 `scan_visual_subjects`
+      工具**。开着也只是「按需」—— 只有模型主动调用时才截一张图、跑一次视觉
+      小调用；不调用就零成本。
 
-    ⚠️ **原来还有第三条「图片」通道（`screenshot`），现在**整条都没了。**
+    ⚠️ **原来还有一条「图片」通道（`screenshot`），现在整条都没了。**
     2026-10-23 下线的是「**每轮附图**」那条通道（三态枚举
     ``always`` / ``on_demand`` / ``off`` + 输出 schema 里的 ``need_screenshot``
     字段）；2026-10-27 下线的是「**按需工具**」那条（``take_screenshot``）——
     工具实现、提示词里的工具表行、「图片感知」通道、``state.executor_screenshot``
-    字段全部清干净。
+    字段全部清干净。2026-10-28 上线的 ``scan_visual_subjects`` **不是它的复活**：
+    它不接受任何目标描述，只回答「这一屏有哪些视觉主体」，返回的是编号表，
+    不是一张图。
 
-    ⇒ 感知只剩**两条文字通道**：UI 元素表 + OCR。
-    截图本身仍用于 **OCR** 与**坐标校验**（框架内部取数，不进消息）；
-    ``Target.vision`` 的按需视觉定位也走截图，但那是**一次独立的小调用**
-    （``services/vision.py``），图同样不进 Executor 的 prompt。
+    ⇒ 感知是**两条文字通道**：元素表（UI 行 + OCR 行）+ 按需视觉主体列表。
+    截图本身仍用于 OCR、坐标校验和视觉扫描（框架内部取数，不进 Executor 消息）。
     """
 
     ui_hierarchy: bool = True
     ocr: bool = True
+    #: 按需视觉扫描：只控制 ``scan_visual_subjects`` 工具是否可见。
+    #:
+    #: **默认开**：按需调用的常态成本为零（模型不调用就不截屏、不调模型），
+    #: 而「文字通道不足时先看一眼」正是这条通道存在的唯一理由。
+    vision: bool = True
     ocr_config: OcrConfig = Field(default_factory=OcrConfig)
 
     # 动作之后的**沉降等待下限**（毫秒）。

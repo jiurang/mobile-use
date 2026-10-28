@@ -64,11 +64,7 @@ from minitap.mobile_use.agents.summarizer.summarizer import SummarizerNode
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
-from minitap.mobile_use.tools.index import (
-    EXECUTOR_WRAPPERS_TOOLS,
-    VIDEO_RECORDING_WRAPPERS,
-    get_tools_from_wrappers,
-)
+from minitap.mobile_use.tools.index import executor_wrappers, get_tools_from_wrappers
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -267,12 +263,12 @@ async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
 
     graph_builder.add_node("executor", ExecutorNode(ctx))
 
-    executor_wrappers = list(EXECUTOR_WRAPPERS_TOOLS)
-    if ctx.video_recording_enabled:
-        executor_wrappers.extend(VIDEO_RECORDING_WRAPPERS)
+    executor_tools = get_tools_from_wrappers(
+        ctx=ctx, wrappers=executor_wrappers(ctx)
+    )
 
     executor_tool_node = ExecutorToolNode(
-        tools=get_tools_from_wrappers(ctx=ctx, wrappers=executor_wrappers),
+        tools=executor_tools,
         messages_key=EXECUTOR_MESSAGES_KEY,
         trace_id=ctx.trace_id,
     )

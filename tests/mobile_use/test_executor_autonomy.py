@@ -44,7 +44,6 @@ from minitap.mobile_use.agents.executor.executor import (  # noqa: E402
 from minitap.mobile_use.agents.executor.prompt import (  # noqa: E402
     build_executor_messages,
     render_executor_system,
-    render_failures_message,
 )
 from minitap.mobile_use.agents.executor.types import (  # noqa: E402
     ExecutorOutput,
@@ -136,7 +135,6 @@ def test_t12_screen_elements_come_after_local_history():
         ctx=_ctx(),
         goal="进入 WLAN 页面",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[
             AIMessage(content="", tool_calls=[{"name": "tap", "args": {}, "id": "c1"}]),
             ToolMessage(content="Tapped.", tool_call_id="c1"),
@@ -160,48 +158,12 @@ def test_t12b_goal_comes_before_history():
         ctx=_ctx(),
         goal="读出 Wi-Fi 名称",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[ToolMessage(content="x", tool_call_id="c1")],
         device_state_lines=[],
     )
     goal_idx = next(i for i, m in enumerate(msgs) if "读出 Wi-Fi 名称" in str(m.content))
     history_idx = next(i for i, m in enumerate(msgs) if isinstance(m, ToolMessage))
     assert goal_idx < history_idx
-
-
-def test_t12c_failed_targets_block_comes_after_history():
-    """失败清单在历史**之后**。
-
-    ⚠️ 这条测试 2026-10-21 改过方向：它原来断言「失败清单在历史之前」，
-    那是**改布局之前**的旧契约。10-21 真机实测（Redmi Turbo 4）发现
-    设备状态和失败清单卡在历史前面时，executor 的缓存命中率只有 **15.8%**
-    （六个 agent 里最差，而它调用量最大）⇒ 两者都挪到了历史之后。
-
-    （executor-autonomy-plan.md §4.1.1；复现：`scripts/audit_executor_cache_layout.py`）
-
-    ⚠️ 失败清单是**只增不减**的（跨子目标累积），所以它躺在**缓存尾巴**里，
-    每轮全价重发 —— 这是已知代价。把它并进局部历史的改动（失败事实绑定到
-    动作）见 `doc/executor-prompt-v3-mockup.md`。
-    """
-    msgs = build_executor_messages(
-        ctx=_ctx(),
-        goal="g",
-        screen_elements=_elements(),
-        failures=[
-            {
-                "key": "index=48|id=x",
-                "index": 48,
-                "resource_id": "x",
-                "label": "点赞",
-                "reason": "gone",
-            }
-        ],
-        local_messages=[ToolMessage(content="x", tool_call_id="c1")],
-        device_state_lines=[],
-    )
-    fail_idx = next(i for i, m in enumerate(msgs) if "already failed" in str(m.content))
-    history_idx = next(i for i, m in enumerate(msgs) if isinstance(m, ToolMessage))
-    assert fail_idx > history_idx
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +203,6 @@ def test_t18_the_prompt_never_carries_an_image_block():
         ctx=_ctx(),
         goal="进入 WLAN 页面",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[ToolMessage(content="Tapped.", tool_call_id="c1")],
         device_state_lines=["Device date: 2026-10-21"],
     )
@@ -256,7 +217,6 @@ def test_t18b_the_last_message_is_the_element_table():
         ctx=_ctx(),
         goal="进入 WLAN 页面",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[],
         device_state_lines=[],
     )
@@ -267,61 +227,21 @@ def test_t18b_the_last_message_is_the_element_table():
     assert "图片感知" not in texts[-1]
 
 
-def test_t18c_the_static_prompt_has_no_picture_contract():
-    """静态提示词里也不许再讲「图是补充、寻址走行号」那套契约。
+def test_t18c_the_static_prompt_has_no_image_contract():
+    """静态提示词里不许再讲「图会进模型 / 自己喊看截图」那套契约。
 
-    契约随通道一起没了 —— 留着等于教模型去找一条不存在的通道。
+    视觉主体是**文字列表**，不是一张图：截图工具、图片感知、内联 data URI
+    都必须不存在；模型改用 ``scan_visual_subjects`` + ``vision_index``。
     """
     system = render_executor_system(_ctx())
 
-    for marker in ("take_screenshot", "Image perception", "picture"):
-        assert marker not in system, f"静态提示词里还有截图痕迹：{marker}"
-    # 两条**文字**通道还在
+    for marker in ("take_screenshot", "Image perception", "data:image", '"vision":'):
+        assert marker not in system, f"静态提示词里还有旧图片契约：{marker}"
+    # 两条**文字**通道都在：元素表（UI 行 + OCR 行）/ 视觉主体列表
     assert "element table" in system
-    assert "OCR block" in system
-
-
-def test_failed_targets_block_has_no_bare_index():
-    """🔴 失败清单里不许带 index（索引每轮重编号，会让模型点错元素）。"""
-    text = render_failures_message(
-        [
-            {
-                "key": "index=48|id=com.app:id/like_button|text=点赞",
-                "index": 48,
-                "resource_id": "com.app:id/like_button",
-                "label": "点赞",
-                "reason": "gone",
-            }
-        ],
-        language=_ctx().prompt_language,
-    )
-    assert "[48]" not in text
-    assert "48" not in text
-    assert "点赞" in text
-    assert "like_button" in text
-
-
-def test_failed_targets_block_has_no_directive():
-    """🔴 **只记录事实，不下结论**：框架不许命令模型换目标。
-
-    「换不换目标」是相对于目标的判断，框架不知道目标 —— 判断留给模型。
-    （索引里原来那句「不要再用它们，换一个不同的元素」是 2026-10-20 exec 340
-    真机实测加的；2026-10-24 按同一条纪律改成了中性说法。）
-    """
-    text = render_failures_message(
-        [
-            {
-                "key": "k",
-                "index": 48,
-                "resource_id": "com.app:id/like_button",
-                "label": "点赞",
-                "reason": "gone",
-            }
-        ],
-        language=_ctx().prompt_language,
-    )
-    for forbidden in ("不要再用", "pick a different element", "换一个不同的元素"):
-        assert forbidden not in text
+    assert "OCR text rows" in system
+    assert "scan_visual_subjects" in system
+    assert "vision_index" in system
 
 
 # ---------------------------------------------------------------------------
@@ -867,33 +787,12 @@ def test_vision_falls_back_to_executor_and_can_be_overridden():
 
 
 # ---------------------------------------------------------------------------
-# T16~T18 —— 无元素表时必须走 ocr_index（iOS / 云设备路径）
+# T16~T18 —— 屏幕描述只有一种形态：统一元素表（UI 行 + OCR 行）
 # ---------------------------------------------------------------------------
 #
-# 屏幕描述有两种形态，工具认的字段不一样：
-#
-#   有元素表（Android，层级树能归一化）→ `Target.index`
-#   没元素表（iOS / 云设备 / ui_hierarchy=False）→ `Target.ocr_index`
-#
-# 真 bug：改造前 `executor.md` 全篇只教 `index`（"the leading `[i]`, 1-based,
-# used verbatim"），legacy OCR 块又照旧渲染成 `[i]` —— 模型在 iOS / 云设备上
-# 每个动作都被工具拒掉：
-#
-#   "index=N is not a row in the screen element table (no table)"
-#
-# 复现脚本已随本轮清理一并去掉（临时审计脚本不入库）；下面的用例本身就是
-# 可复现的证据 —— 断言 prompt 里出现/不出现哪些引导语。
-#
-# 修法：提示侧按同一个判据分流（`has_element_table`），无表时在 OCR 块前面
-# 挂一段「用 ocr_index」的说明，并让 executor.md 同时讲清两种寻址方式。
-
-
-# 无元素表时的 prompt **不该**出现的误导表述 —— 它们会让模型去填 `index`。
-MISLEADING_INDEX_CLAIMS = (
-    "alone is enough",
-    "index is the most reliable",
-    "index 就行",
-)
+# 2026-10-28：iOS / 云设备的层级树形状不认识，但 OCR 结果仍能建表（只剩
+# OCR 行）。屏幕描述因此和 Android 一样是一张统一索引的表，模型只填 `index`；
+# 原来那条「无元素表 → 教 ocr_index」的 legacy OCR 块已经删除。
 
 
 def _ocr(n: int = 3) -> list:
@@ -913,58 +812,41 @@ def _prompt_text(msgs) -> str:
     return "\n".join(str(m.content) for m in msgs)
 
 
-def test_t16_no_element_table_prompt_teaches_ocr_index():
-    """无元素表时，prompt 必须教 `ocr_index`，且不能误导成「直接用 index」。
-
-    无表 ⇒ 工具侧只认 `ocr_index`（`tools/utils.resolve_target`），模型却
-    只被教过 `index` ⇒ 每个动作都解析失败。
-    """
+def test_t16_ocr_only_table_is_still_one_indexed_table():
+    """只有 OCR 行时（iOS / 云设备），屏幕描述仍是同一张表、同一套 `index`。"""
     from minitap.mobile_use.agents.executor.prompt import has_element_table
+    from minitap.mobile_use.utils.screen_elements import build_screen_elements
 
-    # 判据本身：空 / None ⇒ 本屏没有元素表
     assert has_element_table(None) is False
     assert has_element_table([]) is False
-    assert has_element_table(_elements()) is True
+
+    elements = build_screen_elements(tree_rows=None, ocr_results=_ocr())
+    assert has_element_table(elements) is True
 
     msgs = build_executor_messages(
         ctx=_ctx(DevicePlatform.IOS),
         goal="点开设置",
-        screen_elements=None,
-        failures=[],
+        screen_elements=elements,
         local_messages=[],
         device_state_lines=[],
-        ocr_results=_ocr(),
     )
     text = _prompt_text(msgs)
 
-    # 1) 必须出现 ocr_index
-    assert "ocr_index" in text
-
-    # 2) 必须明确说「本屏没有元素表 → 用 ocr_index，而不是 index」
-    assert "NO SCREEN ELEMENT TABLE" in text
-    assert "not a row in the screen element table" in text
-
-    # 3) 说明段必须在 OCR 块**前面** —— 模型是从上往下读的
-    assert text.index("NO SCREEN ELEMENT TABLE") < text.index("[1] ")
-
-    # 4) 不能有「直接用 index 就行」那类误导表述
-    for claim in MISLEADING_INDEX_CLAIMS:
-        assert claim not in text, f"无元素表时的 prompt 不该出现 {claim!r}"
-
-    # 5) OCR 块的编号没被改 —— `[i]` 必须仍与 latest_ocr_results 的下标对应
+    # 表头和 OCR 行都在，编号从 1 开始
+    assert "Screen elements, one per line" in text
     assert '[1] "Text 1"' in text
+    # 不再教 ocr_index —— 一套 index 走到底
+    assert "ocr_index" not in text
 
 
 def test_t17_element_table_prompt_still_uses_index():
-    """有元素表时行为不能变：target 示例仍然是 `index`，且不混入无表说明。"""
+    """有元素表时：target 示例仍然是 `index`。"""
     msgs = build_executor_messages(
         ctx=_ctx(),
         goal="点开设置",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[],
         device_state_lines=[],
-        ocr_results=_ocr(),
     )
     text = _prompt_text(msgs)
 
@@ -974,37 +856,21 @@ def test_t17_element_table_prompt_still_uses_index():
 
     # target 示例仍然是 index
     assert '"index": 7' in text
-
-    # 无表专用说明不能混进有表路径
-    assert "NO SCREEN ELEMENT TABLE" not in text
+    assert "ocr_index" not in text
 
 
 def test_t18_both_shapes_assemble_without_raising():
-    """两种形态都要能正常组装（不抛异常）。"""
+    """有表 / 空表都要能正常组装（不抛异常）。"""
     for elements in (None, [], _elements()):
         msgs = build_executor_messages(
             ctx=_ctx(),
             goal="g",
             screen_elements=elements,
-            failures=[],
             local_messages=[],
             device_state_lines=[],
-            ocr_results=_ocr(),
         )
         assert msgs, f"screen_elements={elements!r} 时不该组装出空消息列表"
         assert isinstance(_prompt_text(msgs), str)
-
-    # 既没有元素表也没有 OCR：没有屏幕描述，但也不能崩
-    msgs = build_executor_messages(
-        ctx=_ctx(),
-        goal="g",
-        screen_elements=None,
-        failures=[],
-        local_messages=[],
-        device_state_lines=[],
-        ocr_results=None,
-    )
-    assert msgs
 
 
 # ---------------------------------------------------------------------------
@@ -1426,7 +1292,6 @@ def test_t23_long_tool_result_is_truncated_but_errors_stay_verbatim():
         ctx=_ctx(),
         goal="g",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[
             ToolMessage(content=long_error_text, tool_call_id="c1", status="error"),
         ],
@@ -1518,7 +1383,6 @@ def test_t24_short_tool_results_are_never_touched():
         ctx=_ctx(),
         goal="g",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[ToolMessage(content=short, tool_call_id="c1")],
         device_state_lines=[],
     )

@@ -41,13 +41,13 @@ class Target(BaseModel):
             "index the accessibility tree, not the OCR block."
         ),
     )
-    vision: str | None = Field(
+    vision_index: int | None = Field(
         None,
         description=(
-            "A natural-language description of the target, for things neither the "
-            "element table nor the OCR block can name (icons, images, canvas). The "
-            "framework locates it on a screenshot and supplies the coordinates; never "
-            "pair it with your own bounds. Prefer `index` whenever a row exists."
+            "The 1-based [i] of a row in the 'Visual subjects' block, produced by "
+            "the `scan_visual_subjects` tool. Only for things neither the element "
+            "table nor the OCR block can name (icons, images, canvas, textless "
+            "controls). Never pair it with `index` or your own bounds."
         ),
     )
 

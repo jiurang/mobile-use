@@ -266,10 +266,9 @@ AgentNode = Literal[
     "cortex",
     "executor",
     "reporter",
-    # 视觉定位（`Target.vision`）用的小调用。**不是决策 agent**：它只看一张截图、
-    # 回答一个框。单独成一个角色是为了能指向 grounding 更强的模型 —— 真机实测
-    # （2026-10-28）：同一个模型在「红色屋顶房子」上给对了框，在「纯黑色的照片」
-    # 上却高置信度地给错框，定位质量完全取决于模型。
+    # 视觉扫描（`scan_visual_subjects`）用的小调用。**不是决策 agent**：它只看
+    # 一张截图、列出当屏全部视觉主体。单独成一个角色是为了能指向 grounding 更强的
+    # 模型 —— 真机实测（2026-10-28）：不同模型对图标、图片的框质量差别很大。
     "vision",
 ]
 AgentNodeWithFallback = AgentNode
@@ -431,13 +430,11 @@ class LLMConfig(BaseModel):
     # 全部变成 ValidationError（doc/executor-autonomy-plan.md 附录 A.1、审计发现 E6）。
     # None = 没单独配 → get_agent() 回落到 executor 的配置。
     reporter: LLMWithFallback | None = None
-    # 视觉定位模型。**可选**：None = 没单独配 → get_agent() 回落 executor，
+    # 视觉扫描模型。**可选**：None = 没单独配 → get_agent() 回落 executor，
     # 行为与引入这个角色之前一字不差。
     #
-    # 为什么必须能单独配：`Target.vision` 的框会跳过 IoU 校验，定位质量直接
-    # 决定点得对不对。真机实测（2026-10-28，MiniMax-M3.1）：带区分度的描述
-    # （红色屋顶房子）稳定给对框，模糊/带方位的描述（纯黑色的照片）会高置信度
-    # 地给错框。grounding 能力是模型属性 —— 想换更强的模型，只能靠这个角色。
+    # 为什么必须能单独配：视觉扫描给出的框会跳过 IoU 校验，框的质量直接决定
+    # 点得对不对。grounding 能力是模型属性 —— 想换更强的模型，只能靠这个角色。
     #
     # 也做成可选而不是必填：仓库里所有 `LLMConfig(...)` 构造点和老 override
     # 文件都不带这个键，必填会把它们全部变成 ValidationError。

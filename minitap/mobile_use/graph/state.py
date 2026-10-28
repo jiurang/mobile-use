@@ -9,6 +9,7 @@ from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.ocr.types import OcrText
+from minitap.mobile_use.services.vision import VisionElement
 from minitap.mobile_use.utils.failed_targets import ActionFailureFact, FailedTarget
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.recorder import record_interaction
@@ -73,6 +74,24 @@ class State(BaseModel):
     latest_screen_elements: Annotated[
         list[ScreenElement] | None,
         "Screen element table (UI tree + OCR, one shared 1-based index)",
+        take_last,
+    ] = None
+
+    # 视觉主体列表：Executor 调 `scan_visual_subjects` 之后的**当屏**快照。
+    #
+    # 为什么缓存进 state 而不是只留在工具回执里：工具回执是文字，模型下一步
+    # 要写 `Target.vision_index`，而工具侧必须能把编号还原成同一个框。回执里
+    # 的编号和这里必须是同一份对象。
+    #
+    # 生命周期：扫描工具写；Contextor 每步比对屏幕指纹，屏变了就清空。
+    vision_elements: Annotated[
+        list[VisionElement] | None,
+        "Visual subjects from the last on-demand scan (1-based index, label, bounds)",
+        take_last,
+    ] = None
+    vision_scan_fingerprint: Annotated[
+        str | None,
+        "Element-table fingerprint at scan time; a mismatch means the list is stale",
         take_last,
     ] = None
 

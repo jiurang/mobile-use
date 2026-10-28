@@ -91,7 +91,6 @@ def _executor_messages(ctx: MobileUseContext):
         ctx=ctx,
         goal="用「传奇」再搜一次",
         screen_elements=_elements(),
-        failures=[],
         local_messages=[],
         device_state_lines=["Device date: 2026-10-26 22:20:00 CST 2026"],
     )

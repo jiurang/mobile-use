@@ -59,11 +59,7 @@ from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.services.telemetry import telemetry
-from minitap.mobile_use.tools.index import (
-    EXECUTOR_WRAPPERS_TOOLS,
-    VIDEO_RECORDING_WRAPPERS,
-    format_tools_list,
-)
+from minitap.mobile_use.tools.index import executor_wrappers, format_tools_list
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.failed_targets import describe, render_failures, render_failure_facts
 from minitap.mobile_use.utils.logger import get_logger
@@ -394,9 +390,7 @@ class CortexNode:
             self.ctx.execution_setup.get_locked_app_package() if self.ctx.execution_setup else None
         )
 
-        executor_wrappers = list(EXECUTOR_WRAPPERS_TOOLS)
-        if self.ctx.video_recording_enabled:
-            executor_wrappers.extend(VIDEO_RECORDING_WRAPPERS)
+        executor_tools = executor_wrappers(self.ctx)
 
         # system prompt 整段静态：不再接 initial_goal、计划、汇报这类每轮变化的
         # 值。它因此是一个整体可复用的前缀，不会被任何单轮字段击穿。
@@ -405,7 +399,7 @@ class CortexNode:
             os.getenv(CORTEX_PROMPT_ENV),
         ).render(
             platform=self.ctx.device.mobile_platform.value,
-            executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_wrappers),
+            executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_tools),
             locked_app_package=current_locked_app_package,
             # perception 仍然传着，但 cortex.md 不再看屏，所以不再引用它：
             # 感知在 Executor 侧。

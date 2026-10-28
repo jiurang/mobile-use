@@ -27,8 +27,8 @@ AGENT_ROLE_NAMES: tuple[str, ...] = (
     "cortex",
     "executor",
     "reporter",
-    # 视觉定位（`Target.vision`）的小调用。manager 侧要能单独给它下发渠道 ——
-    # grounding 能力是模型属性，换模型只能从这条角色走。
+    # 视觉扫描（`scan_visual_subjects`）的小调用。manager 侧要能单独给它下发
+    # 渠道 —— grounding 能力是模型属性，换模型只能从这条角色走。
     "vision",
 )
 UTILS_ROLE_NAMES: tuple[str, ...] = (

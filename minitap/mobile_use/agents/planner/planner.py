@@ -40,11 +40,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.services.telemetry import telemetry
-from minitap.mobile_use.tools.index import (
-    EXECUTOR_WRAPPERS_TOOLS,
-    VIDEO_RECORDING_WRAPPERS,
-    format_tools_list,
-)
+from minitap.mobile_use.tools.index import executor_wrappers, format_tools_list
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
 
@@ -200,13 +196,11 @@ class PlannerNode:
         )
         current_foreground_app = await get_current_foreground_package_async(self.ctx)
 
-        executor_wrappers = list(EXECUTOR_WRAPPERS_TOOLS)
-        if self.ctx.video_recording_enabled:
-            executor_wrappers.extend(VIDEO_RECORDING_WRAPPERS)
+        executor_tools = executor_wrappers(self.ctx)
 
         system_message = _load_template("planner.md").render(
             platform=self.ctx.device.mobile_platform.value,
-            executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_wrappers),
+            executor_tools_list=format_tools_list(ctx=self.ctx, wrappers=executor_tools),
             locked_app_package=current_locked_app_package,
             current_foreground_app=current_foreground_app,
             video_recording_enabled=self.ctx.video_recording_enabled,
