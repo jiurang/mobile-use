@@ -1,40 +1,26 @@
-"""把「动作 JSON」**确定性地**翻译成 tool_calls。
+"""把「动作 JSON」确定性地翻译成 tool_calls。
 
-这个模块是**纯代码**的一层：给出动作 JSON，给出 tool_calls，或者给出一条
-「为什么不行」的理由。它不调 LLM，也不改写动作内容。
+这一层是纯代码：给出动作 JSON，给出 tool_calls，或者给出一条「为什么不行」的
+理由。它不调 LLM，也不改写动作内容。
 
-输入长什么样
-------------
-一个 JSON 数组字符串，每个元素形如::
+输入是一个 JSON 数组字符串，每个元素形如::
 
     [{"action": "tap", "target": {"resource_id": "com.x:id/send", ...}}]
 
-``action`` 字段**本身就是工具名**，其余 key 平铺成 tool args。这和
-``ExecutorOutput.actions`` 的形状**逐字一致**（见
-``agents/executor/types.py``），所以 Executor 吐出来的结构化输出可以直接
-喂进来，中间不需要任何转写。
+``action`` 字段本身就是工具名，其余 key 平铺成 tool args。这和
+``ExecutorOutput.actions`` 的形状逐字一致（见 ``agents/executor/types.py``），
+所以 Executor 吐出来的结构化输出可以直接喂进来，中间不需要任何转写。
 
-为什么要有这一层
-----------------
-「JSON → tool_calls」是**机械转写**，不需要智能：工具名在 ``action`` 里，
-参数就在旁边。而承载真正语义的「按顺序串行执行」「一个失败就中止后面的」
-实现在 ``ExecutorToolNode.__func``（串行 for 循环 + failed 标志），
-**不在 LLM 里** —— 所以这一层不会丢掉任何语义。
+「JSON 到 tool_calls」是机械转写，不需要智能：工具名在 ``action`` 里，参数就在
+旁边。而承载真正语义的「按顺序串行执行」「一个失败就中止后面的」实现在
+``ExecutorToolNode.__func``（串行 for 循环加 failed 标志），不在 LLM 里，所以
+这一层不会丢掉任何语义。
 
-失败时**不退回 LLM 重新转写**，而是把**拒绝理由**回灌给模型
---------------------------------------------------------------------
-Executor 的 LLM **就是决策者**（它自己看屏、自己决定下一个动作）。
-「退回 LLM」退回来的是同一个决策者，它看不到自己错在哪 ⇒ 大概率输出
-**同样的坏动作** ⇒ 死循环。
-
-⇒ 所以 :func:`dispatch_decisions_with_reason` 同时返回**给模型看的理由**
-（「你刚才说的 `teleport` 不是个工具」），调用方把它当工具结果回灌，
-让模型带着理由重新决策。这是新架构下唯一正确的失败处理方式。
-
-⚠️ 改造前的老架构（Cortex 出 decisions、Executor 机械转写）里，
-「退回 LLM 重转写」是合理的——转写器重试可能就写对了。老文档里
-「直连是快路径，失败就退回 Executor LLM」的说法**已经失效**，
-照着实现会造出死循环。
+失败时不退回 LLM 重新转写，而是把拒绝理由回灌给模型。Executor 的 LLM 就是
+决策者（它自己看屏、自己决定下一个动作），「退回 LLM」退回来的是同一个决策者，
+它看不到自己错在哪，大概率输出同样的坏动作，于是变成死循环。所以
+:func:`dispatch_decisions_with_reason` 同时返回给模型看的理由，调用方把它当工具
+结果回灌，让模型带着理由重新决策。
 """
 
 from __future__ import annotations
@@ -42,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from typing import Any
 
 from langchain_core.messages import ToolCall
 from langchain_core.tools import BaseTool
@@ -58,6 +45,7 @@ _INJECTED_ARGS = frozenset({"tool_call_id", "state", "store", "runtime", "config
 
 
 def _strip_fences(text: str) -> str:
+    """剥掉 Markdown 的代码围栏，取出里面的正文。"""
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*\n?", "", text)
     text = re.sub(r"\n?```\s*$", "", text)
@@ -67,9 +55,9 @@ def _strip_fences(text: str) -> str:
 def _extract_json_array(text: str) -> str | None:
     """取出第一个括号配平的 JSON 数组。
 
-    Cortex 的 `decisions` 本身已经是个 JSON 数组**字符串**，但模型经常在
-    外面裹一层解释文字（"好的，我来…"）。用括号配平扫描而不是正则：
-    动作对象里可能有嵌套数组和转义引号，贪婪正则会截断。
+    Cortex 的 `decisions` 本身已经是个 JSON 数组字符串，但模型经常在外面裹一层
+    解释文字（"好的，我来…"）。用括号配平扫描而不是正则：动作对象里可能有嵌套
+    数组和转义引号，贪婪正则会截断。
     """
     start = text.find("[")
     if start == -1:
@@ -97,7 +85,7 @@ def _extract_json_array(text: str) -> str | None:
     return None
 
 
-def parse_actions(decisions: str | None) -> list[dict] | None:
+def parse_actions(decisions: str | None) -> list[dict[str, Any]] | None:
     """把 decisions 字符串解析成动作列表。解析不出来就返回 None。"""
     if not decisions or not decisions.strip():
         return None
@@ -137,18 +125,19 @@ def _required_args(tool: BaseTool) -> set[str]:
 
 
 def _looks_valid_with_reason(
-    action: dict, tool: BaseTool, thought: str
-) -> tuple[dict | None, str | None]:
+    action: dict[str, Any], tool: BaseTool, thought: str
+) -> tuple[dict[str, Any] | None, str | None]:
     """校验单个动作能否安全直发；不行返回 ``(None, 拒绝理由)``。
 
     校验两件事，方向相反：
-    - 必填参数齐不齐（缺了就交给模型去补）
-    - 有没有模型压根不认识的参数名（幻觉出来的字段）
 
-    另外顺手拦一类最常见的形态错误：声明为对象的参数（比如 `target`）
-    传了字符串或数字 —— 这种在 ToolNode 里报错太晚，退回模型重新决定更划算。
+    - 必填参数齐不齐（缺了就交给模型去补）。
+    - 有没有模型压根不认识的参数名（幻觉出来的字段）。
 
-    **理由必须说对病因**：笼统地说「不合法」，模型只会换个姿势再犯一次。
+    另外顺手拦一类最常见的形态错误：声明为对象的参数（比如 `target`）传了字符串
+    或数字。这种错误在 ToolNode 里报错太晚，退回模型重新决定更划算。
+
+    理由必须说对病因。笼统地说「不合法」，模型只会换个姿势再犯一次。
     """
     kwargs = {k: v for k, v in action.items() if k not in _NAME_KEYS}
     kwargs["agent_thought"] = kwargs.get("agent_thought") or thought
@@ -185,11 +174,10 @@ def dispatch_decisions(
     default_thought: str | None,
     tools: list[BaseTool],
 ) -> list[ToolCall] | None:
-    """动作 JSON → tool_calls（**不返回拒绝理由**的老签名）。
+    """动作 JSON 到 tool_calls（不返回拒绝理由的老签名）。
 
-    ⚠️ 新代码用 :func:`dispatch_decisions_with_reason`：它多返回一条
-    「给模型看的拒绝理由」。没有理由就没法回灌，模型只会换个姿势再犯
-    同一个错。
+    新代码用 :func:`dispatch_decisions_with_reason`：它多返回一条给模型看的拒绝
+    理由。没有理由就没法回灌，模型只会换个姿势再犯同一个错。
 
     Args:
         decisions: 动作 JSON（JSON 数组字符串）。
@@ -197,7 +185,7 @@ def dispatch_decisions(
         tools: 当前会话可用的工具。
 
     Returns:
-        成功时返回按原顺序排列的 tool_calls；**任何一步不确定都返回 None**。
+        成功时返回按原顺序排列的 tool_calls。任何一步不确定都返回 None。
         空列表也返回 None（没有动作可发，和「解析失败」在调用方的处理方式
         是一样的）。
     """
@@ -210,30 +198,23 @@ def dispatch_decisions_with_reason(
     default_thought: str | None,
     tools: list[BaseTool],
 ) -> tuple[list[ToolCall] | None, str | None]:
-    """和 `dispatch_decisions` 一样，但**同时返回拒绝理由**。
+    """和 `dispatch_decisions` 一样，但同时返回拒绝理由。
 
-    为什么需要它
-    ------------
-    旧架构里 dispatcher 失败 → 退回 Executor 的 LLM **重新转写**同一批
-    decisions，那是有意义的（转写器重试可能就写对了）。
-
-    新架构里 Executor 的 LLM **就是决策者**（它自己决定动作），
-    所以「退回 LLM」退回来的还是同一个决策者 —— 它大概率输出**同样的坏动作**，
-    因为它没看到自己错在哪。这会变成死循环。
-
-    ⇒ 正确的做法是把**拒绝理由**回灌给 Executor，让它带着
-    「你刚才说的 `teleport` 不是个工具」重新决策。
+    需要它的原因是失败处理的方向。Executor 的 LLM 就是决策者，它自己决定动作，
+    所以「退回 LLM」退回来的还是同一个决策者，它看不到自己错在哪，大概率输出
+    同样的坏动作，于是变成死循环。正确的做法是把拒绝理由回灌给 Executor，让它
+    带着「你刚才说的 `teleport` 不是个工具」重新决策。
 
     Returns:
-        `(tool_calls, reason)`。成功时 reason 为 None；
-        失败时 tool_calls 为 None、reason 是给模型看的一句话。
+        `(tool_calls, reason)`。成功时 reason 为 None；失败时 tool_calls 为 None、
+        reason 是给模型看的一句话。
     """
     actions = parse_actions(decisions)
     if not actions:
-        # ⚠️ **空 actions 和「解析失败」是两回事**，回灌给模型的理由必须不同：
-        #   * 空 actions —— 模型**没决定任何动作**（它可能卡住了 / 上一轮失败了）。
-        #     说「格式错」会让它去改格式，而它本来就没格式问题。
-        #   * 解析失败 —— 模型输出的东西根本不是 JSON 数组。
+        # 空 actions 和「解析失败」是两回事，回灌给模型的理由必须不同：
+        # 空 actions 是模型没决定任何动作（它可能卡住了、上一轮失败了），说
+        # 「格式错」会让它去改格式，而它本来就没格式问题；解析失败是模型输出的
+        # 东西根本不是 JSON 数组。
         if decisions is not None and decisions.strip() in ("[]", "[ ]"):
             return None, (
                 "you returned an empty action list — decide one concrete action to take, "

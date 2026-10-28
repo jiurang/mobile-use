@@ -762,6 +762,15 @@ class Agent:
         state = self._get_graph_state(task=task)
         graph_input = state.model_dump()
         task_start_time = datetime.now(UTC)
+        # 「任务开始的时间」给 Executor / Cortex 看的。
+        #
+        # 口径是**图开始跑**这一刻，不是任务对象创建那一刻 —— 创建到开跑之间
+        # 还有装 APK / 锁应用这些准备动作（真机实测能花几分钟），那段时间不是
+        # 这个任务在干活。
+        #
+        # ⚠️ 它会进提示词 ⇒ 必须整场运行**逐字节不变**（否则前缀缓存被打断）。
+        # 所以只在起跑这一刻赋值，之后谁都不许改。
+        context.task_started_at = task_start_time.astimezone()
 
         telemetry.capture_task_started(
             task_id=task_id,

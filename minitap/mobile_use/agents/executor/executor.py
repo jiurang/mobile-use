@@ -1,13 +1,15 @@
 """Executor：自主执行者。
 
-Cortex 只给一个子目标（一句自然语言），Executor 自己看屏、决策、执行，
-循环到子目标完成或熔断。
+Cortex 只给一个子目标（一句自然语言），Executor 自己看屏、决策、执行，循环到
+子目标完成或熔断。
 
-关键设计：
-1. 不 bind_tools 设备工具（schema 不进缓存键，每轮满价计费）；工具用法靠
-   `executor.md` 的文本工具表，只绑定 `ExecutorOutput` 一个结构化输出 schema。
-2. dispatcher 失败要把拒绝理由回灌给模型：退回 LLM 只会拿回同样的坏动作。
-3. prompt 里每轮变化的内容（屏幕元素表）一律放最后，避免破坏前缀缓存。
+三处设计撑着这一环：
+
+- 不 bind_tools 设备工具。那 16 个工具的 schema 不进缓存键，每轮都按满价计费；
+  工具用法改由 ``executor.md`` 里的文本工具表教，只绑定 ``ExecutorOutput``
+  一个结构化输出 schema。
+- dispatcher 拒绝动作时要把拒绝理由回灌给模型。退回 LLM 只会拿回同样的坏动作。
+- prompt 里每轮变化的内容（屏幕元素表）一律放最后，避免破坏前缀缓存。
 """
 
 from __future__ import annotations
@@ -58,9 +60,10 @@ from minitap.mobile_use.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 单个子目标最多执行几步；默认不限（None），超了才强制收尾并汇报给 Cortex。
-# 曾设为 12，实机会腰斩正常子目标、并掩盖原地打转的真因，故放开。
-# 兜底是任务级的全局步预算（constants.DEFAULT_MAX_STEPS → recursion_limit）；
-# 代价是一个子目标可能吃光整个任务预算，撞 recursion_limit 时任务直接失败。
+# 放开上限是有原因的：上限会腰斩正常子目标，也会掩盖原地打转的真因。
+# 兜底是任务级的全局步预算（``constants.DEFAULT_MAX_STEPS``，最终撞
+# ``recursion_limit``）；代价是一个子目标可能吃光整个任务预算，撞
+# ``recursion_limit`` 时任务直接失败。
 # 要恢复上限：把这里改成整数即可（代码路径都还在）。
 MAX_STEPS_PER_SUBGOAL: int | None = None
 
@@ -68,8 +71,8 @@ MAX_STEPS_PER_SUBGOAL: int | None = None
 def _rejection_code(reason: str | None) -> str:
     """把拒绝理由压成短代码（只进遥测，不参与控制流）。
 
-    理由原文可能含屏幕上的文字（用户数据），不外传。这里是按子串匹配
-    dispatcher 的自然语言措辞，匹配失败退化成 unknown，改措辞会影响分布。
+    理由原文可能含屏幕上的文字（用户数据），不外传。这里按子串匹配 dispatcher
+    的自然语言措辞，匹配失败退化成 unknown，改措辞会影响分布。
     """
     if not reason:
         return "unknown"
@@ -89,12 +92,12 @@ def _rejection_code(reason: str | None) -> str:
 
 
 class ExecutorNode:
-    """决策一步；循环在 graph 层（`graph/graph.py`），每一步是一个 super-step。
+    """决策一步；循环在 graph 层（``graph/graph.py``），每一步是一个 super-step。
 
     这样状态（尤其屏幕元素表）在步骤之间保持一致，索引契约才成立。
     """
 
-    def __init__(self, ctx: MobileUseContext):
+    def __init__(self, ctx: MobileUseContext) -> None:
         self.ctx = ctx
 
     @wrap_with_callbacks(
@@ -102,7 +105,7 @@ class ExecutorNode:
         on_success=lambda _: logger.success("Executor Agent"),
         on_failure=lambda _: logger.error("Executor Agent"),
     )
-    async def __call__(self, state: State):
+    async def __call__(self, state: State) -> dict[str, Any]:
         goal = state.executor_goal
         if not goal:
             # 正常流程不会走到这，但兜住比崩掉好。
@@ -124,7 +127,7 @@ class ExecutorNode:
         tools = get_tools_from_wrappers(self.ctx, wrappers)
 
         # 全任务累计动作步数：本节点每跑一轮 +1。
-        # `executor_steps` 会在 Cortex 换目标时归零，`total_steps` 不归零，
+        # ``executor_steps`` 会在 Cortex 换目标时归零，``total_steps`` 不归零，
         # 供 SDK 上报整个任务的动作步数。无目标兜底分支不计入两者。
         step_index = state.executor_steps + 1
         next_total_steps = state.total_steps + 1
@@ -134,9 +137,9 @@ class ExecutorNode:
             done: bool = False,
             gave_up: bool = False,
             progress: list[dict] | None = None,
-        ):
+        ) -> dict[str, Any]:
             """写一步的结果。几个出口共用同一份计数器。"""
-            update: dict = {
+            update: dict[str, Any] = {
                 "executor_done": done,
                 "executor_failed": gave_up,
                 "executor_steps": step_index,
@@ -166,11 +169,11 @@ class ExecutorNode:
                 done=True,
             )
 
-        # ---- 「没有进展」的检测（只提醒，不拦截）----
+        # 「没有进展」的检测，只提醒，不拦截。
         #
         # 实测 executor 会在卡住的子目标上重复几十步，既不说完成也不说做不到，
-        # 最终撞 recursion_limit 崩掉。这里把「重复」作为事实告诉模型，
-        # 由它自己决定换招还是放弃；不截断、不改结果。
+        # 最终撞 recursion_limit 崩掉。这里把「重复」作为事实告诉模型，由它自己
+        # 决定换招还是放弃；不截断，也不改结果。
         progress = list(state.executor_progress or [])
         stall_signal = detect_stall(progress)
         stall_notice = ""
@@ -188,10 +191,10 @@ class ExecutorNode:
 
         response = await self._decide(state=state, goal=goal, stall_notice=stall_notice)
 
-        # ---- 目标达成 → 不碰 actions，直接收尾 ----
+        # 目标达成：不碰 actions，直接收尾。
         #
-        # done 时 actions 是空数组，会被 dispatcher 判成空动作拒绝，
-        # 所以必须先在派发前判定。
+        # done 时 actions 是空数组，会被 dispatcher 判成空动作拒绝，所以必须
+        # 先在派发前判定。
         if response.done:
             return await emit(
                 AIMessage(
@@ -202,7 +205,7 @@ class ExecutorNode:
                 done=True,
             )
 
-        # ---- 明确放弃 → 收尾，outcome 判 failed（不是 completed）----
+        # 明确放弃：收尾，outcome 判 failed 而不是 completed。
         #
         # 没有这条出口时「做不到」在契约里不可表达，模型只能一直试到撞
         # recursion_limit。有了它，Cortex 可以换招或放弃，任务继续往下走。
@@ -218,10 +221,10 @@ class ExecutorNode:
                 gave_up=True,
             )
 
-        # ---- 动作 → tool_calls（确定性直连）----
+        # 动作转 tool_calls（确定性直连）。
         #
-        # 一轮只执行一个动作：元素编号只在那一屏上成立，多执行的动作其下标
-        # 指向的是已变更的屏幕。这里做硬兜底：多余的丢弃并回灌给模型。
+        # 一轮只执行一个动作：元素编号只在那一屏上成立，多执行的动作其下标指向的
+        # 是已变更的屏幕。这里做硬兜底：多余的丢弃并回灌给模型。
         actions = list(response.actions[:1])
         if len(response.actions) > 1:
             logger.info(
@@ -238,7 +241,7 @@ class ExecutorNode:
         )
 
         if tool_calls is None:
-            # dispatcher 拒了：回灌理由让模型重新决策（退回 LLM 只会重复同样的错）。
+            # dispatcher 拒了：回灌理由让模型重新决策。退回 LLM 只会重复同样的错。
             logger.info(f"[executor] Dispatch rejected: {reject_reason}")
             telemetry.capture_executor_dispatch(
                 task_id=self.ctx.trace_id,
@@ -246,7 +249,7 @@ class ExecutorNode:
                 action_count=len(response.actions),
                 rejection_code=_rejection_code(reject_reason),
             )
-            # 用 HumanMessage 而非 ToolMessage：拒绝时没有对应 tool_call_id，
+            # 用 HumanMessage 而非 ToolMessage：拒绝时没有对应的 tool_call_id，
             # OpenAI 兼容端点会 400。
             return await emit(
                 AIMessage(content=response.agent_thought or ""),
@@ -262,7 +265,7 @@ class ExecutorNode:
             action_count=len(actions),
         )
 
-        # 丢弃了额外动作 → 告诉模型那些动作没执行，别误以为做过。
+        # 丢弃了额外动作：告诉模型那些动作没执行，别误以为做过。
         extra_note = ""
         if len(response.actions) > 1:
             extra_note = render_extra_actions_notice(
@@ -292,15 +295,15 @@ class ExecutorNode:
     ) -> ExecutorOutput:
         """问一次 LLM，拿结构化输出。
 
-        只绑定 `ExecutorOutput` 一个 schema（见 `get_structured_llm`）。
+        只绑定 ``ExecutorOutput`` 一个 schema（见 ``get_structured_llm``）。
         解析失败不返回 None，内部会降级成「空动作 + 说明」。
         """
-        # 设备状态模板块（措辞在 executor.md / executor-zh.md 里）：
+        # 设备状态模板块，措辞在 executor.md / executor-zh.md 里：
         # 息屏 / 无感知通道要告知模型，否则它会在黑屏上反复尝试。
         device_state = render_device_state(
             device_date=state.device_date,
-            # 给模型看应用名（设备 APK 里读，读不到退回内置表）；state 里仍存
-            # 包名 —— app lock / 宏前置条件要精确包名。
+            # 给模型看应用名（设备 APK 里读，读不到退回内置表）；state 里仍存包名，
+            # app lock / 宏前置条件要精确包名。
             focused_app_info=await resolve_app_display_name(self.ctx, state.focused_app_info),
             screen_off=state.screen_state == "off",
             no_perception=not (self.ctx.perception.ui_hierarchy or self.ctx.perception.ocr),
@@ -327,11 +330,11 @@ class ExecutorNode:
 
         response, failure_reason = await self._invoke(runner, messages, schema)
 
-        # ---- 解析失败 → 带 nudge 重试一次 ----
+        # 解析失败：带 nudge 重试一次。
         #
-        # 主/fallback 是本机同一个模型时 `with_fallback` 兜不住，异常会冒到顶层
-        # 杀掉任务。这里自己重试并明确告诉模型错在哪（failure_reason 来自解析层），
-        # 再失败就降级成「空动作 + 说明」，让流程继续。
+        # 主 / fallback 是本机同一个模型时 ``with_fallback`` 兜不住，异常会冒到
+        # 顶层杀掉任务。这里自己重试并明确告诉模型错在哪（failure_reason 来自
+        # 解析层），再失败就降级成「空动作 + 说明」，让流程继续。
         if response is None:
             logger.warning(
                 f"[executor] LLM returned no parseable output ({failure_reason}); retrying once"
@@ -358,8 +361,9 @@ class ExecutorNode:
                 )
 
         # 遥测：这一步花了多少 token。
-        # usage 由 `services/llm.py` 的 `capture_llm_usage` 统一上报
-        # （`invoke_llm_with_timeout_message` 内部已开/关捕获槽），本节点不重复埋点。
+        # usage 由 ``services/llm.py`` 的 ``capture_llm_usage`` 统一上报
+        # （``invoke_llm_with_timeout_message`` 内部已开 / 关捕获槽），
+        # 本节点不重复埋点。
         telemetry.capture_executor_step(
             task_id=self.ctx.trace_id,
             step_index=state.executor_steps + 1,
@@ -387,18 +391,18 @@ class ExecutorNode:
                 task_id=self.ctx.trace_id,
             )
         except StructuredOutputError as e:
-            # 只记 facts（工具名 / finish_reason），不记 detail ——
+            # 只记 facts（工具名 / finish_reason），不记 detail。
             # detail 含模型原文，屏幕文字属于用户数据。
             logger.warning(f"[executor] structured output unusable: {e.reason} | {e.facts}")
             return None, e.reason
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[executor] LLM call failed: {type(e).__name__}: {str(e)[:200]}")
             return None, f"{type(e).__name__}: {str(e)[:200]}"
-        # 必须对着实际使用的 schema 类判：`executor_output_schema` 可能现场造
-        # 同名类，对着 ExecutorOutput 判会恒为 False，导致动作被丢弃。
+        # 必须对着实际使用的 schema 类判，不能写死 ExecutorOutput：schema 由调用方
+        # 传进来，写死一旦对不上就会恒为 False，动作被丢弃。
         if not isinstance(response, schema):
             return None, f"the answer was not an {schema.__name__} object"
         return response, None
 
-    # 屏幕截图不再进模型（2026-10-23 图片通道下线）：只看 UI 元素表 + OCR，
-    # 提示词与输出 schema 里都没有图。截图本身仍用于 OCR 与坐标校验。
+    # 屏幕截图不进模型：只看 UI 元素表和 OCR，提示词与输出 schema 里都没有图。
+    # 截图本身仍用于 OCR 与坐标校验。

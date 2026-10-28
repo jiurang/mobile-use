@@ -37,10 +37,26 @@
 * 模型要图的动作**照常执行**（截图不动屏幕），不占一次「扣动作 + 重来」；
 * 不需要 schema 里多一个字段（``need_screenshot`` 那种「举手」字段会让模型
   学会为它撒谎）；
-* 图挂在**工具结果**上，模型看得见「这是我刚要的那张图」，归属清楚。
+* 图在**prompt 末尾**（元素表旁边），模型看得见「这是我刚要的那张图」。
 
 ⚠️ **图和元素表是同一屏。** 工具在 contextor 抓完屏之后才跑，中间没有任何动作
 改动过屏幕 ⇒ 图与元素表描述的是同一屏，编号契约不受影响。
+
+图为什么不挂���工具结果上
+------------------------
+**图片块会进 provider 的前缀缓存键。** 真 API 实测（2026-10-26，
+MiniMax-M3.1-Flash，``api.minimaxi.com``；探针
+``mobile-manager/scripts/probe_cache_image_role.py``）：把请求**中段**的图片
+删掉、或换成另一张，命中量立刻掉到「图之前」的位置（8,639 → 7,193 /
+7,207 token）。
+
+⇒ 图挂在局部历史里 = 被钉在历史中段；下一次拍图要「顶替」它时那个位置的字节
+变了 ⇒ **前缀从历史中段起整段作废**。真机实测（mobile-manager execution 893）：
+14 次顶替让 47,181 个本可命中的 token 变成满价重算，缓存率从 82% 掉到 41%。
+
+⇒ 图另存（``EXECUTOR_SCREENSHOT_KEY``），装配 prompt 时放到**最后一条消息**
+（元素表旁边 —— 那本来就是每轮都变的易变区）⇒ 局部历史一个字节都不动，
+前缀永远稳定。
 
 provider 支持面（2026-10-24 真打 MiniMax-M3.1-Flash-Preview 实测）
 -----------------------------------------------------------------
@@ -66,27 +82,20 @@ from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
-from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
+from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY, EXECUTOR_SCREENSHOT_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.prompt_language import PromptLanguage, pick
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
-from minitap.mobile_use.utils.message_content import has_image_block
+from minitap.mobile_use.utils.message_content import screenshot_channel_label
 
 logger = get_logger(__name__)
 
 #: 图的 JPEG 质量。与 ``utils/image_compress.py`` 的默认一致（q50 实测可读）。
 SCREENSHOT_JPEG_QUALITY = 50
-
-#: 旧截图被顶掉时留在历史里的一句话。
-#:
-#: 为什么留一句话而不是直接删掉那条消息：删 ToolMessage 会留下**孤儿 tool_call**
-#: （assistant 那边的 tool_calls 还在），OpenAI 兼容端点直接 400
-#: （见 ``agents/summarizer/summarizer.py`` 的模块文档）。所以是**替换内容**，
-#: 不是删除消息。
-SUPERSEDED_NOTE = "(this screenshot was superseded by a newer one)"
 
 
 async def capture_screen_base64(ctx: MobileUseContext) -> str:
@@ -117,53 +126,41 @@ async def capture_screen_base64(ctx: MobileUseContext) -> str:
     return await UnifiedMobileController(ctx).take_screenshot()
 
 
-def build_screenshot_content(image_b64: str) -> list[str | dict[str, Any]]:
-    """工具结果的 content：**一段说明 + 一张图**。
+def build_screenshot_content(
+    *, language: PromptLanguage, jpeg_bytes: int
+) -> list[str | dict[str, Any]]:
+    """工具结果的 content：**一行事实**（图不在这里，图注也不在）。
 
-    说明是给模型看的，必须把三件事讲清楚：
+    ⚠️ **图为什么不挂在这条工具结果上**
+    --------------------------------
+    图片块**会进 provider 的前缀缓存键**（真 API 实测，MiniMax-M3.1-Flash：
+    把请求中段的图片删掉或换一张，命中量立刻掉到「图之前」的位置）。
 
-    1. 图和元素表是**同一屏**（不是另一屏）；
-    2. 图是**补充**，寻址仍然走元素表的 ``[i]``；
-    3. 一屏一图就够（token 成本 + 过期）。
+    ⇒ 图挂在局部历史里 = 被钉在历史中段；下一次拍图要「顶替」它时那个位置的
+    字节就变了 ⇒ **前缀从历史中段起整段作废**。
+    真机实测（mobile-manager execution 893）：14 次顶替让 47,181 个本可命中的
+    token 变成满价重算，缓存率从 82% 掉到 41%。
 
-    ⚠️ 说明里**不要写屏幕上的内容**（那是用户数据），只讲图本身的性质。
+    ⇒ 改成：工具结果只留**文字事实**，图另存（``EXECUTOR_SCREENSHOT_KEY``），
+    装配 prompt 时作为**独立的一条消息**（标题「图片感知」）放在最末。
+    局部历史一个字节都不动 ⇒ 前缀永远稳定。
+
+    ⚠️ **为什么也没有图注**
+    ----------------------
+    「图是补充、寻址走元素表的 ``[i]``、一屏一图就够」这套契约写在**静态
+    提示词**里（``agents/executor/executor.md``）—— 模型每轮都读得到。逐轮
+    重说一遍只是重复，还把一段易变文字塞进局部历史。
+
+    ⇒ 工具结果只回答两件事：**拍到了没有 / 多大**；图在哪儿由这一行指路。
     """
-    text = (
-        "Screenshot of the current screen - the same screen the element table "
-        "describes. It does not touch the screen.\n\n"
-        "The picture SUPPLEMENTS the element table and the OCR text, it does not "
-        "replace them:\n"
-        "- Use it for what those two cannot show: icons, images, colors, layout, "
-        "whether a popup covers something.\n"
-        "- Keep using the element table for WHAT TO TAP: the [i] row numbers stay "
-        "the addressing contract, this picture has no numbers on it.\n"
-        "- One picture per screen is enough: it goes stale as soon as the screen "
-        "changes, and each one costs about 1,200 input tokens."
+    label = screenshot_channel_label(language=language)
+    text = pick(
+        f"Screenshot taken: image/jpeg, {jpeg_bytes:,} bytes. The picture is in "
+        f'the "{label}" block at the end of this request.',
+        f"已截图：image/jpeg，{jpeg_bytes:,} 字节。图像在本次请求末尾的「{label}」段。",
+        language=language,
     )
-    return [
-        {"type": "text", "text": text},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-    ]
-
-
-def _superseded_screenshots(state: State) -> list[Any]:
-    """历史里**带着图**的那些工具结果（要顶掉的那几张）。
-
-    只保留**最新一张**图是有理由的，不只是省钱：
-
-    * 旧图对应的是**旧屏** —— 屏幕变了它就是错的，留着会误导模型
-      （「我看到的是这个」其实早就不是了）；
-    * 每张图约 1,200 input token，而局部历史**每轮都要整段重发** ⇒ 攒图等于
-      每轮多烧钱。
-
-    顶掉的方式是**替换内容**（留一句话），不是删消息 —— 删 ToolMessage 会留下
-    孤儿 tool_call，端点 400（见 ``agents/summarizer/summarizer.py``）。
-    """
-    return [
-        message
-        for message in (getattr(state, "executor_messages", None) or [])
-        if has_image_block(getattr(message, "content", None))
-    ]
+    return [{"type": "text", "text": text}]
 
 
 async def _error_command(
@@ -219,6 +216,10 @@ def get_take_screenshot_tool(ctx: MobileUseContext):
 
         It does not touch the screen, and one picture per screen is enough -
         it goes stale as soon as the screen changes.
+
+        The picture itself arrives in the next request, as the last message,
+        under the heading "Image perception" (「图片感知」) - a channel of its
+        own, separate from the element table and the OCR text.
         """
         controller = UnifiedMobileController(ctx)
 
@@ -262,25 +263,26 @@ def get_take_screenshot_tool(ctx: MobileUseContext):
         # ~33%，拿它当 KB 报给模型，那个数字是错的（模型会拿它做推理）。
         jpeg_bytes = len(base64.b64decode(image_b64))
         agent_outcome = take_screenshot_wrapper.on_success_fn(jpeg_bytes)
+        # 工具结果**只有文字** —— 图不进局部历史（见 build_screenshot_content 的
+        # 注释：图片块进 provider 的缓存键，写进历史会把前缀打断）。
         tool_message = ToolMessage(
             tool_call_id=tool_call_id,
-            content=build_screenshot_content(image_b64),
+            content=build_screenshot_content(
+                language=ctx.prompt_language,
+                jpeg_bytes=jpeg_bytes,
+            ),
             status="success",
         )
-
-        # 旧图顶掉：只留最新一张。**替换内容**而不是删消息（孤儿 tool_call 会 400）。
-        superseded = [
-            message.model_copy(update={"content": SUPERSEDED_NOTE})
-            for message in _superseded_screenshots(state)
-            if getattr(message, "id", None)
-        ]
 
         return Command(
             update=await state.asanitize_update(
                 ctx=ctx,
                 update={
                     "agents_thoughts": [agent_thought, agent_outcome],
-                    EXECUTOR_MESSAGES_KEY: [*superseded, tool_message],
+                    # 历史里只**追加**这条工具结果 —— 一个字节都不改写。
+                    EXECUTOR_MESSAGES_KEY: [tool_message],
+                    # 图另存：只留最新一张（覆盖），装配 prompt 时放到末尾。
+                    EXECUTOR_SCREENSHOT_KEY: image_b64,
                 },
                 agent="executor",
             ),

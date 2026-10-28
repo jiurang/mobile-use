@@ -37,7 +37,7 @@ CANDIDATES = (
     / "main"
     / "resources"
     / "llm-channels.json",
-    Path("E:/MyCoding/mobile-manager/manager-server/src/main/resources/llm-channels.json"),
+    Path("E:/MyCoding/mobile/mobile-manager/manager-server/src/main/resources/llm-channels.json"),
 )
 
 

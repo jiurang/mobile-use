@@ -1,25 +1,22 @@
 """Planner：把「用户目标」拆成一份子目标计划，并在需要时重规划。
 
-两条不能破的契约
-----------------
+这个节点有两条不能破的契约。
 
-1. **计划日志只增不改。** ``subgoal_plan_log`` 是 append-only 的：replan 时
-   在尾部追加一段 ``PLAN vN``，旧段一字不改。改写旧段会击穿 cortex 提示词的
-   前缀（实测：一次 replan 差 8,078 token，且这个差随 thoughts 变长而变大）。
-   理由见 :func:`_append_plan_section`。
+第一，计划日志只增不改。``subgoal_plan_log`` 是 append-only 的，replan 时在
+尾部追加一段 ``PLAN vN``，旧段一字不改。改写旧段会击穿 cortex 提示词的
+前缀，实测一次 replan 差 8,078 token，而且这个差随 thoughts 变长而变大。
+理由见 :func:`_append_plan_section`。
 
-2. **replan 只返回「剩下的步骤」。** LLM 在重规划时**不**重说已经完成的
-   子目标；代码把 ``SUCCESS`` 的子目标原样带回去（``completed_subgoals +
-   new_subgoals``）。否则模型一重规划就会把做完的事再做一遍。
+第二，replan 只返回剩下的步骤。LLM 在重规划时不重说已经完成的子目标，代码把
+``SUCCESS`` 的子目标原样带回去（``completed_subgoals + new_subgoals``）。否则
+模型一重规划就会把做完的事再做一遍。
 
-韧性：解析失败不许杀死整个任务
-------------------------------
-和 cortex 同一个病（MiniMax 偶发返回空响应 ⇒ 解析抛 ⇒ 整个任务当场失败），
-而 ``with_fallback`` 救不了 —— 本机 override 里 fallback 和主模型是同一个模型。
-
-⇒ 失败 → 带 nudge 重试一次 → 仍失败 → **降级**成「重新下发那些失败的子目标」。
-降级**不引入任何新的事实断言**（重新下发一个「还没做完」的子目标是事实）。
-只有**首次规划**没有可退守的东西（没有计划就没有可执行的东西）⇒ 只能抛。
+解析失败不许杀死整个任务。cortex 有同一个毛病：MiniMax 偶发返回空响应，
+解析一抛整个任务当场失败，而 ``with_fallback`` 救不了，因为本机 override 里
+fallback 和主模型是同一个模型。所以失败后带 nudge 重试一次，仍失败就降级成
+「重新下发那些失败的子目标」。降级不引入任何新的事实断言，重新下发一个还没
+做完的子目标是事实。只有首次规划没有可退守的东西，没有计划就没有可执行的东西，
+那种情况只能抛。
 """
 
 from functools import cache
@@ -65,12 +62,15 @@ _STATUS_LABELS = {
 
 @cache
 def _load_template(filename: str) -> Template:
+    """加载提示词模板并缓存，模板内容在整个进程生命周期内不变。"""
     return Template(Path(__file__).parent.joinpath(filename).read_text(encoding="utf-8"))
 
 
 def _format_plan(subgoals: list[Subgoal]) -> str:
-    """Render the previous plan for the prompt. IDs are omitted on purpose:
-    they are regenerated on every plan and would only be noise for the LLM."""
+    """把上一版计划渲染进提示词。
+
+    刻意不写 ID：ID 每次规划都会重新生成，对模型只是噪声。
+    """
     if not subgoals:
         return "(no previous plan)"
     lines = []
@@ -83,7 +83,11 @@ def _format_plan(subgoals: list[Subgoal]) -> str:
 
 
 def _build_subgoals(output: PlannerOutput) -> list[Subgoal]:
-    """Validate and normalize the LLM output into fresh subgoals."""
+    """校验并归一化模型交回来的计划。
+
+    空描述和重复描述直接丢掉，一条都不剩就说明模型没给出计划，抛错。ID 每次
+    重新生成，并保证同一次规划里互不重复。
+    """
     descriptions: list[str] = []
     seen: set[str] = set()
     for raw in output.subgoals:
@@ -119,8 +123,10 @@ async def _invoke_planner(
     ctx: MobileUseContext,
     used_fallback: bool = False,
 ) -> list[Subgoal]:
-    """Call the LLM and validate its output so that an invalid plan from the
-    main model can be retried with the fallback model."""
+    """调模型并校验它的输出。
+
+    主模型给出无效计划时，调用方可以带着同样的消息换 fallback 模型重试。
+    """
     response = await invoke_llm_with_timeout_message(
         llm.ainvoke(messages),
         agent_name="planner",
@@ -135,10 +141,10 @@ async def _invoke_planner(
 def _append_plan_section(
     previous_log: str, version: int, is_replan: bool, subgoals: list[Subgoal]
 ) -> str:
-    """把这一版计划追加到计划日志末尾。**不改动之前任何一段。**
+    """把这一版计划追加到计划日志末尾，不改动之前任何一段。
 
-    改写旧段会击穿 cortex 提示词的前缀（见 doc/cortex提示词组成v2.md Q2）：
-    replan 时旧表会在中部被改写、新子目标的 ID 还是随机生成的，改一处等于
+    改写旧段会击穿 cortex 提示词的前缀（见 docs/cortex提示词组成v2.md）：
+    replan 时旧表会在中部被改写，而新子目标的 ID 还是随机生成的，改一处等于
     后面全部作废。只追加则天然单调。
     """
     header = f"PLAN v{version}" + (" (replan)" if is_replan else "")
@@ -147,7 +153,12 @@ def _append_plan_section(
 
 
 class PlannerNode:
-    def __init__(self, ctx: MobileUseContext):
+    """规划节点：把用户目标变成一份子目标计划。
+
+    子目标失败时，这里重新规划；重新规划只追加计划日志，不改旧段。
+    """
+
+    def __init__(self, ctx: MobileUseContext) -> None:
         self.ctx = ctx
 
     @wrap_with_callbacks(
@@ -155,23 +166,22 @@ class PlannerNode:
         on_success=lambda _: logger.success("Planner Agent"),
         on_failure=lambda _: logger.error("Planner Agent"),
     )
-    async def __call__(self, state: State):
+    async def __call__(self, state: State) -> dict[str, Any]:
         needs_replan = one_of_them_is_failure(state.subgoal_plan)
 
-        # 重规划计数（方案 §11.6「replan 触发计数」）。
+        # 重规划触发计数。
         #
-        # 这个埋点唯一的用途是**验证看门狗还活着（R16）**：R16 要求「计划级失败
-        # 不能没人管」，新拓扑里的处理链是
-        # ``reporter → orchestrator → convergence → replan → planner`` ——
-        # 每一次真正走到 replan，就证明这条链通了。反过来，「跑了很久却一次
-        # replan 都没有」有两种可能：一次没失败过（正常），或者**看门狗断了**
-        # （子目标失败了没人接手，Cortex 一直重发到撞 recursion_limit）。
-        # 这两种光看别的指标分不开。
+        # 这个埋点唯一的用途是验证看门狗还活着：计划级的失败不能没人管，新
+        # 拓扑里的处理链是 reporter、orchestrator、convergence、replan、planner，
+        # 每一次真正走到 replan，就证明这条链通了。反过来，跑了很久却一次
+        # replan 都没有，只有两种可能：一次没失败过（正常），或者看门狗断了
+        # （子目标失败了没人接手，Cortex 一直重发到撞 recursion_limit）。这两种
+        # 光看别的指标分不开。
         #
         # 埋在这里而不是 `convergence_gate`：那个是纯函数，拿不到 task_id；
         # 而 planner 正好算得出 `needs_replan`。
         #
-        # ⚠️ 只报数量，不报子目标原文（原文是用户数据）。
+        # 只报数量，不报子目标原文，原文是用户数据。
         if needs_replan:
             telemetry.capture_replan(
                 task_id=self.ctx.trace_id,
@@ -225,23 +235,23 @@ class PlannerNode:
                 ),
             )
 
-        # 🔴 **韧性**：解析失败不许杀死整个任务。
+        # 韧性：解析失败不许杀死整个任务。
         #
-        # 和 cortex 同一个病（`agents/cortex/cortex.py` 的同款形状）：
-        # MiniMax 偶发返回空响应 ⇒ `_parse` 抛 ⇒ **整个任务当场失败**。
-        # `with_fallback` 救不了 —— 本机 override 里 fallback 和主模型是同一个模型。
+        # 和 cortex 同一个病（agents/cortex/cortex.py 的同款形状）：MiniMax 偶发
+        # 返回空响应，`_parse` 一抛，整个任务当场失败。`with_fallback` 救不了，
+        # 本机 override 里 fallback 和主模型是同一个模型。
         #
-        # ⇒ 失败 → 带 nudge 重试一次 → 仍失败 → **降级**。
+        # 所以失败后带 nudge 重试一次，仍失败就降级。
         #
-        # 降级成什么（**不引入任何新的事实断言**）：
-        # * **replan 场景**（有旧计划，且有被标失败的子目标）⇒ **把那个失败的
-        #   子目标重新下发一次**。它「还没做完」，所以重新下发是事实，不是编造；
-        #   这也正是「换招重试」在计划层的形状。
-        # * **首次规划**（没有旧计划）⇒ **没有可退守的东西**，只能抛。
-        #   这条真的无解：没有计划就没有任何可执行的东西。
+        # 降级成什么，原则是不引入任何新的事实断言：
+        # - replan 场景，也就是有旧计划且有被标失败的子目标，把那个失败的子目标
+        #   重新下发一次。它还没做完，所以重新下发是事实，不是编造，这也正是
+        #   「换招重试」在计划层的形状。
+        # - 首次规划，也就是没有旧计划，没有可退守的东西，只能抛。这条真的无解：
+        #   没有计划就没有任何可执行的东西。
         #
-        # ⚠️ **代价（要说清）**：降级后那个子目标可能再失败 ⇒ 又 replan ⇒ 又降级 ⇒
-        # **可能反复重规划直到全局动作步预算耗尽**。全局预算是唯一的兜底。
+        # 代价要说清：降级后那个子目标可能再失败，于是又 replan 又降级，可能反复
+        # 重规划直到全局动作步预算耗尽。全局预算是唯一的兜底。
         try:
             new_subgoals = await ask_planner(messages)
         except Exception as e:  # noqa: BLE001
@@ -261,7 +271,7 @@ class PlannerNode:
             except Exception as e2:  # noqa: BLE001
                 failed = [s for s in state.subgoal_plan if s.status == SubgoalStatus.FAILURE]
                 if not failed:
-                    # 首次规划（或没有失败子目标）⇒ 没有可退守的东西，只能抛。
+                    # 首次规划（或没有失败子目标）没有可退守的东西，只能抛。
                     logger.warning(
                         f"[planner] retry also failed ({type(e2).__name__}: {str(e2)[:160]}) "
                         "and there is no failed subgoal to re-issue; giving up"
@@ -279,8 +289,8 @@ class PlannerNode:
                     )
                     for s in failed
                 ]
-        # On replan, the LLM only returns the remaining steps: already completed
-        # subgoals are kept as-is so they are never executed a second time.
+        # 重规划时，模型只交回剩下的步骤。已完成的子目标原样保留，所以它们
+        # 不会被执行第二遍。
         completed_subgoals = [
             subgoal for subgoal in state.subgoal_plan if subgoal.status == SubgoalStatus.SUCCESS
         ]

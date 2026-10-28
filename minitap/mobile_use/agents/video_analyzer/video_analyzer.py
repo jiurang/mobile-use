@@ -1,8 +1,8 @@
-"""
-Video Analyzer utility for analyzing video content using Gemini models.
+"""视频分析：把视频文件交给 Gemini 系模型做分析。
 
-This utility sends video files to video-capable Gemini models for analysis
-and returns text descriptions based on the provided prompt.
+视频先按 API 的体积上限压缩，再作为 base64 附件随提示词一起发过去。模型回的
+文字就是分析结果；提示词本身在 ``video_analyzer.md`` 和 ``human.md`` 两个模板
+里，这里只负责组装消息和清理临时文件。
 """
 
 import base64
@@ -24,26 +24,21 @@ async def analyze_video(
     video_path: Path,
     prompt: str,
 ) -> str:
-    """
-    Analyze a video file using a video-capable Gemini model.
+    """分析一个视频文件，返回模型写的文字说明。
 
-    Args:
-        ctx: The MobileUseContext containing LLM configuration
-        video_path: Path to the video file (MP4)
-        prompt: The analysis prompt/question about the video
-
-    Returns:
-        Text analysis result from the model
+    ``prompt`` 是要问模型的问题，原样拼进 ``human.md`` 模板。视频体积超过 API
+    上限时先压缩，压缩产物在函数结束时删掉，原始视频不动。
 
     Raises:
-        Exception: If video analysis fails
+        FileNotFoundError: 视频文件不存在。
+        Exception: 模型调用失败时原样抛出，调用方自己决定要不要重试。
     """
     logger.info(f"Starting video analysis for {video_path}")
 
     if not video_path.exists():
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
-    # Compress video if needed to fit within API limits
+    # 视频超过 API 的体积上限时先压一份，压缩产物用完即删。
     compressed_path = await compress_video_for_api(video_path)
 
     try:
@@ -53,7 +48,7 @@ async def analyze_video(
         video_base64 = base64.b64encode(video_bytes).decode("utf-8")
 
         suffix = compressed_path.suffix.lower()
-        mime_type = "video/mp4" if suffix in [".mp4", ".m4v"] else f"video/{suffix[1:]}"
+        mime_type = "video/mp4" if suffix in (".mp4", ".m4v") else f"video/{suffix[1:]}"
 
         system_message_content = Template(
             Path(__file__).parent.joinpath("video_analyzer.md").read_text(encoding="utf-8")
@@ -110,11 +105,11 @@ async def analyze_video(
 
         return result
     finally:
-        # Clean up compressed file if it differs from original
+        # 只清压缩产物，原始视频不动。
         if compressed_path != video_path and compressed_path.exists():
             try:
                 compressed_path.unlink()
             except OSError as e:
-                # 清理失败不该影响已经拿到的分析结果 —— 只记一条，别把
+                # 清理失败不该影响已经拿到的分析结果，只记一条，别把
                 # 「结果成功但临时文件没删掉」变成一次失败。
                 logger.debug(f"Could not remove the compressed video: {e}")

@@ -25,7 +25,6 @@ from minitap.mobile_use.tools.mobile.open_link import open_link_wrapper
 from minitap.mobile_use.tools.mobile.press_key import press_key_wrapper
 from minitap.mobile_use.tools.mobile.stop_app import stop_app_wrapper
 from minitap.mobile_use.tools.mobile.swipe import swipe_wrapper
-from minitap.mobile_use.tools.mobile.take_screenshot import take_screenshot_wrapper
 from minitap.mobile_use.tools.mobile.tap import tap_wrapper
 from minitap.mobile_use.tools.mobile.video_recording import (
     start_video_recording_wrapper,
@@ -66,11 +65,17 @@ EXECUTOR_WRAPPERS_TOOLS = [
     focus_and_clear_text_wrapper,
     press_key_wrapper,
     wait_for_delay_wrapper,
-    # 屏幕是灭的时候用它点亮 —— 息屏时截图全黑、层级树只剩 systemui 残留，agent 会盲操作
+    # 屏幕是灭的时候用它点亮 —— 息屏时 OCR 认不出字、层级树只剩 systemui 残留，agent 会盲操作
     wake_screen_wrapper,
-    # 截图：**UI 元素表与 OCR 的补充**。模型自己喊一声要看图，框架把当屏那张图
-    # 挂在工具结果上（不占 schema 字段、不扣动作）。寻址仍然走元素表的 `[i]`。
-    take_screenshot_wrapper,
+    # 🔴 **2026-10-27 移除截图工具。**
+    #
+    # `take_screenshot`（模型自己喊一声要看图）已从 Executor 的工具集里**整体摘掉**：
+    # 实现文件 `tools/mobile/take_screenshot.py` 一并删除，提示词里的工具表行、
+    # 「图片感知」通道、`state.executor_screenshot` 字段全部清干净。
+    #
+    # ⇒ 感知只剩两条**文字**通道：UI 元素表 + OCR。
+    #
+    # 备份 / 恢复说明：`backup/20261027-remove-screenshot-tool/README.md`
     # Scratchpad tools for persistent memory
     # 🔴 2026-10-23 临时停用 —— 见本文件顶部的说明。恢复：解开下面三行注释。
     # save_note_wrapper,

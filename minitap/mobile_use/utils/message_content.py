@@ -24,9 +24,14 @@ LangChain 的 ``Message.content`` 有两种形态：
 :func:`content_to_text`；凡是「要保留图」的地方，用 :func:`has_image_block`
 判断后再决定怎么处理。
 
+⚠️ **2026-10-27：截图通道已整条移除**（含按需工具 ``take_screenshot``），
+模型现在收不到任何图。本模块的三个函数**仍然保留** —— 它们防的是
+「任何多模态内容」，不只是截图；哪天某个工具又往消息里塞图片块，
+这些坑不该再踩一遍。
+
 **图片块长什么样**
 ------------------
-本仓库发出去的图片块是 **OpenAI 原生形态**::
+图片块用 **OpenAI 原生形态**::
 
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,...."}}
 

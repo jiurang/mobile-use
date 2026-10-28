@@ -236,28 +236,33 @@ def test_executor_prompt_keeps_perception_channels():
 
 
 def test_executor_prompt_has_no_trace_of_the_picture_channel():
-    """图片**通道**仍然下线，但「按需截图**工具**」回来了 —— 两者必须分清。
+    """截图这条通道**整条移除**（2026-10-27）：提示词里不许再有图的痕迹。
 
-    2026-10-23 下线的是「**每轮附图**」那条通道：模型没有 `need_screenshot`
-    字段可以举手，屏幕描述块里也没有图。
+    下线过两次：先是「每轮附图」那条通道（2026-10-23，`need_screenshot`
+    这种「举手要图」的字段），后是「按需工具」那条（2026-10-27，
+    `take_screenshot` —— 模型自己喊一声要看图）。
 
-    2026-10-24 起截图改成**工具** `take_screenshot`：模型自己调，图挂在工具
-    结果上。所以提示词里**必须**出现 `take_screenshot`（模型得能叫出这个名字），
-    而且必须写清它是元素表 / OCR 的**补充** —— 否则模型会以为图能代替元素表，
-    然后报出图上并不存在的编号。
+    ⇒ 这里断言：提示词里**一个**截图痕迹都不许有 ——
+    工具表行、说明段落、通道标题，全部不许出现。
 
-    ⇒ 这里断言两件事：
-    1. **通道**的痕迹（`need_screenshot` 这类「举手要图」的字段）一个都不许有；
-    2. **工具**在，并且「补充」这层关系写出来了。
+    ⚠️ 断言的是**「不许有」**，不是「必须有什么」：加了新工具再改一遍
+    这条断言的成本，比留一条「模型得能叫出这个名字」的断言低得多 ——
+    截图通道已经**整条**没了，没有模型需要叫的名字。
     """
+    for path in (_EXECUTOR_MD, _EXECUTOR_ZH_MD):
+        text = path.read_text(encoding="utf-8")
+        for marker in (
+            "need_screenshot",
+            "`take_screenshot`",
+            "take_screenshot",
+            "Image perception",
+            "图片感知",
+        ):
+            assert marker not in text, f"{path.name} 里还有截图痕迹：{marker}"
+    # 两条**文字**通道还在
     text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    # 通道的痕迹：模型不该再学会「举手要图」这个动作
-    assert "need_screenshot" not in text
-    # 工具在
-    assert "`take_screenshot`" in text
-    # 并且写清了它是补充（不是替代）
-    assert "supplement" in text.lower()
     assert "element table" in text
+    assert "OCR block" in text
 
 
 def test_executor_prompt_has_no_tool_json_schema():

@@ -114,6 +114,15 @@ class State(BaseModel):
     executor_messages: Annotated[list[AnyMessage], "Sequential Executor messages", add_messages]
     cortex_last_thought: Annotated[str | None, "Last thought of the cortex for the executor"]
 
+    # 🔴 **2026-10-27 移除：`executor_screenshot` 字段。**
+    #
+    # 截图这条通道已整条下线（含按需工具 `take_screenshot`），模型收不到任何图，
+    # state 里也就没有必要留「当屏截图」这个字段。
+    #
+    # 截图本身仍用于 **OCR** 与**坐标校验**（框架内部取数，不进消息）。
+    #
+    # 备份 / 恢复说明：`backup/20261027-remove-screenshot-tool/README.md`
+
     # ---- Executor 自主执行（方案 v2，doc/executor-autonomy-plan.md §8）----
     #
     # 语义变化：`executor_messages` 从「Cortex 每轮清空」变成

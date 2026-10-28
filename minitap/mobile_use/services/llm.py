@@ -27,6 +27,7 @@ from minitap.mobile_use.config import (
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.services.channels import (
     ChannelSpec,
+    normalize_base_url,
     require_channel,
 )
 from minitap.mobile_use.services.telemetry import telemetry
@@ -507,13 +508,17 @@ def get_anthropic_llm(
     override = override or ProviderOverride()
     api_key = override.key_or("ANTHROPIC_API_KEY")
     assert api_key is not None
+    # 端点归一化：Anthropic 协议的客户端拼的是 ``/v1/messages``，所以基址要停在
+    # 根上 —— 用户粘 ``https://api.anthropic.com/v1/messages`` 进来时，
+    # 不剥掉就会请求 ``.../v1/v1/messages``。
+    anthropic_url = normalize_base_url(override.base_url, "anthropic")
     client = AnthropicCacheControlChat(
         model_name=model_name,
         api_key=api_key,
         # `anthropic_api_url` 是 ChatAnthropic 的端点字段名(不是 `base_url`,
         # 见 langchain_anthropic/chat_models.py:946)。这里只认渠道下发的值 ——
         # Settings 里没有 ANTHROPIC_BASE_URL 这个键,不要凭空发明一个。
-        anthropic_api_url=override.base_url,
+        anthropic_api_url=anthropic_url,
         temperature=temperature,
         max_tokens=8192,  # type: ignore[call-arg]  # field aliased to max_tokens_to_sample
         max_retries=2,
@@ -1543,6 +1548,12 @@ def build_openai_protocol_client(
             f"请在渠道配置里填上 —— 不填的话请求会打到别的服务商，"
             f"而错误信息完全指不到真正的原因。"
         )
+    # 端点归一化：用户常常直接粘供应商文档里的**完整端点**
+    # （``.../v1/embeddings``、``.../v1/chat/completions``），而这个客户端会
+    # 在 base_url 后面自己拼 ``/chat/completions`` —— 不剥掉尾巴就变成
+    # ``.../embeddings/chat/completions`` → 404。
+    # 详见 :func:`minitap.mobile_use.services.channels.normalize_base_url`。
+    base_url = normalize_base_url(base_url, spec.protocol)
 
     # ---- 温度钳制 ----
     if spec.temperature_range:

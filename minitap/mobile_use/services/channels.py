@@ -495,6 +495,15 @@ CHANNELS: dict[str, ChannelSpec] = {
         requires_base_url=True,
         api_key_env=None,
         base_url_env=None,
+        note=(
+            "任何 OpenAI 兼容的服务都能用这条渠道（自己换供应商不用改代码）。"
+            "Base URL 填到版本号那一层就行（如 https://host/v1）；"
+            "直接粘供应商文档里的完整端点（.../v1/chat/completions）也可以 —— "
+            "系统会自动去掉末尾那段路径，避免请求打到 .../chat/completions/chat/completions "
+            "而拿到 404。填完可以点「测试连接」当场验证。"
+            "⚠️ 向量模型（embedding，如 Qwen3-Embedding-8B）不能当对话模型用："
+            "服务端会拒绝（HTTP 511「模型不支持 OpenAI Completions 接口」）。"
+        ),
     ),
     # ---- 保留的原生通道（SDK 没有 OpenAI 兼容等价物）------------------------
     "google": ChannelSpec(
@@ -600,6 +609,85 @@ def protocol_of(channel_id: str) -> LLMProtocol:
     """
     spec = get_channel(channel_id)
     return spec.protocol if spec else "openai"
+
+
+# ---------------------------------------------------------------------------
+# 端点归一化
+# ---------------------------------------------------------------------------
+#
+#: **客户端自己会拼在 base_url 后面的路径**，按协议分。
+#:
+#: OpenAI 兼容协议的客户端（``ChatOpenAI``）拼的是 ``/chat/completions``；
+#: Anthropic 协议的客户端（``ChatAnthropic``）拼的是 ``/v1/messages``。
+#:
+#: 这些路径是**客户端**的行为，不是某个供应商的行为 —— 所以按协议归类，
+#: 而不是按渠道列一张表（那会变成第二份会过期的清单）。
+#:
+#: ⚠️ ``/embeddings`` 也在 OpenAI 那一栏里，但它的含义和另外几个不同：
+#: 向量端点是**另一个 API**，不是 ``/chat/completions`` 的别名。它出现在这里，
+#: 是因为用户贴进来的地址常常是「向量端点」，而我们要在拼路径之前把它
+#: **还原成基址**（见 :func:`normalize_base_url`）。
+_ENDPOINT_SUFFIXES: dict[LLMProtocol, tuple[str, ...]] = {
+    # OpenAI 兼容：SDK 拼 chat/completions；embeddings / responses / completions
+    # 是同族的其它端点，一并当作「可以剥掉的尾巴」。
+    "openai": ("/chat/completions", "/completions", "/embeddings", "/responses"),
+    # Anthropic：SDK 拼的是 /v1/messages。
+    "anthropic": ("/v1/messages", "/messages"),
+    # google / vertexai 的 SDK 没有端点旋钮，azure 的 endpoint 是部署根地址
+    # （后面要跟 /openai/deployments/{model}），都不该被剥。
+    "google": (),
+    "vertexai": (),
+    "azure": (),
+}
+
+
+def normalize_base_url(url: str | None, protocol: LLMProtocol = "openai") -> str | None:
+    """把「粘进来的完整端点」还原成「客户端会拼路径的基址」。
+
+    为什么需要这个
+    --------------
+    供应商的文档给的是**完整端点**，用户就照着粘::
+
+        https://api.scnet.cn/api/llm/v1/embeddings     ← 用户填的
+        https://api.scnet.cn/api/llm/v1/chat/completions ← SDK 最终请求的
+
+    而 OpenAI 兼容客户端会在 base_url 后面**自己拼** ``/chat/completions``，
+    于是拼出来的是::
+
+        https://api.scnet.cn/api/llm/v1/embeddings/chat/completions  → 404
+
+    这个 404 是最难查的一类：地址看着像模像样，服务端只回一句 ``Not Found``，
+    而真正的原因是「base_url 里多带了一段路径」。
+    （真机实测 2026-10-26：manager 下发 ``.../v1/embeddings``，
+    执行 885 每次调用都拿到
+    ``404 {'path': '/acx/llm/v1/embeddings/chat/completions'}``。）
+
+    ⇒ **规则：base_url 是基址，不是端点。** 粘进来的地址如果已经带着
+    客户端会拼的那段路径，就把它剥掉，让「两种填法」都能用。
+
+    只剥**已知的尾巴**，不猜、不改写域名和路径的其余部分：
+    ``https://x.com/v1`` 保持原样（OpenAI 协议的 ``/v1`` 是要留着的），
+    ``https://x.com/api/llm/v1`` 也保持原样。
+
+    Anthropic 协议多剥一层 ``/v1``：那个协议的客户端拼的是 ``/v1/messages``，
+    所以基址得停在根上 —— 留着 ``/v1`` 会拼出 ``/v1/v1/messages``。
+    """
+    if url is None:
+        return None
+    cleaned = url.strip()
+    if not cleaned:
+        return None
+    # 去掉结尾的斜杠（``https://x.com/v1/`` → ``https://x.com/v1``）。
+    cleaned = cleaned.rstrip("/")
+    suffixes = _ENDPOINT_SUFFIXES.get(protocol, ())
+    for suffix in suffixes:
+        if cleaned.lower().endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+            break
+    if protocol == "anthropic" and cleaned.lower().endswith("/v1"):
+        # Anthropic 客户端拼的是 /v1/messages —— 基址停在根上。
+        cleaned = cleaned[: -len("/v1")].rstrip("/")
+    return cleaned or None
 
 
 def catalog_payload() -> list[dict[str, Any]]:

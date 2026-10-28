@@ -43,6 +43,7 @@ from minitap.mobile_use.agents.executor.executor import (  # noqa: E402
 )
 from minitap.mobile_use.agents.executor.prompt import (  # noqa: E402
     build_executor_messages,
+    render_executor_system,
     render_failures_message,
 )
 from minitap.mobile_use.agents.executor.types import (  # noqa: E402
@@ -77,6 +78,7 @@ from minitap.mobile_use.utils.failed_targets import (  # noqa: E402
     record_failure,
 )
 from minitap.mobile_use.utils.screen_elements import ScreenElement  # noqa: E402
+from minitap.mobile_use.utils.message_content import has_image_block  # noqa: E402
 from minitap.mobile_use.utils.ui_hierarchy import ElementBounds  # noqa: E402
 
 
@@ -202,6 +204,83 @@ def test_t12c_failed_targets_block_comes_after_history():
     fail_idx = next(i for i, m in enumerate(msgs) if "already failed" in str(m.content))
     history_idx = next(i for i, m in enumerate(msgs) if isinstance(m, ToolMessage))
     assert fail_idx > history_idx
+
+
+# ---------------------------------------------------------------------------
+# T18 —— 截图通道已整条移除：prompt 里**永远**不该有图片块
+# ---------------------------------------------------------------------------
+
+
+def _message_texts(msgs) -> list[str]:
+    """每条消息的**文字**（多模态 content 只取 text 块）。"""
+    out = []
+    for m in msgs:
+        content = m.content
+        if isinstance(content, str):
+            out.append(content)
+        elif isinstance(content, list):
+            out.append(
+                "\n".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            )
+        else:
+            out.append(str(content))
+    return out
+
+
+def test_t18_the_prompt_never_carries_an_image_block():
+    """🔴 **prompt 里永远不该有图片块**（2026-10-27 截图通道整条移除）。
+
+    下线过两条：先是「每轮附图」那条（`need_screenshot` 举手字段），
+    后是「按需工具」那条（`take_screenshot` + 末尾那条「图片感知」消息）。
+
+    ⇒ 现在模型只有两条**文字**通道：UI 元素表 / OCR 块。
+    """
+    msgs = build_executor_messages(
+        ctx=_ctx(),
+        goal="进入 WLAN 页面",
+        screen_elements=_elements(),
+        failures=[],
+        local_messages=[ToolMessage(content="Tapped.", tool_call_id="c1")],
+        device_state_lines=["Device date: 2026-10-21"],
+    )
+
+    for i, m in enumerate(msgs):
+        assert not has_image_block(getattr(m, "content", None)), f"第 {i} 条消息里不该有图"
+
+
+def test_t18b_the_last_message_is_the_element_table():
+    """最后一条消息是**元素表** —— 屏幕描述到这儿就结束，没有「图片感知」。"""
+    msgs = build_executor_messages(
+        ctx=_ctx(),
+        goal="进入 WLAN 页面",
+        screen_elements=_elements(),
+        failures=[],
+        local_messages=[],
+        device_state_lines=[],
+    )
+
+    texts = _message_texts(msgs)
+    assert "[1]" in texts[-1], "最后一条消息应该是元素表"
+    assert "Image perception" not in texts[-1]
+    assert "图片感知" not in texts[-1]
+
+
+def test_t18c_the_static_prompt_has_no_picture_contract():
+    """静态提示词里也不许再讲「图是补充、寻址走行号」那套契约。
+
+    契约随通道一起没了 —— 留着等于教模型去找一条不存在的通道。
+    """
+    system = render_executor_system(_ctx())
+
+    for marker in ("take_screenshot", "Image perception", "picture"):
+        assert marker not in system, f"静态提示词里还有截图痕迹：{marker}"
+    # 两条**文字**通道还在
+    assert "element table" in system
+    assert "OCR block" in system
 
 
 def test_failed_targets_block_has_no_bare_index():
@@ -625,23 +704,23 @@ def test_t13_executor_output_has_no_picture_field():
     }
 
 
-def test_t13b_executor_prompt_has_no_picture_channel_but_keeps_the_screenshot_tool():
-    """图片**通道**没回来，截图**工具**回来了；息屏唤醒必须留着。
+def test_t13b_executor_prompt_has_no_picture_channel_but_keeps_wake_screen():
+    """截图通道**整条没了**，但息屏唤醒必须留着。
 
     息屏唤醒是另一回事（真机教训：30 分钟息屏让一个任务从 30 步涨到 51 步），
-    它和图片通道无关，不能一起删掉。
+    它和图片通道无关，不能一起删掉 —— 现在模型只有两条文字通道，
+    息屏时两条都读不到东西，「先唤醒」就更得保住。
 
-    2026-10-24：截图从「每轮附图的通道」改成了「模型自己调的**工具**」——
-    所以提示词里必须有 `take_screenshot`（模型得能叫出这个名字），
-    而 `need_screenshot` 这种「举手要图」的字段必须仍然不在（通道没回来）。
+    2026-10-27：按需截图**工具**也下线了 ⇒ 提示词里不许再有 `take_screenshot`，
+    `need_screenshot` 这种「举手要图」的字段同样不许有。
     """
     from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
 
     text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
     # 通道没回来：模型不该再学会「举手要图」
     assert "need_screenshot" not in text
-    # 工具回来了
-    assert "`take_screenshot`" in text
+    # 工具也没了：模型没有可喊的名字
+    assert "take_screenshot" not in text
     # 息屏唤醒必须留着
     assert "wake_screen" in text
 
@@ -1100,7 +1179,6 @@ def _initial_state() -> dict:
         "latest_ui_hierarchy": None,
         "latest_ocr_results": None,
         "latest_screen_elements": None,
-        "latest_screenshot": None,
         "focused_app_info": None,
         "device_date": None,
         "structured_decisions": None,

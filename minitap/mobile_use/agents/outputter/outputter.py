@@ -1,26 +1,27 @@
-"""Outputter：把整条链路的思考过程压成**一份结构化产出**。
+"""Outputter：把整条链路的思考过程压成一份结构化产出。
 
-它是链路的**最后一跳**，产出物直接给调用方（SDK / TUI），不再回流给任何
-agent。
+它是链路的最后一跳，产出物直接给调用方（SDK / TUI），不再回流给任何 agent。
 
-两条路径
---------
+有两条路径：
 
-* **结构化**（``output_config.structured_output`` 有值）⇒ 走
-  ``with_structured_output(schema)``，产出按 schema 校验过的对象。
-  ``schema`` 可以是 dict（原生 JSON schema）或一个 ``BaseModel``。
-* **纯文本** ⇒ 模型直接写内容，按 JSON 解析。
+* 结构化（``output_config.structured_output`` 有值）时走
+  ``with_structured_output(schema)``，产出按 schema 校验过的对象。``schema``
+  可以是 dict（原生 JSON schema），也可以是一个 ``BaseModel``。
+* 纯文本时模型直接写内容，按 JSON 解析。
 
-⚠️ ``output_config.output_description`` 不为空时会**多发一条 HumanMessage**
-（把描述当成追加指令）。同时，只要结构化响应对象**自带** ``content`` 字段，
-返回的就是**模型写的 JSON**（``json.loads(response.content)``）而不是
-``model_dump()`` —— 两条路径的数据来源不一样，调用方拿到的东西也不同。
+``output_config.output_description`` 不为空时会多发一条 HumanMessage，把描述
+当成追加指令。只要结构化响应对象自带 ``content`` 字段，返回的就是模型写的
+JSON（``json.loads(response.content)``），不是 ``model_dump()``；两条路径的数据
+来源不一样，调用方拿到的东西也不一样。
 """
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
+from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from pydantic import BaseModel
 
 from minitap.mobile_use.config import OutputConfig
@@ -36,7 +37,8 @@ logger = get_logger(__name__)
 
 async def outputter(
     ctx: MobileUseContext, output_config: OutputConfig, graph_output: State
-) -> dict:
+) -> dict[str, Any]:
+    """把整条链路的思考过程压成一份结构化产出。"""
     logger.info("Starting Outputter Agent")
     last_message = graph_output.messages[-1] if graph_output.messages else None
 
@@ -71,13 +73,13 @@ async def outputter(
     llm_fallback = get_llm(
         ctx=ctx, name="outputter", is_utils=True, use_fallback=True, temperature=1
     )
-    structured_llm = llm
-    structured_llm_fallback = llm_fallback
 
-    if output_config.structured_output:
-        schema: dict | type[BaseModel] | None = None
-        so = output_config.structured_output
-
+    # structured_output 有三种写法：一个 pydantic 类、一个 pydantic 实例，或者
+    # 一份原生 JSON schema（dict）。三种都要落到同一个 with_structured_output
+    # 调用上。
+    schema: dict[str, Any] | type[BaseModel] | None = None
+    so = output_config.structured_output
+    if so:
         if isinstance(so, dict):
             schema = so
         elif isinstance(so, BaseModel):
@@ -85,9 +87,14 @@ async def outputter(
         elif isinstance(so, type) and issubclass(so, BaseModel):
             schema = so
 
-        if schema is not None:
-            structured_llm = llm.with_structured_output(schema)
-            structured_llm_fallback = llm_fallback.with_structured_output(schema)
+    # 带 schema 的 runnable 返回 pydantic 实例或 dict，不带的返回消息；两种形状
+    # langchain 只标成「dict 或 BaseModel」，这里放宽成 Any，靠下面的 isinstance
+    # 分支收窄。
+    structured_llm: Runnable[LanguageModelInput, Any] = llm
+    structured_llm_fallback: Runnable[LanguageModelInput, Any] = llm_fallback
+    if schema is not None:
+        structured_llm = llm.with_structured_output(schema)
+        structured_llm_fallback = llm_fallback.with_structured_output(schema)
 
     response = await with_fallback(
         main_call=lambda: invoke_llm_with_timeout_message(
@@ -101,14 +108,15 @@ async def outputter(
             task_id=ctx.trace_id,
             used_fallback=True,
         ),
-    )  # type: ignore
+    )
+
+    # 这两条分支上 content 就是模型写的那段 JSON 文本。langchain 的标注允许它
+    # 还是 list（多模态内容块），但结构化输出走的是纯文本，这里收窄成 str。
     if isinstance(response, BaseModel):
         if output_config.output_description and hasattr(response, "content"):
-            response = json.loads(response.content)  # type: ignore
-            return response
+            return json.loads(cast("str", response.content))
         return response.model_dump()
-    elif hasattr(response, "content"):
-        return json.loads(response.content)  # type: ignore
-    else:
-        logger.info("Found unknown response type: " + str(type(response)))
+    if hasattr(response, "content"):
+        return json.loads(cast("str", response.content))
+    logger.info("Found unknown response type: " + str(type(response)))
     return response

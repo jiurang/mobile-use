@@ -40,3 +40,12 @@ DEFAULT_MAX_STEPS = 80
 
 MAX_MESSAGES_IN_HISTORY = 25
 EXECUTOR_MESSAGES_KEY = "executor_messages"
+
+# 🔴 **2026-10-27 移除：`EXECUTOR_SCREENSHOT_KEY`（`"executor_screenshot"`）。**
+#
+# 截图这条通道已整条下线（含按需工具 `take_screenshot`），模型收不到任何图，
+# state 里也就没有必要留「当屏截图」这个字段。
+#
+# 截图本身仍用于 **OCR** 与**坐标校验**（框架内部取数，不进消息）。
+#
+# 备份 / 恢复说明：`backup/20261027-remove-screenshot-tool/README.md`

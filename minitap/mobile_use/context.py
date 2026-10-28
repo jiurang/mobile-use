@@ -5,6 +5,7 @@ Uses ContextVar to avoid prop drilling and maintain clean function signatures.
 """
 
 from collections.abc import Callable, Coroutine
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -110,21 +111,15 @@ class PerceptionConfig(BaseModel):
     - `ocr`（OCR 文本）：关掉后 Contextor **根本不跑 OCR**（真机实测 381~443ms
       /步），Executor 也拿不到 OCR 块。
 
-    ⚠️ **原来还有第三条「图片」通道（`screenshot`），那条已下线。**
+    ⚠️ **原来还有第三条「图片」通道（`screenshot`），现在**整条都没了。**
     2026-10-23 下线的是「**每轮附图**」那条通道（三态枚举
     ``always`` / ``on_demand`` / ``off`` + 输出 schema 里的 ``need_screenshot``
-    字段）—— 它**仍然没有**：屏幕描述块里只有元素表或 OCR 块，
-    模型也没有「举手要图」这个字段。
+    字段）；2026-10-27 下线的是「**按需工具**」那条（``take_screenshot``）——
+    工具实现、提示词里的工具表行、「图片感知」通道、``state.executor_screenshot``
+    字段全部清干净。
 
-    2026-10-24 起截图改成了**按需工具** ``take_screenshot``
-    （``tools/mobile/take_screenshot.py``）：模型自己喊一声要看图，
-    框架把当屏那张图挂在**工具结果**上（多模态内容块）。
-    ⇒ 它是 UI 元素表与 OCR 的**补充**，不是第三条感知通道：
-    寻址仍然走元素表的 ``[i]``，图只补上图标 / 颜色 / 布局这些文字通道
-    给不了的东西（provider 侧能不能吃图见该文件的实测记录）。
-
-    ⚠️ **它不受这里的开关控制** —— Manager 侧把两条通道都关掉时，
-    这个工具依然可用（那正是它能救场的时候）。
+    ⇒ 感知只剩**两条文字通道**：UI 元素表 + OCR。
+    截图本身仍用于 **OCR** 与**坐标校验**（框架内部取数，不进消息）。
     """
 
     ui_hierarchy: bool = True
@@ -231,6 +226,19 @@ class MobileUseContext(BaseModel):
     #: 为什么放在 context 而不是让每个 agent 自己读环境变量：同一个 Agent 上
     #: 可能同时跑中文任务和英文任务，环境变量是**进程级**的，读不了「这次任务」。
     prompt_language: PromptLanguage = PromptLanguage.EN
+
+    #: **任务开始的时间**（带时区）。给 Executor / Cortex 看的。
+    #:
+    #: 口径：图**开始跑**的那一刻，不是「任务对象被创建」的那一刻 ——
+    #: 创建到开跑之间还有装 APK / 锁应用这些准备动作（真机实测能花几分钟），
+    #: 那段时间不是这个任务在干活。
+    #:
+    #: 为什么放在 context（而不是 state）：它是**一次运行**的属性，不是图状态 ——
+    #: state 会被 checkpoint、被反复快照；这个时间在整场运行里只读一次。
+    #:
+    #: ⚠️ 它进的是提示词 ⇒ **必须整场运行逐字节不变**（否则前缀缓存被打断）。
+    #: 所以只在起跑那一刻赋值，之后谁都不许改。
+    task_started_at: datetime | None = None
 
     def get_adb_client(self) -> AdbClient:
         if self.adb_client is None:

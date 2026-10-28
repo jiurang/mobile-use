@@ -1,32 +1,23 @@
 """Executor 自主执行的数据契约。
 
-两个模型，两个角色
------------------
+这个文件定义两个模型：一个收模型的话，一个给上层看。
 
-* :class:`ExecutorOutput` —— **Executor 的 LLM 每轮吐的东西**。
-  注意它**不含** 16 个设备工具的 JSON schema：Executor 用
-  ``_ToolCallStructuredRunnable`` 只绑定**这一个** schema，
-  工具的用法靠 ``executor.md`` 里的**文本工具表**教（365 tok，静态可缓存）。
-  绑定全量 schema 会让每轮多背 4,008 token 且不进缓存键（实测，见
-  ``doc/executor-autonomy-plan.md`` §3.1）。
+:class:`ExecutorOutput` 是 Executor 的 LLM 每轮吐的东西。它不含 16 个设备工具的
+JSON schema：Executor 只绑定这一个结构化输出 schema，工具的用法靠 ``executor.md``
+里的文本工具表教（365 token，静态可缓存）。绑定全量 schema 会让每轮多背 4,008
+token，而那份 schema 不进缓存键，所以每轮都按满价计费（实测，见
+``docs/智能体协作v2.md``）。
 
-* :class:`ExecutorReport` —— **Reporter 产出、给 Cortex 和 Orchestrator 看的东西**。
-  ``outcome`` 由**代码**判定（见 :func:`determine_outcome`），不经 LLM；
-  ``failed_targets`` / ``evidence`` 也由代码直搬。LLM 只写 ``summary``。
+:class:`ExecutorReport` 是 Reporter 产出、给 Cortex 和 Orchestrator 看的东西。
+``outcome`` 由代码判定，不经 LLM（见 :func:`determine_outcome`）；
+``failed_targets`` 与 ``evidence`` 由代码直搬，LLM 只写 ``summary``。
 
-动作本身不单独建模：用 ``dict`` 承载（见 :class:`ExecutorOutput.actions`
-的说明）—— 它要原样喂给 dispatcher，多一层模型只会多一层失配的机会。
+动作本身不单独建模，用 ``dict`` 承载：它要原样喂给 dispatcher，多一层模型只会
+多一层失配的机会。
 
-只有一种形态
-------------
-以前这个文件里有两个 schema：``ExecutorOutput`` 和「模型不能看图时那个
-schema」（用 ``create_model`` 现场造的兄弟类），靠基类
-:class:`ExecutorOutputBase` 共享字段 —— 因为那时模型**可能**看得见截图，
-要按需决定给不给它看图。
-
-图片通道下线后**只剩一种形态** ⇒ 兄弟类与基类都撤了，只留
-:class:`ExecutorOutput`。解析层对着它判 ``isinstance`` 也就不会再出现
-「动态造的同名类 ≠ 真类」那个坑（真机实测 2026-10-22 23:19）。
+只有一种形态。模型现在看不见截图，也就不需要「按需决定给不给它看图」的第二个
+schema，解析层对着 :class:`ExecutorOutput` 判 ``isinstance`` 就是对着真类判，
+不会再出现「现场造出来的同名类不等于真类」的情况（真机实测 2026-10-22 23:19）。
 """
 
 from __future__ import annotations
@@ -38,17 +29,16 @@ from pydantic import BaseModel, Field
 from minitap.mobile_use.utils.failed_targets import FailedTarget
 
 
-# ⚠️ **下面这个类的 docstring 是「模型看得见的工具描述」，不是给人看的注释。**
-#
-# ``convert_to_openai_tool(schema)`` 会把 ``cls.__doc__`` 塞进 JSON schema 的
-# ``description``，而这个 schema 每轮都发给模型 ⇒ **改这段 docstring = 改提示词**。
+# 下面这个类的 docstring 是模型看得见的工具描述，不是给人看的注释。
+# convert_to_openai_tool 会把 cls.__doc__ 塞进 JSON schema 的 description，
+# 而这个 schema 每轮都发给模型，改这段 docstring 就是改提示词。
 # 它和字段描述一样属于「动了就会改变模型行为」的契约，改之前先想清楚。
 #
-# 这条约束是实测踩出来的：本轮重构把 docstring 改写了，A/B 一比就发现
-# 发给模型的工具描述变了（字段部分没变，只有 description 变了）。
+# 这条约束是实测踩出来的：改写 docstring 之后字段部分没变，发给模型的工具描述
+# 变了。
 #
-# 而「这个类是怎么用、为什么这么用」这类**给人看**的信息，**别写进 docstring** ——
-# 写在上面的注释里。docstring 只留给模型。
+# 「这个类怎么用、为什么这么用」这类给人看的信息写在上面的注释里，docstring 只
+# 留给模型。
 class ExecutorOutput(BaseModel):
     """Executor 每一轮的 LLM 输出。
 
@@ -104,8 +94,8 @@ class ExecutorOutput(BaseModel):
 class ExecutorReport(BaseModel):
     """一个子目标尝试的汇报。
 
-    **除 ``summary`` 外全部由代码填充**，LLM 不得改写
-    （依据 ``utils/thoughts_compaction.py`` 的硬规则：事实不能压）。
+    除 ``summary`` 外全部由代码填充，LLM 不得改写，依据是
+    ``utils/thoughts_compaction.py`` 的硬规则：事实不能压。
     """
 
     outcome: Literal["completed", "failed", "blocked"] = Field(
@@ -154,33 +144,28 @@ def determine_outcome(
     step_limit_reached: bool = False,
     gave_up: bool = False,
 ) -> Literal["completed", "failed", "blocked"]:
-    """**代码**判定 outcome，规则无歧义（见方案 §6.2.1）。
+    """由代码判定 outcome，规则无歧义（见 ``docs/智能体协作v2.md``）。
 
-    ``done=True``            → ``completed``
-    ``gave_up=True``         → ``failed``（模型明确说「做不到」）
-    步数超限 / 熔断          → ``blocked``
-    其余一切（没达成）       → ``failed``
+    ``done=True`` 判 ``completed``；``gave_up=True`` 判 ``failed``，对应模型明确
+    说「做不到」；步数超限或熔断判 ``blocked``；其余一切（没达成）判 ``failed``。
 
-    ⚠️ **``failures`` 不参与判定** —— 「有失败事实」和「什么都没发生」
-    都判 ``failed``。失败**几条**、失败在**哪**，属于**事实层**，由
-    :class:`ExecutorReport.failed_targets` 单独承载（逐字搬运，见
-    ``agents/reporter/reporter.py``）。
+    ``failures`` 不参与判定：「有失败事实」和「什么都没发生」都判 ``failed``。
+    失败几条、失败在哪属于事实层，由 :class:`ExecutorReport.failed_targets`
+    单独承载，逐字搬运，见 ``agents/reporter/reporter.py``。
 
-    为什么不拿失败条数去细分 outcome：Cortex 拿到的是「成了 / 没成」，
-    它据此决定换招还是放弃；失败清单是给**它判断「换哪招」**用的，
-    不是用来把 outcome 拆成 completed-with-warnings 之类的第三种。
-    判定规则一旦依赖条数，「失败 0 条但没达成」和「失败 3 条」就会落到
-    不同分支 —— 而这两种都是「没成」，规则必须无歧义。
+    不拿失败条数去细分 outcome，是因为 Cortex 拿到的是「成了 / 没成」，它据此
+    决定换招还是放弃；失败清单是给它判断「换哪招」用的，不是用来把 outcome 拆
+    成 completed-with-warnings 之类的第三种。判定规则一旦依赖条数，「失败 0 条
+    但没达成」和「失败 3 条」就会落到不同分支，而这两种都是「没成」，规则必须
+    无歧义。
 
-    这条函数是「事实不丢」的结构性保证：``outcome`` **不经 LLM**，
-    所以 Reporter 没有机会把失败说成完成。
+    这条函数是「事实不丢」的结构性保证：``outcome`` 不经 LLM，所以 Reporter
+    没有机会把失败说成完成。
 
-    ⚠️ **``gave_up`` 必须排在 ``done`` 前面** —— 两者语义相反
-    （「做成了」vs「做不到」）。历史上 ``done=True`` 被**无条件**映射成
-    ``completed``，那时 executor 没有「放弃」这个出口，「做不到」在契约里
-    **不可表达**，模型只能继续试 ⇒ 原地打转 ⇒ 撞 ``recursion_limit`` 崩掉
-    （真机实测 2026-10-26，mobile-manager execution 880，卡了 70 步、
-    45 分钟、409 万 input token）。
+    ``gave_up`` 必须排在 ``done`` 前面，两者语义相反（「做成了」和「做不到」）。
+    模型曾经只能表达前者，「做不到」在契约里不可表达，于是原地打转，最后撞
+    ``recursion_limit`` 崩掉（真机实测 2026-10-26：卡了 70 步、45 分钟、
+    409 万 input token）。
     """
     if gave_up:
         return "failed"

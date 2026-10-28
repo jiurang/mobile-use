@@ -1,27 +1,25 @@
-"""Executor 的工具执行节点：**串行**执行，一个失败就中止后面的。
+"""Executor 的工具执行节点：串行执行，一个失败就中止后面的。
 
-为什么要自己写一个 ToolNode
----------------------------
-上游 ``ToolNode`` **并行**跑所有 tool call，而且没有「一个失败就中止后面」
-的公开钩子。而 Executor 依赖这两条语义：
+上游 ``ToolNode`` 并行跑所有 tool call，也没有「一个失败就中止后面」的公开钩子，
+而 Executor 依赖这两条语义：
 
-* **串行** —— 元素表的编号只在**那一屏**上成立。一轮执行多个动作，第二个
-  动作的 ``Target.index`` 指向的是**第一个动作执行前**的屏，屏幕已经被改过了。
-* **一个失败就中止** —— 前一个动作失败了，后面的动作多半建立在错误的前提上。
+- 串行。元素表的编号只在那一屏上成立。一轮执行多个动作，第二个动作的
+  ``Target.index`` 指向的还是第一个动作执行前的屏，屏幕已经被改过了。
+- 一个失败就中止。前一个动作失败了，后面的动作多半建立在错误的前提上。
 
-（这两条语义的承载者**不在 LLM 里**，在 ``ExecutorToolNode.__func`` 里面；
-prompt 里写的是软约束，这里是硬兜底。）
+这两条语义的承载者不在 LLM 里，在 ``ExecutorToolNode.__func`` 里面；prompt 里
+写的是软约束，这里是硬兜底。
 
-⚠️ **这个类依赖 langgraph-prebuilt 的私有 API**（``_parse_input`` /
-``_extract_state`` / ``_run_one`` / ``_arun_one`` / ``_combine_tool_outputs``）。
-它们的签名在 minor 版本之间会变 ⇒ ``pyproject.toml`` 里把 langgraph 锁在
-``>=1.2.0,<1.3.0``。升级前先 diff 上游的 ``ToolNode._func``，并跑
+这个类依赖 langgraph-prebuilt 的私有 API（``_parse_input`` / ``_extract_state`` /
+``_run_one`` / ``_arun_one`` / ``_combine_tool_outputs``）。它们的签名在 minor
+版本之间会变，所以 ``pyproject.toml`` 里把 langgraph 锁在 ``>=1.2.0,<1.3.0``。
+升级前先 diff 上游的 ``ToolNode._func``，并跑
 ``tests/mobile_use/test_executor_tool_node.py``。
 
 顺带做的一件事：给「动过屏幕」的工具结果打上动作时刻（``last_action_at``），
-让 contextor 能判断「要不要先等屏幕沉降」。打点放在这里而不是 13 个工具文件
-里各写一遍 —— 工具们各有各的返回形状，在**执行完工具之后**统一处理，
-才是唯一能保证「每个动屏动作都被记到」的位置。
+让 contextor 能判断「要不要先等屏幕沉降」。打点放在这里，而不是 13 个工具文件
+里各写一遍，因为工具们各有各的返回形状，在执行完工具之后统一处理，才是唯一
+能保证「每个动屏动作都被记到」的位置。
 """
 
 import asyncio
@@ -43,10 +41,10 @@ from minitap.mobile_use.utils.message_content import content_to_text
 
 logger = get_logger(__name__)
 
-# 会**改变屏幕**的工具。只有这些工具之后才需要等屏幕沉降（见
-# `PerceptionConfig.settle_delay_ms`）：等笔记、读笔记、刻意等待都不算。
+# 会改变屏幕的工具。只有这些工具之后才需要等屏幕沉降（见
+# ``PerceptionConfig.settle_delay_ms``）：等笔记、读笔记、刻意等待都不算。
 #
-# `wait_for_delay` 不在列表里：等待本身就是在给屏幕时间，额外再等一遍是双倍。
+# ``wait_for_delay`` 不在列表里：等待本身就是在给屏幕时间，额外再等一遍是双倍。
 DEVICE_CHANGING_TOOLS = frozenset(
     {
         "tap",
@@ -70,7 +68,7 @@ def _stamp_action(output: Any, tool_name: str) -> None:
     """给「动过屏幕」的工具结果打上动作时刻。
 
     打时间戳这件事放在这里，而不是 13 个工具文件里各写一遍：工具们各有各的
-    返回形状（Command / ToolMessage / 列表），在**执行完工具之后**统一处理，
+    返回形状（Command / ToolMessage / 列表），在执行完工具之后统一处理，
     才是唯一能保证「每个动屏动作都被记到」的位置。
     """
     if tool_name not in DEVICE_CHANGING_TOOLS:
@@ -88,19 +86,17 @@ def _stamp_action(output: Any, tool_name: str) -> None:
 
 
 class ExecutorToolNode(ToolNode):
-    """
-    ToolNode that runs tool calls one after the other - not simultaneously.
-    If one error occurs, the remaining tool calls are aborted!
+    """逐个执行 tool call，一个出错就中止剩下的。
 
-    Upstream ToolNode has no public hook for sequential, abort-on-failure execution (it
-    runs calls in parallel), so this overrides `_func`/`_afunc` and relies on private
-    ToolNode methods (`_parse_input`, `_extract_state`, `_run_one`, `_arun_one`,
-    `_combine_tool_outputs`). Their signatures change across minor releases, hence the
-    minor-version cap on langgraph in pyproject.toml. When bumping it, diff upstream's
-    `ToolNode._func` and run tests/mobile_use/test_executor_tool_node.py.
+    上游 ToolNode 没有「串行 + 出错即中止」的公开钩子（它并行跑所有 call），
+    所以这里覆写 ``_func`` / ``_afunc``，并依赖 ToolNode 的私有方法
+    （``_parse_input``、``_extract_state``、``_run_one``、``_arun_one``、
+    ``_combine_tool_outputs``）。这些方法的签名在 minor 版本之间会变，
+    所以 pyproject.toml 里对 langgraph 做了 minor 版本上限。升版本前先 diff
+    上游的 ``ToolNode._func``，并跑 tests/mobile_use/test_executor_tool_node.py。
     """
 
-    def __init__(self, tools, messages_key: str, trace_id: str | None = None):
+    def __init__(self, tools, messages_key: str, trace_id: str | None = None) -> None:
         super().__init__(tools=tools, messages_key=messages_key)
         self._trace_id = trace_id
 
@@ -110,7 +106,7 @@ class ExecutorToolNode(ToolNode):
         input: list[AnyMessage] | dict[str, Any] | BaseModel,
         config: RunnableConfig,
         runtime: Runtime,
-    ):
+    ) -> Any:
         return await self.__func(is_async=True, input=input, config=config, runtime=runtime)
 
     @override
@@ -167,6 +163,7 @@ class ExecutorToolNode(ToolNode):
                     output = await self._arun_one(call, input_type, tool_runtime)
                 else:
                     output = self._run_one(call, input_type, tool_runtime)
+                # None 表示工具返回了预期之外的类型，当成失败处理。
                 failed = self._has_tool_call_failed(call, output)
                 if failed is None:
                     output = self._get_erroneous_command(
@@ -185,7 +182,7 @@ class ExecutorToolNode(ToolNode):
                 error_msg = ""
                 try:
                     if isinstance(output, ToolMessage):
-                        # 多模态内容（截图那种）要压成文本再记日志 ——
+                        # 多模态内容（截图那种）要压成文本再记日志：
                         # 直接 str() 一个块列表会打出几十 KB 的 base64 字面量。
                         error_msg = content_to_text(output.content)
                     elif isinstance(output, Command):
@@ -193,7 +190,7 @@ class ExecutorToolNode(ToolNode):
                     elif tool_message := self._find_tool_message(output):
                         error_msg = content_to_text(tool_message.content)
                 except Exception as e:
-                    # 提取错误详情失败**不能**盖掉真正的错误：这里只是拿不到
+                    # 提取错误详情失败不能盖掉真正的错误：这里只是拿不到
                     # 更详细的说明，工具本身已经失败了（`failed` 为真）。
                     # 记一条 debug 保住现场，否则「提取失败」和「工具失败」
                     # 在日志里长得一模一样。
@@ -203,7 +200,6 @@ class ExecutorToolNode(ToolNode):
                 logger.info(f"❌ Tool call failed: {call_without_state}")
                 logger.info(f"   Error: {error_msg}")
 
-                # Capture executor action telemetry
                 if self._trace_id:
                     telemetry.capture_executor_action(
                         task_id=self._trace_id,
@@ -214,7 +210,6 @@ class ExecutorToolNode(ToolNode):
             else:
                 logger.info("✅ Tool call succeeded: " + str(call_without_state))
 
-                # Capture executor action telemetry
                 if self._trace_id:
                     telemetry.capture_executor_action(
                         task_id=self._trace_id,
