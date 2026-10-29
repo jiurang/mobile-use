@@ -11,7 +11,7 @@ from minitap.mobile_use.controllers.types import (
 )
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
-from minitap.mobile_use.services.vision import resolve_vision_index
+from minitap.mobile_use.perception.frame import ScreenFrame, resolve_vision
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.utils.failed_targets import (
     ActionFailureFact,
@@ -27,7 +27,6 @@ from minitap.mobile_use.utils.ocr_view import resolve_ocr_index
 from minitap.mobile_use.utils.screen_elements import (
     ScreenElement,
     resolve_screen_index,
-    scan_cache_fingerprint,
 )
 from minitap.mobile_use.utils.ui_hierarchy import (
     ElementBounds,
@@ -448,20 +447,31 @@ def _apply_element(target: Target, element: ScreenElement) -> Target:
     return target.model_copy(update=updates)
 
 
-def resolve_target(state: State, target: Target) -> tuple[Target, str | None]:
-    """把 `target.index` / `target.ocr_index` 解析成具体的元素。
+def resolve_target(
+    state: State, target: Target, frame: ScreenFrame | None = None
+) -> tuple[Target, str | None]:
+    """把 `target.index` / `target.ocr_index` / `target.vision_index` 解析成具体的元素。
 
     返回 `(解析后的 target, 错误信息)`。错误信息非空表示「模型给的索引用不了」，
     调用方**必须**把它回给模型 —— 绝不能静默退化成「点别的地方」。
+
+    索引都以**当屏感知帧**为准（``frame``）。传了就只认帧上的数据：元素表、OCR、
+    视觉主体来自同一次抓屏，编号天然同源。没传（老调用点 / 单元测试）时退回
+    state 的元素表与 OCR；视觉编号仍然必须有帧，因为它的列表只挂在帧上。
 
     两条路径
     --------
     1. **有屏幕元素表**（所有平台，Contextor 统一建）：`index` 和 `ocr_index`
        都索引这张表，**同一个编号空间**。UI 行和 OCR 行都在里面。
     2. **没有元素表**（两条通道都关 / 这一屏没有任何可寻址行）：只有
-       `ocr_index`，它索引 `latest_ocr_results`，这是改造前的兼容路径。
+       `ocr_index`，它索引 OCR 结果，这是改造前的兼容路径。
     """
-    elements = state.latest_screen_elements or []
+    if frame is not None:
+        elements = frame.screen_elements or []
+        legacy_ocr_results = frame.ocr_results
+    else:
+        elements = state.latest_screen_elements or []
+        legacy_ocr_results = state.latest_ocr_results
 
     if target.index is not None:
         element = resolve_screen_index(elements, target.index)
@@ -482,10 +492,10 @@ def resolve_target(state: State, target: Target) -> tuple[Target, str | None]:
                     f" (the table had {len(elements)} rows)"
                 )
             return _apply_element(target, element), None
-        # 老世界：没有元素表，ocr_index 索引的是 latest_ocr_results。
+        # 老世界：没有元素表，ocr_index 索引的是 OCR 结果。
         # 报错文案要跟改造前逐字一致 —— `tests/mobile_use/test_tap_ocr_index.py`
         # 守着这些字样，模型也是靠它们知道索引错在哪。
-        ocr_results = state.latest_ocr_results
+        ocr_results = legacy_ocr_results
         ocr_hit = resolve_ocr_index(ocr_results, target.ocr_index)
         if ocr_hit is None:
             if not ocr_results:
@@ -499,40 +509,27 @@ def resolve_target(state: State, target: Target) -> tuple[Target, str | None]:
         return target.model_copy(update={"bounds": ocr_hit.bounds, "text": ocr_hit.text}), None
 
     if target.vision_index is not None:
-        return _resolve_vision_target(state, target)
+        return _resolve_vision_target(frame, target)
 
     return target, None
 
 
-def _resolve_vision_target(state: State, target: Target) -> tuple[Target, str | None]:
-    """把 ``Target.vision_index`` 还原成扫描缓存里的那一行。
+def _resolve_vision_target(frame: ScreenFrame | None, target: Target) -> tuple[Target, str | None]:
+    """把 ``Target.vision_index`` 还原成**当前帧**上的视觉主体行。
 
-    三条拒绝理由都必须**明确回给模型**，不能静默退化成「点别的地方」：
-
-    * 没有缓存：还没扫描过（或扫描失败），让它先调 ``scan_visual_subjects``；
-    * 指纹过期：扫描之后屏幕已经变了，旧编号可能指向别的东西；
-    * 越界：编号不在这次扫描的范围内。
+    视觉列表只挂在帧上（``perception/frame.py``），所以没有帧就明确拒绝，不能
+    退化成「按 state 里的旧表猜」。
     """
-    elements = state.vision_elements or []
-    if not elements:
+    if frame is None:
         return target, (
-            f"vision_index={target.vision_index} cannot be used: there are no visual "
-            "subjects on this screen - call scan_visual_subjects first"
+            f"vision_index={target.vision_index} cannot be used: the current screen "
+            "frame is unavailable - re-read the screen first"
         )
 
-    expected = state.vision_scan_fingerprint
-    current = scan_cache_fingerprint(state.latest_screen_elements, state.latest_ocr_results)
-    if expected and expected != current:
-        return target, (
-            "the visual-subject list is from a previous screen and is no longer valid - "
-            "call scan_visual_subjects again on the current screen"
-        )
-
-    element = resolve_vision_index(elements, target.vision_index)
+    element, error = resolve_vision(frame, target.vision_index)
     if element is None:
-        return target, (
-            f"vision_index={target.vision_index} is out of range; the visual list had "
-            f"{len(elements)} item(s), valid range is 1..{len(elements)}"
+        return target, error or (
+            f"vision_index={target.vision_index} could not be resolved on this screen"
         )
 
     return (

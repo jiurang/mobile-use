@@ -409,11 +409,12 @@ def screen_fingerprint(elements: list[ScreenElement] | None) -> frozenset[str]:
 
 
 def element_table_fingerprint(elements: list[ScreenElement] | None) -> str:
-    """整张元素表的**几何 + 内容**指纹，用于判断视觉扫描缓存是否过期。
+    """整张元素表的**几何 + 内容**指纹。
 
-    比 :func:`screen_fingerprint` 多带每行的 bounds：滚动、翻页、弹窗会让位置
-    变化，指纹就变；而时钟 / 点赞数这类纯数字噪音仍按 ``#noise#`` 归一，不会
-    因为数字在跳就把一次刚做完的视觉扫描判成过期。
+    它是感知帧 ``epoch`` 的来源（见 ``perception/frame.py``）：同屏同值，
+    屏一变值就变。比 :func:`screen_fingerprint` 多带每行的 bounds：滚动、翻页、
+    弹窗会让位置变化，指纹就变；而时钟 / 点赞数这类纯数字噪音仍按 ``#noise#``
+    归一，不会因为数字在跳就把一次刚做完的视觉扫描判成过期。
 
     排序后再哈希：行序本身不影响「是不是同一屏」，但同一行的文字和位置必须
     同时一致。
@@ -423,30 +424,6 @@ def element_table_fingerprint(elements: list[ScreenElement] | None) -> str:
         text = (element.label or element.text or "").strip()
         normalized = "#noise#" if is_noise_text(text) else text
         bounds = element.bounds
-        parts.append(
-            f"{normalized}|{bounds.x},{bounds.y},{bounds.width}x{bounds.height}"
-        )
-    return hashlib.sha1("\n".join(sorted(parts)).encode("utf-8")).hexdigest()
-
-
-def scan_cache_fingerprint(
-    elements: list[ScreenElement] | None,
-    ocr_results: list[OcrText] | None = None,
-) -> str:
-    """视觉扫描缓存的屏幕指纹：有元素表就用元素表，没有就退回 OCR。
-
-    iOS / 云设备建不出统一元素表（层级树形状不认识），那里唯一可比对的是
-    OCR 行。两边都没有时返回「空屏」的稳定指纹 —— 此时没有文字通道可用于
-    判断屏幕是否变化，只能以最近一次扫描为准。
-    """
-    if elements:
-        return element_table_fingerprint(elements)
-
-    parts: list[str] = []
-    for item in ocr_results or []:
-        text = (item.text or "").strip()
-        normalized = "#noise#" if is_noise_text(text) else text
-        bounds = item.bounds
         parts.append(
             f"{normalized}|{bounds.x},{bounds.y},{bounds.width}x{bounds.height}"
         )

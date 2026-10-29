@@ -1,5 +1,22 @@
 # Vision 感知重设计：Executor 按需调用，vision 返回全部视觉主体
 
+> **2026-10-29 修订：引入感知帧 `ScreenFrame`。**
+>
+> 下文 3.2、3.3、4.1、4.3–4.6 描述的是「扫描时另截一张图 + state 存视觉表 +
+> 扫描前元素表指纹」的旧实现。现在所有感知产物都挂在同一份
+> `minitap/mobile_use/perception/frame.py::ScreenFrame` 上：
+>
+> - `screenshot_base64`、`screen_elements`、`ocr_results` 来自同一次
+>   `get_screen_data`，扫描不再自己截屏；
+> - `epoch` 由元素表（或 OCR）内容派生，取代 `vision_scan_fingerprint`；
+> - `vision_elements` 只属于帧：新帧 `epoch` 相同才继承，不同即作废；
+> - `state` 不再有 `vision_elements` / `vision_scan_fingerprint`；
+> - 工具回执只报数量，编号表只在每轮 Executor prompt 里出现一次。
+>
+> 接口也随之改名：`scan_current_screen` → `scan_frame(ctx, frame)`，
+> `render_vision_scan_result` → `render_scan_receipt(count)`；
+> `VisionElement` / `render_vision_rows` / `resolve_vision` 迁到 `perception/frame.py`。
+
 ## 1. 问题
 
 现行设计里，Executor 在 `Target.vision` 写一句话描述，框架据此截图 + 调一次视觉模型

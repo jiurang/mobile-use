@@ -63,8 +63,8 @@ from langchain_core.messages import (
 from langchain_core.tools import BaseTool
 
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.perception.frame import VisionElement, render_vision_rows
 from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template, pick
-from minitap.mobile_use.services.vision import VisionElement, render_vision_rows
 from minitap.mobile_use.tools.index import executor_wrappers, get_tools_from_wrappers
 from minitap.mobile_use.utils.message_content import (
     content_to_text,
@@ -379,7 +379,7 @@ def render_vision_subjects_message(
 ) -> str:
     """最近一次按需扫描的视觉主体表；没有缓存时返回空串。
 
-    编号由 ``render_vision_rows`` 生成 —— 它和 ``resolve_vision_index`` 是
+    编号由 ``render_vision_rows`` 生成 —— 它和 ``resolve_vision`` 是
     同一条编号契约的两端，模板只加表头，编号一个字节都不动。
     """
     rows = render_vision_rows(elements or [])
@@ -766,8 +766,9 @@ def build_executor_messages(
             成功工具结果（见 :func:`truncate_local_history`），``state`` 里的原
             对象不动，Reporter 读的是原对象。
         device_state_lines: 设备状态行。
-        vision_elements: 最近一次 ``scan_visual_subjects`` 的缓存。只在非空且
-            屏幕没变时出现，教模型用 ``vision_index`` 选主体。
+        vision_elements: 最近一次 ``scan_visual_subjects`` 的结果，来自**当前
+            感知帧**（``ctx.screen_frame``）。屏变了帧会把它作废，这里拿到的
+            空表就是「不要再按旧编号操作」的信号。
 
     Returns:
         发给 LLM 的消息列表。

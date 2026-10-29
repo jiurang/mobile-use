@@ -7,8 +7,8 @@
 Executor 的文字通道只有元素表 + OCR。两条都叫不出名字的东西（纯图标按钮、
 图片里的元素、WebView / 画布、自绘控件）以前只能靠模型猜坐标，或者干脆做不了。
 现在补的是一条**按需触发的感知通道**：Executor 在决策时发现文字通道不足以确认
-屏上有什么，就调用 ``scan_visual_subjects`` 工具；工具截一张当屏图，问一次视觉
-模型「这屏上都有哪些视觉主体」，把**全部主体**编号后返回。
+屏上有什么，就调用 ``scan_visual_subjects`` 工具；工具拿**当前感知帧**的截图，
+问一次视觉模型「这屏上都有哪些视觉主体」，把**全部主体**编号后交给帧。
 
 关键在方向：**识别什么由 vision 决定，不由 Executor 决定**。Executor 只决定
 「什么时候需要看」，看到列表后再按 ``vision_index`` 选一个。让看不见图的
@@ -20,6 +20,11 @@ Executor 先描述目标、再让 vision 去找，等于让它猜屏上有什么
 -----------------------------
 图只进**一次独立的小调用**。Executor 的 system prompt 和局部历史一个字节都不动，
 只有模型真的调用扫描工具时才产生开销。
+
+一帧一图
+--------
+本模块只接受 ``ScreenFrame``（见 ``perception/frame.py``），**不自己截屏**：
+元素表、OCR 和视觉主体必须来自同一次抓取，否则两套编号会来自两屏。
 
 坐标为什么用 0-1000 归一化
 --------------------------
@@ -33,13 +38,12 @@ Executor 先描述目标、再让 vision 去找，等于让它猜屏上有什么
 from __future__ import annotations
 
 import asyncio
-import json
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from minitap.mobile_use.context import MobileUseContext
-from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
+from minitap.mobile_use.perception.frame import ScreenFrame, VisionElement
 from minitap.mobile_use.prompt_language import PromptLanguage, pick
 from minitap.mobile_use.services.llm import get_structured_llm, invoke_llm_with_timeout_message
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
@@ -85,18 +89,6 @@ class VisionScanOutput(BaseModel):
     )
 
 
-class VisionElement(BaseModel):
-    """缓存进 state、并渲染给 Executor 的一行视觉主体。
-
-    编号是 **1-based**，和工具结果 / 提示词里的 ``[i]`` 严格一致；``label`` 就是
-    模型的 description；``bounds`` 已换算成像素。
-    """
-
-    index: int = Field(description="1-based index shown to the model")
-    label: str = Field(description="Short description of the subject")
-    bounds: ElementBounds
-
-
 def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
@@ -123,31 +115,6 @@ def bounds_from_normalized_box(
     right = _clamp(int(round(nx2 / NORMALIZED_MAX * screen_width)), left + 1, screen_width)
     bottom = _clamp(int(round(ny2 / NORMALIZED_MAX * screen_height)), top + 1, screen_height)
     return ElementBounds(x=left, y=top, width=right - left, height=bottom - top)
-
-
-async def capture_screen_base64(ctx: MobileUseContext) -> str:
-    """抓一张当屏截图，返回**原始分辨率**的 base64（不带 data URI 前缀）。
-
-    两条路，快的那条优先：
-
-    * ``ctx.ui_adb_client.get_screenshot_base64()`` —— uiautomator 只截图，
-      不动层级树（真机实测 166ms）；
-    * 控制器那条 ``take_screenshot()``（iOS / 云设备 / 快路不可用）。
-
-    快路失败**不抛**，直接回落通用路 —— 视觉是补充通道。
-    """
-    client = getattr(ctx, "ui_adb_client", None)
-    getter = getattr(client, "get_screenshot_base64", None)
-    if getter is not None:
-        try:
-            image = await asyncio.to_thread(getter)
-            if image:
-                return image
-            logger.warning("[vision] Fast capture returned nothing; falling back")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[vision] Fast capture failed ({e}); falling back")
-
-    return await UnifiedMobileController(ctx).take_screenshot()
 
 
 def scan_system_prompt(ctx: MobileUseContext) -> str:
@@ -184,80 +151,49 @@ def scan_system_prompt(ctx: MobileUseContext) -> str:
     )
 
 
-def render_vision_rows(elements: list[VisionElement]) -> str:
-    """只渲染主体行（不带表头）。空表返回空串。
+def render_scan_receipt(count: int, *, language: PromptLanguage) -> str:
+    """工具回执：只报数量，**不再重复整张表**。
 
-    **编号契约的唯一来源**：这里印出的 ``[i]`` 和 ``resolve_vision_index`` 吃的
-    下标是同一条契约的两端。
+    完整编号表由 Executor 每轮从帧渲染（``prompt.render_vision_subjects_message``）。
+    两处都列一遍时，缓存刚失效的那一轮会出现「历史里还有旧编号、当轮没有表」的
+    割裂；表只留一处，编号就永远只有一个来源。
     """
-    lines: list[str] = []
-    for element in elements:
-        lines.append(
-            f"[{element.index}] {json.dumps(element.label, ensure_ascii=False)} "
-            f"({element.bounds.x},{element.bounds.y},"
-            f"{element.bounds.width}x{element.bounds.height})"
-        )
-    return "\n".join(lines)
-
-
-def resolve_vision_index(
-    elements: list[VisionElement] | None, index: int | None
-) -> VisionElement | None:
-    """把 ``Target.vision_index`` 还原成主体行。**1-based**，越界返回 None。
-
-    越界或没有缓存时返回 None —— 调用方必须把「这个编号不存在」告诉模型，
-    不能退化成「点别的地方」。
-    """
-    if index is None or not elements:
-        return None
-    if index < 1 or index > len(elements):
-        logger.warning(
-            f"vision_index={index} out of range; the visual list had {len(elements)} "
-            f"item(s) (valid 1..{len(elements)})"
-        )
-        return None
-    return elements[index - 1]
-
-
-def render_vision_scan_result(
-    elements: list[VisionElement], *, language: PromptLanguage
-) -> str:
-    """工具结果的正文：表头 + 编号行 + 怎么用。
-
-    这是 Executor **下一轮**看到的原文，必须同时说清三件事：编号从 1 开始、
-    只对当屏有效、动作时写 ``vision_index``。
-    """
-    rows = render_vision_rows(elements)
-    if not rows:
+    if count <= 0:
         return pick(
             "Visual scan finished: no visual subjects were found on this screen. "
             "Do not invent any. Use the element table or OCR instead.",
             "视觉扫描完成：这一屏没有找到视觉主体。不要编造。改用元素表或 OCR。",
             language=language,
         )
-    header = pick(
-        "Visual subjects on the current screen (1-based, valid only for this screen):",
-        "当前屏幕的视觉主体（1-based，只对当屏有效）：",
-        language=language,
-    )
-    usage = pick(
-        'To act on one, use target {"vision_index": <i>}. Do not add bounds of your own. '
-        "If the screen changes before you act, scan again.",
+    return pick(
+        f"Visual scan finished: {count} subject(s) are numbered in the vision table "
+        'for this screen. Use target {"vision_index": <i>} to act on one; do not add '
+        "bounds of your own. If the screen changes, the table is dropped - scan again.",
+        f"视觉扫描完成：这一屏的 {count} 个视觉主体已列在视觉表中，编号从 1 开始。"
         '要操作其中一项，target 写 {"vision_index": <i>}，不要自己给 bounds。'
-        "动作之前屏幕变了，就重新扫描。",
+        "屏幕变了这张表会被作废，届时重新扫描。",
         language=language,
     )
-    return f"{header}\n{rows}\n\n{usage}"
 
 
 async def scan_screen_subjects(
-    ctx: MobileUseContext, screenshot_base64: str
+    ctx: MobileUseContext,
+    screenshot_base64: str,
+    *,
+    screen_width: int | None = None,
+    screen_height: int | None = None,
 ) -> tuple[list[VisionElement], str]:
     """对一张截图跑一次视觉扫描，返回 ``(主体列表, 失败原因)``。
 
     成功时原因为空串；失败时列表为空、原因是**给模型看的一句话**。
     任何异常都降级成原因，不抛。
+
+    归一化框换算用的分辨率默认取 ``ctx.device``；扫帧时显式传帧自己的
+    ``width/height`` —— 帧是那次抓屏的事实来源，横竖屏切换时不能拿旧尺寸算框。
     """
+    width = screen_width or ctx.device.device_width
+    height = screen_height or ctx.device.device_height
+
     try:
         # Pillow 的解码 / 缩放 / 编码是纯 CPU 活（真机 100~300ms），丢线程里。
         image_b64 = await asyncio.to_thread(
@@ -302,9 +238,7 @@ async def scan_screen_subjects(
     except Exception as e:  # noqa: BLE001
         # 含「这条渠道的模型看不了图」：照实说，让模型退回元素表索引。
         logger.warning(f"[vision] Scan call failed: {type(e).__name__}: {str(e)[:200]}")
-        return [], (
-            f"the vision model could not be used ({type(e).__name__}: {str(e)[:200]})"
-        )
+        return [], (f"the vision model could not be used ({type(e).__name__}: {str(e)[:200]})")
 
     if not isinstance(response, VisionScanOutput):
         return [], "the vision model returned an unreadable answer"
@@ -319,14 +253,12 @@ async def scan_screen_subjects(
             subject.y1,
             subject.x2,
             subject.y2,
-            ctx.device.device_width,
-            ctx.device.device_height,
+            width,
+            height,
         )
         if bounds is None:
             continue
-        elements.append(
-            VisionElement(index=len(elements) + 1, label=description, bounds=bounds)
-        )
+        elements.append(VisionElement(index=len(elements) + 1, label=description, bounds=bounds))
         if len(elements) >= MAX_SUBJECTS:
             break
 
@@ -334,27 +266,27 @@ async def scan_screen_subjects(
     return elements, ""
 
 
-async def scan_current_screen(ctx: MobileUseContext) -> tuple[list[VisionElement], str]:
-    """扫一次**当前**屏幕：读电源状态 → 抓图 → 调视觉模型。
+async def scan_frame(
+    ctx: MobileUseContext, frame: ScreenFrame | None
+) -> tuple[list[VisionElement], str]:
+    """扫**当前感知帧**：直接用帧里的截图，不另抓一张。
 
-    息屏时截出来是一张全黑图，问视觉模型只是白花一次调用，所以先挡掉。
+    为什么不重新截屏：模型是基于这一帧的元素表决定「需要看一眼」的。若此处
+    另抓一张新图，视觉编号来自新屏、元素表编号来自旧屏，屏一动两套编号就指向
+    不同的东西。帧变了由 Contextor 下一轮负责作废，工具不越权。
+
+    息屏 / 没有帧 / 帧里没有图时都返回**给模型看的原因**，不抛。
     """
-    controller = UnifiedMobileController(ctx)
-
-    try:
-        power_state = await controller.get_screen_power_state()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[vision] Could not read the screen power state: {e}")
-        power_state = "unknown"
-    if power_state == "off":
+    if frame is None:
+        return [], "the current screen has not been read yet - its frame is unavailable"
+    if frame.screen_state == "off":
         return [], "the screen is off, so a screenshot would be black - call wake_screen first"
+    if not frame.screenshot_base64:
+        return [], "the current screen frame has no screenshot"
 
-    try:
-        raw = await capture_screen_base64(ctx)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[vision] Screenshot failed: {type(e).__name__}: {e}")
-        return [], f"the screenshot could not be taken ({type(e).__name__}: {e})"
-    if not raw:
-        return [], "the screenshot came back empty"
-
-    return await scan_screen_subjects(ctx, raw)
+    return await scan_screen_subjects(
+        ctx,
+        frame.screenshot_base64,
+        screen_width=frame.width,
+        screen_height=frame.height,
+    )

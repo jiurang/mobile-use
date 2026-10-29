@@ -10,6 +10,7 @@ from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.perception.frame import get_frame
 from minitap.mobile_use.services.ocr.types import OcrText
 from minitap.mobile_use.tools.bounds_validation import coordinates_look_like_hierarchy_derived
 from minitap.mobile_use.tools.live_target import resolve_live_bounds_by_id
@@ -63,7 +64,9 @@ def get_tap_tool(ctx: MobileUseContext) -> BaseTool:
         # 解析不了就把原因记进 attempts，让模型知道是索引错了，
         # 而不是让工具在别的地方乱点一下。
         ocr_texts: list[OcrText] | None = state.latest_ocr_results or None
-        target, index_error = resolve_target(state=state, target=target)
+        target, index_error = resolve_target(
+            state=state, target=target, frame=get_frame(ctx)
+        )
         if index_error:
             logger.warning(f"Tap target could not be resolved: {index_error}")
             attempts.append(

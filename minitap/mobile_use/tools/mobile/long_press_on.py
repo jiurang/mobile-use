@@ -10,6 +10,7 @@ from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.perception.frame import get_frame
 from minitap.mobile_use.tools.bounds_validation import coordinates_look_like_hierarchy_derived
 from minitap.mobile_use.tools.live_target import resolve_live_bounds_by_id
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
@@ -64,7 +65,9 @@ def get_long_press_on_tool(ctx: MobileUseContext) -> BaseTool:
         # 坐标 —— 它指向的是模型当时看到的那一行，不会抄错。
         # 索引用不了**不等于立刻失败**：模型自己给的 bounds/id/text 仍然可以试，
         # 但原因要留着，最后一起报给模型。
-        target, index_error = resolve_target(state=state, target=target)
+        target, index_error = resolve_target(
+            state=state, target=target, frame=get_frame(ctx)
+        )
         if index_error:
             logger.warning(f"Long press target could not be resolved: {index_error}")
 

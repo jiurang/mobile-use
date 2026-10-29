@@ -5,8 +5,10 @@
 
 ``ctx.perception`` 的两条常驻通道：``ui_hierarchy`` 关掉则表里没有 UI 行；
 ``ocr`` 关掉则 OCR 引擎根本不跑。两条都关时才没有元素表。截图不再进模型，
-只供 OCR 和坐标校验使用。第三条「视觉主体」不在这里扫描 —— 它由 Executor 按需调用
-``scan_visual_subjects`` 触发；这里只负责在屏幕变化时把旧扫描缓存清掉。
+只供 OCR、坐标校验和视觉扫描使用。第三条「视觉主体」不在这里扫描 —— 它由
+Executor 按需调用 ``scan_visual_subjects`` 触发；这里负责把**同一次抓屏**的
+截图、元素表、OCR 发布成一份感知帧（``perception/frame.py``），换帧时按
+``epoch`` 决定上一帧的视觉列表继承还是作废。
 
 先判稳再建表，但「静 ≠ 全」：懒加载控件可能在静默期之后才挂上，这是已知代价，
 验收看「步数」和「失败目标数」。
@@ -28,6 +30,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
     get_device_date,
 )
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.perception.frame import ScreenFrame, frame_epoch, publish_frame
 from minitap.mobile_use.prompt_language import load_prompt_template, pick
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.services.ocr import get_ocr_engine
@@ -42,7 +45,6 @@ from minitap.mobile_use.utils.screen_elements import (
     build_screen_elements,
     foreground_package_from_tree,
     is_noise_text,
-    scan_cache_fingerprint,
     screen_fingerprint,
     visible_texts,
 )
@@ -279,18 +281,25 @@ class ContextorNode:
             foreground_package=current_app_package,
         )
 
-        # 视觉扫描缓存：工具扫描时记下那一屏的元素表指纹。这里每步重建表，
-        # 指纹不一致就说明屏已经变了，旧编号绝不能再被 `vision_index` 使用。
-        # 保留时**原样保留整个列表**：编号、描述、框都来自同一次扫描，不能拆开。
-        previous_vision_elements = getattr(state, "vision_elements", None) or []
-        previous_vision_fp = getattr(state, "vision_scan_fingerprint", None)
-        current_fp = scan_cache_fingerprint(screen_elements, ocr_results)
-        if previous_vision_elements and previous_vision_fp == current_fp:
-            vision_elements = previous_vision_elements
-            vision_scan_fingerprint = previous_vision_fp
-        else:
-            vision_elements = []
-            vision_scan_fingerprint = None
+        # 本轮感知帧：截图、元素表、OCR 绑成**同一份对象**。
+        #
+        # 这一张 `device_data.base64` 就是建表用的那次抓屏 —— 视觉扫描以后直接
+        # 读它，不再自己截图。竞态（先抓树、再截图）在这里被结构性地消除：
+        # 模型看到的每一行、每一个视觉框，都来自这一张图。
+        #
+        # 上一帧的视觉列表是否继承，由 `publish_frame` 按 epoch 决定：屏没变
+        # （元素表内容一致）就保留，变了就整列作废。
+        frame = ScreenFrame(
+            epoch=frame_epoch(screen_elements, ocr_results),
+            screenshot_base64=device_data.base64 or "",
+            width=device_data.width,
+            height=device_data.height,
+            screen_elements=screen_elements,
+            ocr_results=ocr_results,
+            screen_state=screen_state,
+            foreground_app=current_app_package,
+        )
+        publish_frame(self.ctx, frame)
 
         # 「上一步的结果」写进执行器的局部历史：只有动作执行过才有「上一步」，
         # 第一次抓屏不写。`last_action_failure` 是工具层递过来的瞬时事实，并进
@@ -315,9 +324,6 @@ class ContextorNode:
             # 索引契约本身，不能被清空：工具靠它把 Target.index 还原成当屏坐标，
             # 只有这一次裁剪算数。下一次 contextor 会整体覆盖它。
             "latest_screen_elements": screen_elements,
-            # 按需视觉扫描的缓存：扫描工具写，这里负责在屏变了时清掉。
-            "vision_elements": vision_elements,
-            "vision_scan_fingerprint": vision_scan_fingerprint,
             # 层级树没有索引契约，建完表就清空。留着会让工具侧按 id 或文字查找
             # 的分支复活，那是行为变更。
             "latest_ui_hierarchy": None,

@@ -317,14 +317,16 @@ class ExecutorNode:
         )
         device_state_lines = [device_state] if device_state else []
 
+        # 感知帧是元素表与视觉表的唯一来源：两者必须来自同一次抓屏，
+        # 否则 vision_index 和 index 会指向两屏。
+        frame = self.ctx.screen_frame
         messages = build_executor_messages(
             ctx=self.ctx,
             goal=goal,
-            screen_elements=state.latest_screen_elements,
+            screen_elements=frame.screen_elements if frame is not None else None,
             local_messages=state.executor_messages,
             device_state_lines=device_state_lines,
-            # 最近一次按需视觉扫描的缓存；屏幕变了 Contextor 会把它清空。
-            vision_elements=state.vision_elements,
+            vision_elements=frame.vision_elements if frame is not None else None,
             stall_notice=stall_notice,
         )
 

@@ -1,11 +1,12 @@
 """视觉主体扫描（``scan_visual_subjects``）的离线回归测试。
 
-覆盖四件事：
+覆盖五件事：
 
 1. 归一化框 → 像素框的换算（越界夹紧、空框拒绝）；
 2. 扫描输出 → 编号表的映射（过滤空描述 / 非法框，截断到 20 项，异常降级）；
-3. Executor 的 ``Target.vision_index`` 反解（命中、越界、无缓存、指纹过期）；
-4. 提示词 / 工具集契约（中英模板、开关）。
+3. 感知帧：epoch 派生、视觉列表的继承与作废、扫描只读帧里的图；
+4. Executor 的 ``Target.vision_index`` 反解（命中、越界、无列表、无帧）；
+5. 提示词 / 工具集契约（中英模板、开关、回执不重复整张表）。
 """
 
 from __future__ import annotations
@@ -18,13 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "minitap"
 
 import pytest  # noqa: E402
 
+from minitap.mobile_use.perception import frame as screen_frame  # noqa: E402
 from minitap.mobile_use.services import vision  # noqa: E402
 from minitap.mobile_use.tools.bounds_validation import (  # noqa: E402
     coordinates_look_like_hierarchy_derived_from_elements,
 )
 from minitap.mobile_use.tools.types import Target  # noqa: E402
 from minitap.mobile_use.tools.utils import resolve_target  # noqa: E402
-from minitap.mobile_use.utils.screen_elements import scan_cache_fingerprint  # noqa: E402
 from minitap.mobile_use.utils.ui_hierarchy import ElementBounds  # noqa: E402
 
 _PROMPTS = Path(__file__).resolve().parents[2] / "minitap" / "mobile_use" / "agents" / "executor"
@@ -131,25 +132,122 @@ async def test_scan_failure_degrades_to_empty_with_a_reason(monkeypatch):
     assert "model does not accept images" in reason
 
 
-def test_scan_result_tells_the_model_how_to_address_a_subject():
-    elements = [
-        vision.VisionElement(
-            index=1,
-            label="gear icon, top right",
-            bounds=ElementBounds(x=900, y=100, width=80, height=100),
-        )
-    ]
-
-    result = vision.render_vision_scan_result(elements, language="en")
+def test_scan_receipt_tells_the_model_how_to_address_a_subject():
+    """回执只报数量，编号表由每轮 prompt 渲染 —— 不能两处都列一遍。"""
+    result = vision.render_scan_receipt(1, language="en")
 
     assert '{"vision_index": <i>}' in result
-    assert '[1] "gear icon, top right"' in result
+    assert "1 subject(s)" in result
+    assert "[1]" not in result
 
 
 def test_empty_scan_result_does_not_invite_invention():
-    result = vision.render_vision_scan_result([], language="en")
+    result = vision.render_scan_receipt(0, language="en")
     assert "no visual subjects" in result.lower()
     assert "Do not invent" in result
+
+
+# ---------------------------------------------------------------------------
+# 感知帧：一帧一图、列表随帧继承 / 作废
+# ---------------------------------------------------------------------------
+
+
+def _frame(
+    *,
+    epoch: str = "screen-a",
+    elements=None,
+    vision_elements=None,
+    screenshot: str = "frame-image",
+    screen_state: str | None = "on",
+) -> screen_frame.ScreenFrame:
+    return screen_frame.ScreenFrame(
+        epoch=epoch,
+        screenshot_base64=screenshot,
+        width=1000,
+        height=2000,
+        screen_elements=elements or [],
+        screen_state=screen_state,
+        vision_elements=vision_elements or [],
+    )
+
+
+def _ctx_with(frame_obj) -> SimpleNamespace:
+    return SimpleNamespace(screen_frame=frame_obj)
+
+
+def test_same_screen_keeps_the_visual_list():
+    element = screen_frame.VisionElement(
+        index=1, label="gear", bounds=ElementBounds(x=0, y=0, width=10, height=10)
+    )
+    ctx = _ctx_with(_frame(vision_elements=[element]))
+
+    screen_frame.publish_frame(ctx, _frame(epoch="screen-a"))
+
+    assert ctx.screen_frame.vision_elements == [element]
+
+
+def test_a_new_screen_drops_the_visual_list():
+    element = screen_frame.VisionElement(
+        index=1, label="gear", bounds=ElementBounds(x=0, y=0, width=10, height=10)
+    )
+    ctx = _ctx_with(_frame(vision_elements=[element]))
+
+    screen_frame.publish_frame(ctx, _frame(epoch="screen-b"))
+
+    assert ctx.screen_frame.vision_elements == []
+
+
+def test_an_empty_text_channel_makes_every_frame_distinct():
+    """两条文字通道都空时不能把上一屏的视觉列表一直继承下去。"""
+    first = screen_frame.frame_epoch(None, None)
+    second = screen_frame.frame_epoch(None, None)
+
+    assert first.startswith("empty@")
+    assert second.startswith("empty@")
+    assert first != second
+
+
+@pytest.mark.asyncio
+async def test_scan_reads_the_frame_image_instead_of_taking_a_new_one(monkeypatch):
+    frame_obj = _frame(screenshot="the-frame-image")
+    captured: dict[str, object] = {}
+
+    async def _fake_scan(ctx, screenshot_base64, **kwargs):
+        captured["image"] = screenshot_base64
+        captured["size"] = (kwargs.get("screen_width"), kwargs.get("screen_height"))
+        return [], ""
+
+    monkeypatch.setattr(vision, "scan_screen_subjects", _fake_scan)
+
+    elements, reason = await vision.scan_frame(SimpleNamespace(), frame_obj)
+
+    assert reason == ""
+    assert elements == []
+    assert captured["image"] == "the-frame-image"
+    assert captured["size"] == (1000, 2000)
+
+
+@pytest.mark.asyncio
+async def test_scan_without_a_frame_degrades_with_a_reason():
+    elements, reason = await vision.scan_frame(SimpleNamespace(), None)
+
+    assert elements == []
+    assert "frame is unavailable" in reason
+
+
+@pytest.mark.asyncio
+async def test_scan_on_a_screen_that_turned_off_is_refused(monkeypatch):
+    frame_obj = _frame(screen_state="off")
+
+    async def _fake_scan(ctx, screenshot_base64, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("vision model must not be called on a black screenshot")
+
+    monkeypatch.setattr(vision, "scan_screen_subjects", _fake_scan)
+
+    elements, reason = await vision.scan_frame(SimpleNamespace(), frame_obj)
+
+    assert elements == []
+    assert "screen is off" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -157,24 +255,19 @@ def test_empty_scan_result_does_not_invite_invention():
 # ---------------------------------------------------------------------------
 
 
-def _state_with(elements, fingerprint: str | None):
-    return SimpleNamespace(
-        vision_elements=elements,
-        vision_scan_fingerprint=fingerprint,
-        latest_screen_elements=None,
-        latest_ocr_results=None,
-    )
+def _state():
+    return SimpleNamespace(latest_screen_elements=None, latest_ocr_results=None)
 
 
 def test_vision_index_resolves_to_bounds_and_label():
-    element = vision.VisionElement(
+    element = screen_frame.VisionElement(
         index=1,
         label="gear icon, top right",
         bounds=ElementBounds(x=10, y=20, width=30, height=40),
     )
-    state = _state_with([element], scan_cache_fingerprint(None, None))
+    frame_obj = _frame(vision_elements=[element])
 
-    target, error = resolve_target(state, Target(vision_index=1))  # type: ignore[arg-type]
+    target, error = resolve_target(_state(), Target(vision_index=1), frame=frame_obj)
 
     assert error is None
     assert target.bounds == element.bounds
@@ -182,38 +275,32 @@ def test_vision_index_resolves_to_bounds_and_label():
 
 
 def test_vision_index_without_a_scan_is_rejected():
-    state = _state_with([], None)
+    frame_obj = _frame()
 
-    _target, error = resolve_target(state, Target(vision_index=1))  # type: ignore[arg-type]
+    _target, error = resolve_target(_state(), Target(vision_index=1), frame=frame_obj)
 
     assert error is not None
     assert "call scan_visual_subjects first" in error
 
 
 def test_vision_index_out_of_range_is_rejected():
-    element = vision.VisionElement(
+    element = screen_frame.VisionElement(
         index=1, label="only one", bounds=ElementBounds(x=0, y=0, width=10, height=10)
     )
-    state = _state_with([element], scan_cache_fingerprint(None, None))
+    frame_obj = _frame(vision_elements=[element])
 
-    _target, error = resolve_target(state, Target(vision_index=2))  # type: ignore[arg-type]
+    _target, error = resolve_target(_state(), Target(vision_index=2), frame=frame_obj)
 
     assert error is not None
     assert "out of range" in error
     assert "1..1" in error
 
 
-def test_a_stale_visual_list_is_rejected():
-    element = vision.VisionElement(
-        index=1, label="gear", bounds=ElementBounds(x=0, y=0, width=10, height=10)
-    )
-    state = _state_with([element], "a-fingerprint-from-another-screen")
-
-    _target, error = resolve_target(state, Target(vision_index=1))  # type: ignore[arg-type]
+def test_vision_index_without_a_frame_is_rejected():
+    _target, error = resolve_target(_state(), Target(vision_index=1))
 
     assert error is not None
-    assert "previous screen" in error
-    assert "scan_visual_subjects again" in error
+    assert "frame is unavailable" in error
 
 
 def test_vision_bounds_bypass_the_iou_gate():
@@ -237,9 +324,9 @@ def test_vision_bounds_bypass_the_iou_gate():
 @pytest.mark.parametrize("language", ["en", "zh"])
 def test_prompts_teach_the_vision_index_contract(language):
     """提示词里必须教 `vision_index`，并且不再有旧的定位失败回灌宏。"""
-    message = (
-        _PROMPTS / f"prompts/{language}/messages/per-turn/vision-subjects.md"
-    ).read_text(encoding="utf-8")
+    message = (_PROMPTS / f"prompts/{language}/messages/per-turn/vision-subjects.md").read_text(
+        encoding="utf-8"
+    )
     assert "vision_index" in message
     assert "{{ rows }}" in message
     assert "vision_failure_message" not in message

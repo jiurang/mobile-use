@@ -13,6 +13,7 @@ from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.controller_factory import create_device_controller
 from minitap.mobile_use.graph.state import State
+from minitap.mobile_use.perception.frame import get_frame
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
 from minitap.mobile_use.tools.types import Target
 from minitap.mobile_use.tools.utils import (
@@ -72,7 +73,9 @@ def get_focus_and_input_text_tool(ctx: MobileUseContext) -> BaseTool:
         """
         # 把 index / ocr_index 解析成具体的元素。索引优先于模型自己抄的字段 ——
         # 它指向的是模型当时看到的那一行，id 和坐标都是代码给的。
-        target, index_error = resolve_target(state=state, target=target)
+        target, index_error = resolve_target(
+            state=state, target=target, frame=get_frame(ctx)
+        )
         if index_error:
             logger.warning(f"Input target could not be resolved: {index_error}")
 

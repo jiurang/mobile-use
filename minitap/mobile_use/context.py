@@ -19,6 +19,7 @@ from minitap.mobile_use.clients.ios_client import IosClientWrapper
 from minitap.mobile_use.clients.ui_automator_client import UIAutomatorClient
 from minitap.mobile_use.config import AgentNode, LLMConfig
 from minitap.mobile_use.controllers.cloud_device_controller import CloudAndroidController
+from minitap.mobile_use.perception.frame import ScreenFrame
 from minitap.mobile_use.prompt_language import PromptLanguage
 from minitap.mobile_use.services.ocr.types import OcrConfig
 
@@ -229,6 +230,14 @@ class MobileUseContext(BaseModel):
     on_plan_changes: Callable[[list[Subgoal], IsReplan], Coroutine] | None = None
     video_recording_enabled: bool = False
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
+
+    #: **本轮感知帧**：Contextor 每步发布，截图、元素表、OCR、视觉主体都挂在
+    #: 同一份对象上（见 ``perception/frame.py`` 的不变量）。
+    #:
+    #: 为什么不进 state：截图是 1~3MB 的 base64，state 每步都要流动，没必要背着
+    #: 它走；帧是「这次运行看到的屏幕」，和 ``task_started_at`` 同类。``exclude``
+    #: 保证 ctx 被 ``model_dump`` 时不会把截图带出去。
+    screen_frame: ScreenFrame | None = Field(default=None, exclude=True)
 
     #: 提示词语言（``en`` / ``zh``）。**已经在 SDK 层定好了**（任务级 > Agent 级 >
     #: 环境变量 > 英文），这里只负责带进各个 agent。
