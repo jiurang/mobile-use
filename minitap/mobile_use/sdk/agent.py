@@ -97,8 +97,8 @@ load_dotenv()
 #    summarizer + convergence = **6** 个 super-step 才跑 **1** 个动作
 #    （实测 R=400 → 399 super-step / 66 次工具执行 = 6.05）。
 #
-# 3. **改造后**的图（Executor 自主循环）：
-#    * 一个动作步 = contextor + executor + executor_tools + summarizer = **4** 个
+# 3. **改造后**的图（Executor 自主循环；Summarizer 已于 2026-10-29 移除）：
+#    * 一个动作步 = contextor + executor + executor_tools = **3** 个
 #      super-step（工具执行完必须回 contextor 重建元素表 —— 索引契约，见
 #      `graph/graph.py` 的模块文档）；
 #    * 每个子目标另有固定开销 **9** 个：cortex 下发 1 + 收尾那轮 2
@@ -107,11 +107,15 @@ load_dotenv()
 #    * 起跑 **3** 个：planner + orchestrator + convergence。
 #
 # ⇒ 精确模型（探针实测 S 个子目标 × 每目标 K 个动作步，**误差 0**）：
-#       super_steps = 3 + S × (4K + 9)
+#       super_steps = 3 + S × (3K + 9)
 #       executor 步数 E = S × (K + 1)
-#   ⇒ super_steps = 3 + 4E + 5S
+#   ⇒ super_steps = 3 + 3E + 6S
 #   ⇒ 每个动作步最坏要 **9** 个 super-step（K=0：子目标一步没做就收尾）；
-#     典型情况（K=4~5，方案 §4.3 真机实测）只要 5.0~4.6 个。
+#     典型情况（K=4~5）约 4.2~4.0 个。
+#
+# ⚠️ **最坏系数仍是 9**：K=0 时每个子目标要 9 个固定 super-step，和动作步
+# 数量无关。删掉 Summarizer 只降低典型值（每动作 4→3），不降低最坏值，所以
+# `SUPER_STEPS_PER_ACTION_STEP` 保持 9：上限是天花板，不是配额。
 #
 # 系数取**最坏情况 9**：宁可多给，不能少给 —— 给少了任务会在中途撞
 # `GraphRecursionError` 直接崩掉，已经花掉的钱和跑过的步数全白费。
@@ -139,13 +143,13 @@ def compute_recursion_limit(max_steps: int) -> int:
 
     ⚠️ **2026-10-26：名义与实际的差距要说清楚。**
     系数 9 是**最坏情况**（每个子目标的固定开销摊到每一个动作步上）。
-    真实循环里**一个动作步 ≈ 4 个 super-step**
-    （contextor + executor + executor_tools + summarizer），
-    ⇒ 实际放行的动作步 ≈ ``(recursion_limit − 32 − 5S) / 4``，
-    也就是 N=80 时**约 176~188 个动作步**，是名义值的 2.3 倍。
+    真实循环里**一个动作步 ≈ 3 个 super-step**
+    （contextor + executor + executor_tools；Summarizer 已移除），
+    ⇒ 实际放行的动作步 ≈ ``(recursion_limit − 3 − 6S) / 3``，
+    也就是 N=80 时**约 230~244 个动作步**，是名义值的约 2.9~3.0 倍。
 
-    真机实测（mobile-manager execution 880）：**186** 个动作步才撞上限 ——
-    正好落在这个区间。
+    真机实测（Summarizer 移除前，mobile-manager execution 880）：**186** 个
+    动作步才撞上限 —— 当时每动作步 4 个 super-step，按现在的 3 个折算约 248 步。
 
     ⇒ 这个值是**天花板**，不是配额：撞到了会**优雅收尾 + 上报**
     （见 `sdk/budget.py`），不是崩。

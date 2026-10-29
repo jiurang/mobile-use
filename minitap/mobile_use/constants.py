@@ -24,13 +24,16 @@
 #
 # ``max_steps`` **从来没有**被当成动作步执行过。它只被乘进 super-step 上限
 # （``sdk/agent.py::compute_recursion_limit``：``N × 9 + 32``），
-# 而真实循环里**一个动作步 ≈ 4 个 super-step**
-# （contextor + executor + executor_tools + summarizer）。
-# ⇒ N=80 实际放行 ``(752 − 32 − 5S) / 4 ≈ 176~188`` 个动作步，
-# 是名义值的 **2.3 倍**。
+# 而真实循环里**一个动作步 ≈ 3 个 super-step**
+# （contextor + executor + executor_tools；Summarizer 已于 2026-10-29 移除）。
+# ⇒ N=80 实际放行 ``(752 − 3 − 6S) / 3 ≈ 230~244`` 个动作步，
+# 是名义值的 **约 2.9~3.0 倍**。
 #
-# 真机实测（mobile-manager execution 880）：跑了 **186** 个动作步才撞上限
-# —— 正好落在这个区间里。
+# 最坏情况仍是每个动作步 9 个 super-step（每个动作步都自成子目标，K=0），
+# 所以 ``SUPER_STEPS_PER_ACTION_STEP`` 保持 9 —— 它是天花板，不是典型值。
+#
+# 真机实测（mobile-manager execution 880，Summarizer 移除前）：跑了 **186**
+# 个动作步才撞上限 —— 正好落在当时 4 super-step/动作步的区间里。
 #
 # ⇒ **为什么不把它改成「真的按动作步计数」**（那要加一个硬上限）：
 # 撞上限现在是**优雅收尾 + 上报**（`sdk/budget.py`），不是崩；
@@ -38,7 +41,6 @@
 # 名字与实不符这件事，靠**文档说实话**解决，不靠加限制。
 DEFAULT_MAX_STEPS = 80
 
-MAX_MESSAGES_IN_HISTORY = 25
 EXECUTOR_MESSAGES_KEY = "executor_messages"
 
 # 🔴 **2026-10-27 移除：`EXECUTOR_SCREENSHOT_KEY`（`"executor_screenshot"`）。**

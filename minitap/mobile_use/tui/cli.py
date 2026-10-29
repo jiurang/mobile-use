@@ -33,7 +33,6 @@ DEMO_SCRIPT: list[dict] = [
     {"kind": "action", "name": "tap", "detail": "x=540, y=1180", "take": 0.5},
     {"kind": "node", "name": "executor_tools", "think": 0.3},
     {"kind": "action", "name": "wait_for_delay", "detail": "seconds=2.0", "take": 0.9},
-    {"kind": "node", "name": "summarizer", "think": 0.5},
     {"kind": "node", "name": "contextor", "think": 0.7},
     {
         "kind": "thought",
@@ -42,7 +41,6 @@ DEMO_SCRIPT: list[dict] = [
     {"kind": "node", "name": "cortex", "think": 0.6},
     {"kind": "action", "name": "tap", "detail": "x=360, y=228", "take": 0.4},
     {"kind": "action", "name": "focus_and_input_text", "detail": "text=张三", "take": 0.8},
-    {"kind": "node", "name": "summarizer", "think": 0.4},
     {"kind": "result", "output": "已在微信中搜索到「张三」，会话窗口打开成功。"},
 ]
 

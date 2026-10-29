@@ -930,11 +930,14 @@ def test_t18_both_shapes_assemble_without_raising():
 # 交叉验证过「super-step 数 == 节点执行次数」（这张图是纯链，一个 super-step
 # 正好跑一个节点）。
 #
-# 实测模型（探针，误差 0）：
-#     super_steps = 3 + S × (4K + 9)
+# 实测模型（探针，误差 0；2026-10-29 移除 Summarizer 后更新）：
+#     super_steps = 3 + S × (3K + 9)
 #         S = 子目标数，K = 每个子目标的动作步数
 #     动作步数 E = S × (K + 1)（每个子目标最后还有一轮「我做到了」的收尾）
-#   ⇒ super_steps = 3 + 4E + 5S，而 S ≤ E ⇒ 最坏 3 + 9E（每个动作步自成子目标）
+#   ⇒ super_steps = 3 + 3E + 6S，而 S ≤ E ⇒ 最坏 3 + 9E（每个动作步自成子目标）
+#
+# 最坏系数仍是 9：K=0 时每个子目标要 9 个固定 super-step，和动作步无关。
+# 所以 `SUPER_STEPS_PER_ACTION_STEP = 9` 不变；典型值从 4~5 降到 3.6~4.2。
 
 
 def _plan(n: int) -> list[Subgoal]:
@@ -1073,17 +1076,6 @@ def _stub_reporter():
     return _Reporter
 
 
-def _stub_summarizer():
-    class _Summarizer:
-        def __init__(self, ctx):
-            self.ctx = ctx
-
-        async def __call__(self, state):
-            return {}
-
-    return _Summarizer
-
-
 def _stub_decide(steps_per_subgoal: int):
     """脚本化的 Executor 决策：前 K 轮给动作，之后说「我做到了」。
 
@@ -1148,7 +1140,6 @@ async def _run_real_graph(
     monkeypatch.setattr(gg, "CortexNode", _stub_cortex())
     monkeypatch.setattr(gg, "ExecutorToolNode", _stub_tool_node())
     monkeypatch.setattr(gg, "ReporterNode", _stub_reporter())
-    monkeypatch.setattr(gg, "SummarizerNode", _stub_summarizer())
     monkeypatch.setattr(ExecutorNode, "_decide", _stub_decide(steps_per_subgoal))
 
     graph = await gg.get_graph(_ctx())
@@ -1174,7 +1165,7 @@ def test_t20_recursion_limit_covers_the_action_step_budget():
     """T20：换算出来的 `recursion_limit` 足够跑完对应的动作步数。
 
     实测模型（`scripts/probe_superstep_budget.py`）：
-        super_steps = 3 + 4E + 5S，E = 动作步数，S = 子目标数
+        super_steps = 3 + 3E + 6S，E = 动作步数，S = 子目标数
     最坏情况是「每个动作步都自成子目标」（S = E）⇒ 3 + 9E。
     换算必须覆盖这个最坏情况 —— 给少了任务会在中途崩掉。
     """
@@ -1201,7 +1192,7 @@ async def test_t20c_converted_recursion_limit_finishes_the_task(monkeypatch):
     """T20：换成算出来的 `recursion_limit` 之后，任务能**跑完**。
 
     脚本：2 个子目标 × 每个 3 个动作步 = 6 个动作步（+ 每子目标 1 轮收尾
-    = 8 个 executor 步），实测要 45 个 super-step。
+    = 8 个 executor 步），实测要 39 个 super-step（Summarizer 移除前是 45）。
     """
     result = await _run_real_graph(
         monkeypatch,
@@ -1218,7 +1209,7 @@ async def test_t20d_unconverted_recursion_limit_crashes_the_task(monkeypatch):
     """T20 反向验证：**不换算**的话，任务会中途崩。
 
     这就是 M12 要修的东西 —— 同一个 `max_steps` 直接当 `recursion_limit` 用，
-    在新拓扑下根本跑不完（8 个动作步要 45 个 super-step）。
+    在新拓扑下根本跑不完（8 个动作步要 39 个 super-step）。
     """
     result = await _run_real_graph(
         monkeypatch,

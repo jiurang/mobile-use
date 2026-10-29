@@ -52,7 +52,6 @@ AGENT_LABELS: dict[str, str] = {
     "executor_tools": "executor_tools",
     # 汇报节点：把 executor 的执行日志压成结论，用户要能一眼看出「这一轮汇报了」
     "reporter": "reporter",
-    "summarizer": "summarizer",
 }
 
 # Nodes that actually drive the device; worth highlighting in the timeline.

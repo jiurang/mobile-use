@@ -13,7 +13,7 @@
     contextor → executor
     executor --(有动作)--> executor_tools
     executor --(done / 步数上限 / 没动作)--> reporter
-    executor_tools → summarizer → contextor
+    executor_tools → contextor
     reporter → orchestrator
     orchestrator → convergence
 
@@ -60,7 +60,6 @@ from minitap.mobile_use.agents.planner.utils import (
     one_of_them_is_failure,
 )
 from minitap.mobile_use.agents.reporter.reporter import ReporterNode
-from minitap.mobile_use.agents.summarizer.summarizer import SummarizerNode
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
@@ -276,8 +275,6 @@ async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
 
     graph_builder.add_node("reporter", ReporterNode(ctx))
 
-    graph_builder.add_node("summarizer", SummarizerNode(ctx))
-
     graph_builder.add_node(node="convergence", action=make_convergence_node(ledger), defer=True)
 
     ## Linking nodes
@@ -310,10 +307,9 @@ async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
         },
     )
 
-    # 工具执行完 → 裁剪 messages → **回 contextor**（重新抓屏、重建元素表）。
+    # 工具执行完 → **回 contextor**（重新抓屏、重建元素表）。
     # 不能直接回 executor：那样工具解析 Target.index 时拿到的是别的屏的编号。
-    graph_builder.add_edge("executor_tools", "summarizer")
-    graph_builder.add_edge("summarizer", "contextor")
+    graph_builder.add_edge("executor_tools", "contextor")
 
     # 汇报 → Orchestrator（看门狗，**无条件**）。
     # 没有这条边，计划级失败就没有处理者（R16）：Cortex 一直重发到撞 recursion_limit。

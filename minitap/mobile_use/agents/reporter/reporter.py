@@ -529,7 +529,7 @@ def last_tool_result(messages: list[AnyMessage] | None) -> str | None:
 # 和 ``state.latest_ocr_results``。
 #
 # 它就是「动作执行之后」那一屏，这点必须成立，否则证据是旧的。环是 executor、
-# executor_tools、summarizer、contextor 再回到 executor，每执行一个动作都会回到
+# executor_tools、contextor 再回到 executor，每执行一个动作都会回到
 # contextor 重新抓屏。所以 executor 说 done 的那一刻，state 里躺着的就是最后
 # 一个动作执行之后的屏。
 #

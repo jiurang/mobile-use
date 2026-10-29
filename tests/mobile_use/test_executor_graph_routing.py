@@ -463,18 +463,17 @@ def test_graph_has_reporter_to_orchestrator_watchdog_edge():
     )
 
 
-def test_graph_has_executor_tools_to_summarizer_edge():
-    """``executor_tools → summarizer``：工具执行完先裁剪 messages。"""
-    assert ("executor_tools", "summarizer") in _edges()
-
-
-def test_graph_has_summarizer_to_contextor_edge():
-    """``summarizer → contextor``：工具执行完**必须回 contextor** 重新抓屏。
+def test_graph_has_executor_tools_to_contextor_edge():
+    """``executor_tools → contextor``：工具执行完**必须回 contextor** 重新抓屏。
 
     不能直接回 executor：那样工具解析 ``Target.index`` 时拿到的是
     **上一屏**的编号，点错元素（索引契约，方案 §9.1 / R19）。
+
+    Summarizer 已于 2026-10-29 移除：它只裁剪 ``state.messages``，而 v2 里
+    没有任何节点写那个字段，节点恒为 no-op。裁剪职责不再存在，边直接连回
+    contextor。
     """
-    assert ("summarizer", "contextor") in _edges()
+    assert ("executor_tools", "contextor") in _edges()
 
 
 def test_graph_has_contextor_to_executor_edge():
@@ -508,7 +507,6 @@ def test_graph_has_all_required_nodes():
         "executor",
         "executor_tools",
         "reporter",
-        "summarizer",
         "convergence",
     ):
         assert required in nodes, f"图里少了节点 {required}"
