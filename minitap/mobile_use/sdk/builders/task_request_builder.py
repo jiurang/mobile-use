@@ -112,7 +112,7 @@ class TaskRequestCommonBuilder(BaseModel):
         Set the language the agent prompts are written in for this task.
 
         ``"zh"`` loads the Chinese versions of the agent prompts (``*.md`` ->
-        ``*-zh.md``); ``"en"`` keeps the English originals.
+        ``prompts/zh/``); ``"en"`` keeps the English originals.
 
         This is the **task-level** switch: it overrides the agent-level default
         (``AgentConfigBuilder.with_prompt_language``) and the

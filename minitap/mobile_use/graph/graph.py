@@ -3,19 +3,17 @@
 拓扑（方案 §9.1 / §9.4，契约 §W8.2）
 ------------------------------------
 
-    START → planner → orchestrator → convergence
-    convergence --continue--> cortex
-    convergence --replan--> planner
-    convergence --end--> END
+    START → planner → plan_manager
+    plan_manager --continue--> cortex
+    plan_manager --replan--> planner
+    plan_manager --end--> END
 
     cortex --(有待执行的目标)--> contextor
-    cortex --(子目标完成 / 没有待跑目标)--> orchestrator
+    cortex --(子目标完成 / 没有待跑目标 / 预算超限)--> plan_manager
     contextor → executor
     executor --(有动作)--> executor_tools
-    executor --(done / 步数上限 / 没动作)--> reporter
+    executor --(done / 步数上限 / 没动作)--> cortex
     executor_tools → contextor
-    reporter → orchestrator
-    orchestrator → convergence
 
 三条设计约束（每一条都有硬理由，不是风格偏好）
 --------------------------------------------
@@ -26,18 +24,17 @@
    所以工具执行完**必须回 contextor**（重新抓屏 + 重建表），
    **不能**直接回 executor（那样工具会拿到上一屏的编号，点错元素）。
 
-2. **看门狗**（方案 §6.5.1，R16）：
-   ``reporter → orchestrator`` 是**无条件**边 —— 每个子目标结束都让 Orchestrator
-   看一眼计划。没有它，计划级失败（子目标根本做不到）就没有任何处理者：
-   Cortex 会一直说「没完成」一直重发，最后撞 ``recursion_limit`` **异常退出**
-   （不是「重新拆计划」）。
+2. **汇报不是节点**（2026-10-29）：
+   ``executor → cortex`` 是**无条件**边。Executor 结束一次尝试（``done=True``）
+   之后直接回 Cortex，Cortex 入口用 ``build_executor_report`` 把汇报构建出来
+   （纯代码），消费完清掉 ``executor_done``。汇报的唯一消费者是 Cortex，
+   所以不需要独立的 reporter 节点，也就少一个 super-step。
 
-3. **汇报是新旧有别的**：
-   ``state.executor_report`` 每子目标变 —— Reporter 写一份、Cortex 读一份。
-   读过的汇报必须作废，否则下一轮 Cortex 会把**同一份**汇报再判一遍
-   （「完成了 → 推进到下一个子目标」），中间的子目标就被跳过了。
-   作废由 :class:`ReportLedger`（一次运行级的账本）记住「已经判过哪一份」，
-   由 :func:`make_convergence_node` 在 state 里真正清掉。
+3. **看门狗**（方案 §6.5.1，R16）：
+   Cortex 的每一次判断之后都会经过 PlanManager（要么 ``review``，要么
+   下一轮从它出发）。PlanManager 是纯代码：完成提名由 Cortex 给出，计划级失败
+   由「同一子目标下发超过 ``MAX_ISSUES_PER_SUBGOAL`` 次」这条规则兜底；
+   没有它，Cortex 会一直重发到撞 ``recursion_limit`` **异常退出**。
 """
 
 from typing import Literal
@@ -51,15 +48,12 @@ from minitap.mobile_use.agents.contextor.contextor import ContextorNode
 from minitap.mobile_use.agents.cortex.cortex import CortexNode
 from minitap.mobile_use.agents.executor.executor import ExecutorNode
 from minitap.mobile_use.agents.executor.tool_node import ExecutorToolNode
-from minitap.mobile_use.agents.executor.types import ExecutorReport
-from minitap.mobile_use.agents.orchestrator.orchestrator import OrchestratorNode
-from minitap.mobile_use.agents.planner.planner import PlannerNode
-from minitap.mobile_use.agents.planner.utils import (
-    all_completed,
-    get_current_subgoal,
-    one_of_them_is_failure,
+from minitap.mobile_use.agents.plan_manager.plan_manager import (
+    PlanManagerNode,
+    plan_manager_gate,
+    post_cortex_gate,
 )
-from minitap.mobile_use.agents.reporter.reporter import ReporterNode
+from minitap.mobile_use.agents.planner.planner import PlannerNode
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
@@ -69,96 +63,6 @@ from minitap.mobile_use.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class ReportLedger:
-    """记住「哪一份汇报已经被 Cortex 判过」。
-
-    为什么需要它
-    ------------
-    ``state.executor_report`` 是**每子目标变**的字段：Reporter 写一份、Cortex 读一份。
-    读过的汇报必须作废 —— 不作废的话，下一次进 Cortex 会把**同一份**汇报再判一遍
-    （「完成了 → 推进到下一个子目标」），中间的子目标就被跳过了。
-
-    契约给的两个办法（清空 state 字段 / 加一个「本轮已验收」标记字段）都要动
-    ``graph/state.py``，那个文件不在 W8 的名下。所以这里用**一次运行级的账本**：
-    ``get_graph(ctx)`` 每次建图都新建一个，跟着这次任务的生命周期。
-
-    汇报对象每个子目标新建一个，所以用**对象身份**就能区分新旧。
-    这里持有强引用，保证 ``id`` 不会被回收后复用（否则两份汇报可能被误判成同一份）。
-    """
-
-    def __init__(self) -> None:
-        self._seen: ExecutorReport | None = None
-
-    def is_seen(self, report: ExecutorReport | None) -> bool:
-        """这份汇报是不是已经判过了。"""
-        return report is not None and report is self._seen
-
-    def mark_seen(self, report: ExecutorReport) -> None:
-        """记下「这份已经判过了」。"""
-        self._seen = report
-
-
-def convergence_gate(
-    state: State,
-) -> Literal["continue", "replan", "end"]:
-    """Check if all subgoals are completed at convergence point."""
-    logger.info("Starting convergence_gate")
-
-    if one_of_them_is_failure(state.subgoal_plan):
-        logger.info("One of the subgoals is in failure state, asking to replan")
-        return "replan"
-
-    if all_completed(state.subgoal_plan):
-        logger.info("All subgoals are completed, ending the goal")
-        return "end"
-
-    if not get_current_subgoal(state.subgoal_plan):
-        logger.info("No subgoal running, ending the goal")
-        return "end"
-
-    return "continue"
-
-
-def post_cortex_gate(
-    state: State,
-    ledger: ReportLedger,
-) -> Literal["execute", "review"]:
-    """Cortex 之后的路由。
-
-    * ``review``  → Orchestrator：子目标完成的**正式验收**（标 SUCCESS → convergence）；
-      没有待执行的目标时也走这里 —— 看门狗：计划级失败得有人处理。
-    * ``execute`` → Contextor：抓屏 → Executor 跑当前目标。
-
-    汇报的新旧
-    ----------
-    ``executor_report`` 每子目标变，**必须**判它是不是新的：
-    已经判过的那份（ledger 记得）不再触发验收，否则同一份汇报会被判两遍。
-
-    目标的新旧
-    ----------
-    ``executor_steps == 0`` 是「目标刚下发」的信号：Cortex 下发新目标时把它归零
-    （契约 §W6.4），Executor 每跑一轮 +1。所以它是「这个目标还没跑过」的判据 ——
-    少了它，已经做完的目标会被**再跑一遍**（子目标被重复执行）。
-    """
-    report = state.executor_report
-
-    # 汇报说做成了 → 走验收。两个条件同时满足时**优先 review**：
-    # 先验收完成，再继续下一个子目标（契约 §W8.3）。
-    if report is not None and report.outcome == "completed" and not ledger.is_seen(report):
-        logger.info("[graph] Subgoal reported as completed; going to orchestrator for review")
-        ledger.mark_seen(report)
-        return "review"
-
-    # 有目标、而且这个目标还没被执行过 → 去执行。
-    if state.executor_goal and state.executor_steps == 0:
-        logger.info(f"[graph] Executing subgoal: {state.executor_goal}")
-        return "execute"
-
-    # 没有待执行的目标 → 交给 Orchestrator（看门狗）。
-    logger.info("[graph] No pending subgoal to execute; going to orchestrator")
-    return "review"
-
-
 def post_executor_gate(
     state: State,
 ) -> Literal["invoke_tools", "report", "retry"]:
@@ -166,7 +70,7 @@ def post_executor_gate(
 
     * ``invoke_tools`` → ``executor_tools``（执行动作）
     * ``retry``       → ``executor``（**动作被拒了，回 executor 重新决策**）
-    * ``report``      → ``reporter``（收尾汇报）
+    * ``report``      → ``cortex``（收尾：Cortex 入口自己构建汇报）
 
     「有没有动作」从局部历史**最后一条 AIMessage 的 tool_calls** 判断 ——
     Executor 只写 AIMessage（带不带 tool_calls），工具写的是 ToolMessage。
@@ -176,7 +80,7 @@ def post_executor_gate(
 
     拒绝时 Executor 写的是「AIMessage(无 tool_calls) + HumanMessage(拒绝理由)」。
     如果这里只看「最后一条 AIMessage 有没有 tool_calls」，会因为那条 AIMessage
-    确实没有 tool_calls 而 `break` → 直接进 reporter ——
+    确实没有 tool_calls 而 `break` → 直接进 cortex 收尾 ——
     **拒绝理由模型永远看不到，Executor 的自主循环在第一次出岔子时就终止了**。
 
     ⇒ 判据改成「**最后一条消息是不是 HumanMessage**」：
@@ -186,8 +90,8 @@ def post_executor_gate(
     （拒绝时根本没派发出去），OpenAI 兼容端点会 400（致命 bug 3）。
     """
     if state.executor_done:
-        # 目标达成 / 步数上限：不再执行动作，直接收尾汇报。
-        logger.info("[graph] Executor is done; going to reporter")
+        # 目标达成 / 步数上限：不再执行动作，直接收尾。
+        logger.info("[graph] Executor is done; going to cortex")
         return "report"
 
     messages = state.executor_messages or []
@@ -207,54 +111,17 @@ def post_executor_gate(
                 return "invoke_tools"
             break
 
-    # 兜底：没有动作可执行 → 也去 reporter 收尾（不能让流程卡在这儿）。
-    logger.info("[graph] No tool calls to execute; going to reporter")
+    # 兜底：没有动作可执行 → 也去 cortex 收尾（不能让流程卡在这儿）。
+    logger.info("[graph] No tool calls to execute; going to cortex")
     return "report"
-
-
-def make_convergence_node(ledger: ReportLedger):
-    """造一个带账本的 convergence 节点。
-
-    convergence 是计划层的汇合点，顺便干两件事：
-
-    1. **作废已判过的汇报** —— 被 Cortex 判过的那份从 state 里清掉。
-       不清的话下一次进 Cortex 会看到同一份旧汇报，又会「推进到下一个子目标」，
-       中间的子目标就被跳过了。
-    2. **验收提名** —— 汇报说「做成了」时，把当前子目标放进
-       ``complete_subgoals_by_ids``：Orchestrator 只审阅这个名单里的子目标
-       （``orchestrator.py`` 里名单为空它连 LLM 都不调），名单空着就没人验收，
-       子目标永远标不了 SUCCESS，任务就永远收不了尾。
-    """
-
-    async def convergence_node(state: State):
-        update: dict = {}
-        report = state.executor_report
-
-        if report is not None and ledger.is_seen(report):
-            update["executor_report"] = None
-        elif (
-            report is not None
-            and report.outcome == "completed"
-            and not state.complete_subgoals_by_ids
-        ):
-            current_subgoal = get_current_subgoal(state.subgoal_plan)
-            if current_subgoal is not None:
-                update["complete_subgoals_by_ids"] = [current_subgoal.id]
-
-        return update
-
-    return convergence_node
 
 
 async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
     graph_builder = StateGraph(State)
 
-    # 一次建图 = 一次任务运行：汇报账本跟着这次任务的生命周期。
-    ledger = ReportLedger()
-
     ## Define nodes
     graph_builder.add_node("planner", PlannerNode(ctx))
-    graph_builder.add_node("orchestrator", OrchestratorNode(ctx))
+    graph_builder.add_node("plan_manager", PlanManagerNode(ctx))
 
     graph_builder.add_node("contextor", ContextorNode(ctx))
 
@@ -273,35 +140,43 @@ async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
     )
     graph_builder.add_node("executor_tools", executor_tool_node)
 
-    graph_builder.add_node("reporter", ReporterNode(ctx))
-
-    graph_builder.add_node(node="convergence", action=make_convergence_node(ledger), defer=True)
-
     ## Linking nodes
     graph_builder.add_edge(START, "planner")
-    graph_builder.add_edge("planner", "orchestrator")
-    graph_builder.add_edge("orchestrator", "convergence")
+    graph_builder.add_edge("planner", "plan_manager")
 
-    # Cortex 下发目标 → 抓屏；子目标完成 → 验收。
+    # 计划层汇合点：PlanManager 之后直接判 continue / replan / end。
+    graph_builder.add_conditional_edges(
+        "plan_manager",
+        plan_manager_gate,
+        {
+            "continue": "cortex",
+            "replan": "planner",
+            "end": END,
+        },
+    )
+
+    # Cortex 下发目标 → 抓屏；完成提名 / 预算超限 → PlanManager。
     graph_builder.add_conditional_edges(
         "cortex",
-        lambda state: post_cortex_gate(state, ledger),
+        post_cortex_gate,
         {
             "execute": "contextor",
-            "review": "orchestrator",
+            "review": "plan_manager",
+            "budget_exceeded": "plan_manager",
         },
     )
 
     # 抓屏 → 决策一步。
     graph_builder.add_edge("contextor", "executor")
 
-    # 有动作 → 执行；做完了 → 汇报；被拒了 → 回 executor 重新决策。
+    # 有动作 → 执行；做完了 → 交给 Cortex 收尾（它在入口构建汇报）；被拒了 →
+    # 回 executor 重新决策。
     graph_builder.add_conditional_edges(
         "executor",
         post_executor_gate,
         {
             "invoke_tools": "executor_tools",
-            "report": "reporter",
+            "report": "cortex",
             # 动作被拒 → 回 executor（屏幕没变，不用重新抓屏）
             "retry": "executor",
         },
@@ -310,19 +185,5 @@ async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
     # 工具执行完 → **回 contextor**（重新抓屏、重建元素表）。
     # 不能直接回 executor：那样工具解析 Target.index 时拿到的是别的屏的编号。
     graph_builder.add_edge("executor_tools", "contextor")
-
-    # 汇报 → Orchestrator（看门狗，**无条件**）。
-    # 没有这条边，计划级失败就没有处理者（R16）：Cortex 一直重发到撞 recursion_limit。
-    graph_builder.add_edge("reporter", "orchestrator")
-
-    graph_builder.add_conditional_edges(
-        source="convergence",
-        path=convergence_gate,
-        path_map={
-            "continue": "cortex",
-            "replan": "planner",
-            "end": END,
-        },
-    )
 
     return graph_builder.compile()

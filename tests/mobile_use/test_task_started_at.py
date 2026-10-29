@@ -191,7 +191,6 @@ class TestCortexBlock:
         cortex_mod.get_llm = _StubFactory()  # type: ignore[assignment]
         try:
             state = State(
-                messages=[],
                 initial_goal="用「传奇」再搜一次",
                 subgoal_plan=[],
                 latest_ui_hierarchy=None,
@@ -199,12 +198,10 @@ class TestCortexBlock:
                 latest_screen_elements=None,
                 focused_app_info=None,
                 device_date=None,
-                structured_decisions=None,
                 complete_subgoals_by_ids=[],
                 agents_thoughts=[],
                 remaining_steps=10,
                 executor_messages=[],
-                cortex_last_thought=None,
                 scratchpad={},
             )
             asyncio.run(CortexNode(ctx)(state))

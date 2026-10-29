@@ -52,6 +52,7 @@ from minitap.mobile_use.agents.executor.types import (  # noqa: E402
 )
 from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus  # noqa: E402
 from minitap.mobile_use.agents.reporter.reporter import (  # noqa: E402
+    build_executor_report,
     determine_outcome_for,
     failure_reason_for,
 )
@@ -62,6 +63,7 @@ from minitap.mobile_use.context import (  # noqa: E402
     MobileUseContext,
 )
 from minitap.mobile_use.graph.state import State  # noqa: E402
+from minitap.mobile_use.prompt_language import PromptLanguage  # noqa: E402
 from minitap.mobile_use.sdk.budget import (  # noqa: E402
     BudgetExhaustedError,
     build_budget_report,
@@ -112,7 +114,6 @@ def _elements(n: int = 3, *, tag: str = "row") -> list[ScreenElement]:
 
 def _state(**overrides) -> State:
     base = {
-        "messages": [],
         "initial_goal": "read the wifi name",
         "subgoal_plan": [],
         "latest_ui_hierarchy": None,
@@ -120,11 +121,9 @@ def _state(**overrides) -> State:
         "latest_screen_elements": None,
         "focused_app_info": None,
         "device_date": None,
-        "structured_decisions": None,
         "complete_subgoals_by_ids": [],
         "agents_thoughts": [],
         "executor_messages": [],
-        "cortex_last_thought": None,
         "scratchpad": {},
     }
     base.update(overrides)
@@ -209,12 +208,10 @@ async def test_executor_node_writes_the_gave_up_flag(monkeypatch):
 async def test_give_up_flows_into_the_report(monkeypatch):
     """端到端一格：executor 说「做不到」⇒ 汇报的 outcome 是 ``failed``。
 
-    这是**接线**的测试：executor 节点 → reporter 节点 → 汇报。
+    这是**接线**的测试：executor 节点 → 汇报构建（``build_executor_report``）。
     中间任何一环漏了 ``executor_failed``，汇报就会变成 ``completed``
     （把「做不到」说成「做成了」—— 那是最坏的一种错）。
     """
-    from minitap.mobile_use.agents.reporter.reporter import ReporterNode
-
     async def _decide(self, *, state, goal, stall_notice: str = ""):
         return ExecutorOutput(
             actions=[],
@@ -230,9 +227,7 @@ async def test_give_up_flows_into_the_report(monkeypatch):
 
     merged = state.model_dump()
     merged.update(update)
-    report_update = await ReporterNode(ctx=_ctx())(State(**merged))
-
-    report = report_update["executor_report"]
+    report = build_executor_report(State(**merged), _ctx())
     assert report.outcome == "failed", "「做不到」不能被判成 completed"
     assert report.failure_reason == "tried 3 routes, counter stayed 0/1"
     assert "做不到" in report.summary
@@ -373,7 +368,7 @@ def test_stall_notice_tells_the_model_it_may_give_up():
         window=8,
         fingerprint="abc123",
         vision_enabled=True,
-        language="en",
+        language=PromptLanguage.EN,
     )
     assert "failed" in notice
     assert "4 times" in notice
@@ -388,8 +383,8 @@ def test_stall_notice_is_localized():
         "fingerprint": "abc123",
         "vision_enabled": True,
     }
-    en = render_stall_notice(**kwargs, language="en")
-    zh = render_stall_notice(**kwargs, language="zh")
+    en = render_stall_notice(**kwargs, language=PromptLanguage.EN)
+    zh = render_stall_notice(**kwargs, language=PromptLanguage.ZH)
 
     assert "same page" in en
     assert not any("\u4e00" <= ch <= "\u9fff" for ch in en), f"英文块里混进了中文：{en}"
@@ -404,7 +399,7 @@ def test_stall_notice_does_not_ask_for_vision_when_vision_is_off():
         window=8,
         fingerprint="tap:target",
         vision_enabled=False,
-        language="en",
+        language=PromptLanguage.EN,
     )
     assert "scan_visual_subjects" not in notice
     assert "failed" in notice

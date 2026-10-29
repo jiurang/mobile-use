@@ -1,5 +1,11 @@
 # Executor 的提示词清单。
 #
+# 目录约定：
+#   prompts/en/<file>  英文原版
+#   prompts/zh/<file>  中文版（与 en/ 完全同构，同名文件）
+# 下面的 file 一律写「不带语言」的相对路径，渲染时按当前语言拼成
+# prompts/<lang>/<file>。zh 缺某一段时只回落这一段到 en，并 warning。
+#
 # 两条车道，语义不同，不要混：
 #
 #   [[system]]  稳定指令 -> SystemMessage。整场运行逐字节稳定，才吃得到前缀缓存。
@@ -10,7 +16,7 @@
 # 约定：
 #   - system 段的文本只做 `{{var}}` 插值；条件和派生数据留在 prompt.py。
 #   - `when` 由 Python 传入的布尔值决定这一段是否参与组装。
-#   - 某个段缺 `-zh` 同名文件时，只回落这一段，不整份回落。
+#   - message 的目录名与 volatility 同名：messages/<volatility>/<name>.md。
 
 [[system]]
 name = "identity"
@@ -18,20 +24,19 @@ order = -100
 file = "system/00-identity.md"
 
 [[system]]
-name = "vision"
-order = 30
-file = "system/30-vision.md"
-when = "vision_enabled"
+name = "rules"
+order = 10
+file = "system/10-rules.md"
 
 [[system]]
 name = "tools"
-order = 40
-file = "system/40-tools.md"
+order = 30
+file = "system/30-tools.md"
 
 [[system]]
 name = "output"
-order = 50
-file = "system/50-output.md"
+order = 40
+file = "system/40-output.md"
 
 # --- 运行时消息块 ---------------------------------------------------------
 # volatility:
@@ -43,73 +48,67 @@ file = "system/50-output.md"
 
 [[message]]
 name = "task_started"
-file = "messages/task-started.md"
+file = "messages/per-task/task-started.md"
 volatility = "per-task"
 
 [[message]]
 name = "goal"
-file = "messages/goal.md"
-volatility = "per-goal"
-
-# 上一轮尝试的事实摘要。它不由 build_executor_messages 拼 —— Cortex 在「轮」
-# 的起点把它写进 executor_messages（清空局部历史之后的第一条），所以它是一轮内
-# 恒定的一块，volatility 记 per-goal。
-[[message]]
-name = "previous_attempt"
-file = "messages/previous-attempt.md"
+file = "messages/per-goal/goal.md"
 volatility = "per-goal"
 
 [[message]]
 name = "device_state"
-file = "messages/device-state.md"
+file = "messages/per-turn/device-state.md"
 volatility = "per-turn"
 
 [[message]]
 name = "screen_elements"
-file = "messages/screen-elements.md"
+file = "messages/per-turn/screen-elements.md"
 volatility = "per-turn"
 
 [[message]]
 name = "vision_subjects"
-file = "messages/vision-subjects.md"
+file = "messages/per-turn/vision-subjects.md"
 volatility = "per-turn"
 
+# occasional 的四块是同一类「反馈」，共享一个模板文件；
+# 渲染时用 `block` 选择其中一段（见 prompt.py 的 render_* 函数）。
 [[message]]
 name = "dispatch_rejection"
-file = "messages/dispatch-rejection.md"
+file = "messages/occasional/feedback.md"
 volatility = "occasional"
 
 [[message]]
 name = "retry"
-file = "messages/retry.md"
+file = "messages/occasional/feedback.md"
 volatility = "occasional"
 
 [[message]]
 name = "extra_actions"
-file = "messages/extra-actions.md"
+file = "messages/occasional/feedback.md"
 volatility = "occasional"
 
 [[message]]
 name = "stall_notice"
-file = "messages/stall-notice.md"
+file = "messages/occasional/feedback.md"
 volatility = "occasional"
 
 [[message]]
 name = "step_limit"
-file = "messages/step-limit.md"
+file = "messages/terminal/step-limit.md"
 volatility = "terminal"
 
 [[message]]
 name = "no_goal"
-file = "messages/no-goal.md"
+file = "messages/terminal/no-goal.md"
 volatility = "terminal"
 
 [[message]]
 name = "done_fallback"
-file = "messages/done-fallback.md"
+file = "messages/terminal/done-fallback.md"
 volatility = "terminal"
 
 [[message]]
 name = "failed_fallback"
-file = "messages/failed-fallback.md"
+file = "messages/terminal/failed-fallback.md"
 volatility = "terminal"

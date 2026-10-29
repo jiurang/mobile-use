@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import shutil
-import sys
 import tempfile
 import uuid
 from datetime import UTC, datetime
@@ -14,7 +13,6 @@ from typing import TypeVar, overload
 import httpx
 from adbutils import AdbClient
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
 from langgraph.errors import GraphRecursionError
 from PIL import Image
 from pydantic import BaseModel
@@ -97,35 +95,33 @@ load_dotenv()
 #    summarizer + convergence = **6** 个 super-step 才跑 **1** 个动作
 #    （实测 R=400 → 399 super-step / 66 次工具执行 = 6.05）。
 #
-# 3. **改造后**的图（Executor 自主循环；Summarizer 已于 2026-10-29 移除）：
+# 3. **改造后**的图（Executor 自主循环；Summarizer / convergence / reporter
+#    节点已于 2026-10-29 移除，汇报由 cortex 在入口用纯代码构建）：
 #    * 一个动作步 = contextor + executor + executor_tools = **3** 个
 #      super-step（工具执行完必须回 contextor 重建元素表 —— 索引契约，见
 #      `graph/graph.py` 的模块文档）；
-#    * 每个子目标另有固定开销 **9** 个：cortex 下发 1 + 收尾那轮 2
-#      （contextor + executor 报 done）+ reporter 1 + orchestrator×2
-#      + convergence×2 + cortex 验收 1；
-#    * 起跑 **3** 个：planner + orchestrator + convergence。
+#    * 每个子目标另有固定开销 **5** 个：cortex 下发 1 + 收尾那轮 2
+#      （contextor + executor 报 done）+ cortex 验收 1 + plan_manager 1；
+#    * 起跑 **2** 个：planner + plan_manager。
 #
 # ⇒ 精确模型（探针实测 S 个子目标 × 每目标 K 个动作步，**误差 0**）：
-#       super_steps = 3 + S × (3K + 9)
+#       super_steps = 2 + S × (3K + 5)
 #       executor 步数 E = S × (K + 1)
-#   ⇒ super_steps = 3 + 3E + 6S
-#   ⇒ 每个动作步最坏要 **9** 个 super-step（K=0：子目标一步没做就收尾）；
-#     典型情况（K=4~5）约 4.2~4.0 个。
+#   ⇒ super_steps = 2 + 3E + 2S
+#   ⇒ 每个动作步最坏要 **5** 个 super-step（K=0：子目标一步没做就收尾）；
+#     典型情况（K=4~5）约 3.8~3.7 个。
 #
-# ⚠️ **最坏系数仍是 9**：K=0 时每个子目标要 9 个固定 super-step，和动作步
-# 数量无关。删掉 Summarizer 只降低典型值（每动作 4→3），不降低最坏值，所以
-# `SUPER_STEPS_PER_ACTION_STEP` 保持 9：上限是天花板，不是配额。
-#
-# 系数取**最坏情况 9**：宁可多给，不能少给 —— 给少了任务会在中途撞
+# ⚠️ 系数仍取 **9**：实际最坏是 5，9 是刻意多给的余量 ——
+# K=0 时每个子目标 5 个固定 super-step，和动作步数量无关。删掉 Summarizer /
+# convergence / reporter 只降低典型值与最坏值（9→7→5），系数保持 9 仍是安全的
+# 天花板：宁可多给，不能少给 —— 给少了任务会在中途撞
 # `GraphRecursionError` 直接崩掉，已经花掉的钱和跑过的步数全白费。
-# 代价只是「跑飞的任务多烧一点」：上限是天花板，不是配额。
 
 SUPER_STEPS_PER_ACTION_STEP = 9
 
-# 固定开销：起跑 3 + 收尾 1 + 4 次 replan 的余量（planner + orchestrator +
-# convergence + cortex = 4 个/次，replan 不产生动作步但照样吃 super-step）
-# + 保险。给固定开销留够，是为了让「起跑就撞上限」这种边角情况也能跑完。
+# 固定开销：起跑 2 + 收尾 1 + 4 次 replan 的余量（planner + plan_manager +
+# cortex = 3 个/次，replan 不产生动作步但照样吃 super-step）+ 保险。
+# 给固定开销留够，是为了让「起跑就撞上限」这种边角情况也能跑完。
 FIXED_SUPER_STEPS = 32
 
 
@@ -135,18 +131,20 @@ def compute_recursion_limit(max_steps: int) -> int:
     `max_steps` 的名义语义是**动作步数**（用户填「最多跑几步」），
     `recursion_limit` 的语义是**图节点执行次数**。两者不是一回事。
 
-    公式（系数 9 是实测值，见上面那段注释）：
+    公式（系数 9 是刻意留的余量，见上面那段注释）：
 
         recursion_limit = max_steps × 9 + 32
 
     负数按 0 算（`max_steps` 没有下界校验，这里兜住）。
 
     ⚠️ **2026-10-26：名义与实际的差距要说清楚。**
-    系数 9 是**最坏情况**（每个子目标的固定开销摊到每一个动作步上）。
+    系数 9 是刻意留的余量：实际最坏是每个动作步 5 个（K=0，每个动作步都
+    自成子目标），9 比它更保守。
     真实循环里**一个动作步 ≈ 3 个 super-step**
-    （contextor + executor + executor_tools；Summarizer 已移除），
-    ⇒ 实际放行的动作步 ≈ ``(recursion_limit − 3 − 6S) / 3``，
-    也就是 N=80 时**约 230~244 个动作步**，是名义值的约 2.9~3.0 倍。
+    （contextor + executor + executor_tools；Summarizer / convergence /
+    reporter 节点已移除），
+    ⇒ 实际放行的动作步 ≈ ``(recursion_limit − 2 − 2S) / 3``，
+    也就是 N=80 时**约 243~248 个动作步**，是名义值的约 3.0~3.1 倍。
 
     真机实测（Summarizer 移除前，mobile-manager execution 880）：**186** 个
     动作步才撞上限 —— 当时每动作步 4 个 super-step，按现在的 3 个折算约 248 步。
@@ -823,7 +821,6 @@ class Agent:
                     await task.finalize(content=output, state=last_state_snapshot, error=err)
                     return None
 
-                print_ai_response_to_stderr(graph_result=last_state)
                 output = await self._extract_output(
                     task_name=task_name,
                     ctx=context,
@@ -1364,7 +1361,6 @@ class Agent:
 
     def _get_graph_state(self, task: Task):
         return State(
-            messages=[],
             initial_goal=task.request.goal,
             subgoal_plan=[],
             latest_ui_hierarchy=None,
@@ -1372,12 +1368,10 @@ class Agent:
             latest_screen_elements=None,
             focused_app_info=None,
             device_date=None,
-            structured_decisions=None,
             complete_subgoals_by_ids=[],
             agents_thoughts=[],
             remaining_steps=task.request.max_steps,
             executor_messages=[],
-            cortex_last_thought=None,
             scratchpad={},
         )
 
@@ -1507,10 +1501,3 @@ def _validate_and_prepare_file(file_path: Path):
         path_obj.touch(exist_ok=True)
     except OSError as e:
         raise AgentTaskRequestError(f"Error creating file '{file_path}': {e}")
-
-
-def print_ai_response_to_stderr(graph_result: State):
-    for msg in reversed(graph_result.messages):
-        if isinstance(msg, AIMessage):
-            print(msg.content, file=sys.stderr)
-            return

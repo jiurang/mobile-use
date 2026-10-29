@@ -35,7 +35,7 @@ thoughts 里有三类内容，性质完全不同：
 |---|---|---|---|
 | `cortex` | `Decisions reason` / `Goals completion reason` | **散文** | 压：留首句 + 末句 |
 | `executor` | 工具结果（`Tap ... was successful` 等） | **事实** | 逐字保留 |
-| `orchestrator` | `==== NEXT SUBGOAL: ... ====` 等里程碑 | **事实** | 逐字保留 |
+| `plan_manager` | `Starting / NEXT SUBGOAL: ...` 等里程碑 | **事实** | 逐字保留 |
 
 事实不能压，有两个硬理由：
 
@@ -62,26 +62,26 @@ import re
 from typing import Literal
 
 # 会被压缩的角色：只有它的内容是散文。
-# executor / orchestrator 写的是**事实**，必须逐字保留。
+# executor / plan_manager 写的是**事实**，必须逐字保留。
 COMPRESSIBLE_ROLES = frozenset({"cortex"})
 
 # 句子切分：中英文标点都算句末。
 # 保留标点本身（切完的句子仍带句号），这样拼回去读起来是完整的。
 _SENTENCE_SPLIT = re.compile(r"(?<=[。.!?；;])\s*")
 
-# 角色前缀：[cortex] / [executor] / [orchestrator] / [contextor]
+# 角色前缀：[cortex] / [executor] / [plan_manager] / [contextor]
 _ROLE_PREFIX = re.compile(r"^\[([a-z_]+)\]\s*")
 
 # 首尾句之间的连接符。用 " … " 而不是省略号，避免和原文里的省略号混淆。
 _ELLIPSIS = " … "
 
 # ---------------------------------------------------------------------------
-# 受众：规划者（cortex / orchestrator）
+# 受众：规划者（cortex / plan_manager）
 # ---------------------------------------------------------------------------
 #
 # 为什么需要「受众」这个维度
 # ------------------------
-# thoughts 是所有 agent 共用的一条流水账。cortex / orchestrator 是**规划者**：
+# thoughts 是所有 agent 共用的一条流水账。cortex / plan_manager 是**规划者**：
 # 它们不下发具体动作，只决定「下一个子目标是什么」「上一个子目标完成没有」。
 #
 # 而 executor 写进 thoughts 的绝大多数是**逐步流水**：
@@ -115,7 +115,7 @@ _ELLIPSIS = " … "
 #: 受众：**全量** —— 每条 thought 都给出去（归档口径与既有测试都靠它）。
 FULL_AUDIENCE: Literal["full"] = "full"
 
-#: 受众：规划者（cortex / orchestrator）。
+#: 受众：规划者（cortex / plan_manager）。
 PLANNER_AUDIENCE: Literal["planner"] = "planner"
 
 #: 受众的取值集合。用 ``Literal`` 而不是裸 ``str``：传错一个值（比如
@@ -138,12 +138,12 @@ _EXECUTOR_FAILURE_RE = re.compile(
 
 
 def is_planner_relevant(thought: str) -> bool:
-    """这条 thought 对规划者（cortex / orchestrator）有没有用？
+    """这条 thought 对规划者（cortex / plan_manager）有没有用？
 
     判定**只看这一条自己**（位置无关 ⇒ 缓存不击穿）。
 
     * `cortex` —— 自己的推理与决策：留。
-    * `orchestrator` —— 子目标里程碑：留。
+    * `plan_manager` —— 子目标里程碑：留。
     * `executor` —— 逐步流水：默认**丢**；失败/异常类**留**（原因只在这里）。
     * 其它角色 / 没有角色前缀 —— **留**（不知道是什么，别砍）。
     """
@@ -177,7 +177,7 @@ def split_sentences(text: str) -> list[str]:
 def compress_thought(thought: str) -> str:
     """压缩单条 thought。
 
-    - 非散文角色（executor / orchestrator / 未知）→ **原样返回**
+    - 非散文角色（executor / plan_manager / 未知）→ **原样返回**
     - 散文（cortex）→ 只留首句 + 末句
     - 只有一句 → 原样保留
     - 角色前缀**只出现一次**（正文里已有的前缀不重复加）
@@ -211,7 +211,7 @@ def render_thoughts_history(
 
     * `FULL_AUDIENCE`（默认）—— 全部保留，保持**逐条对应**：每条 thought 渲染成一行，
       归档统计的行首锚定口径（数 `[executor]` 开头行）因此不破。
-    * `PLANNER_AUDIENCE` —— 给规划者（cortex / orchestrator）：丢掉 executor
+    * `PLANNER_AUDIENCE` —— 给规划者（cortex / plan_manager）：丢掉 executor
       的**成功流水**，只留失败类。判定逐条独立 ⇒ 已发出的字节永不改变 ⇒
       前缀缓存不击穿。
 

@@ -29,17 +29,14 @@ W, H = 1220, 2712
 
 def make_state(elements: list[ScreenElement] | None = None) -> State:
     return State(
-        messages=[],
         initial_goal="g",
         subgoal_plan=[],
         latest_ui_hierarchy=None,
         latest_ocr_results=None,
         focused_app_info=None,
         device_date=None,
-        structured_decisions=None,
         complete_subgoals_by_ids=[],
         executor_messages=[],
-        cortex_last_thought=None,
         agents_thoughts=[],
         latest_screen_elements=elements,
     )

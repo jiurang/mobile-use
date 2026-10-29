@@ -29,7 +29,6 @@ from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.prompt_language import load_prompt_template, pick
 from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
-from minitap.mobile_use.utils.conversations import is_ai_message
 from minitap.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -40,7 +39,6 @@ async def outputter(
 ) -> dict[str, Any]:
     """把整条链路的思考过程压成一份结构化产出。"""
     logger.info("Starting Outputter Agent")
-    last_message = graph_output.messages[-1] if graph_output.messages else None
 
     system_message = pick(
         "You are a helpful assistant tasked with generating "
@@ -49,16 +47,13 @@ async def outputter(
         language=ctx.prompt_language,
     )
     human_message = load_prompt_template(
-        Path(__file__).parent.joinpath("human.md"),
+        Path(__file__).parent.joinpath("prompts", "en", "human.md"),
         ctx.prompt_language,
     ).render(
         initial_goal=graph_output.initial_goal,
         agents_thoughts=graph_output.agents_thoughts,
         structured_output=output_config.structured_output,
         output_description=output_config.output_description,
-        last_ai_message=last_message.content
-        if last_message and is_ai_message(message=last_message)
-        else None,
     )
 
     messages: list[BaseMessage] = [

@@ -17,9 +17,12 @@ Executor 自主执行之后，感知和动作全下沉给了 Executor（它自�
 不丢 —— 汇报里的 summary / 结束原因 / 失败目标会压成一条摘要，作为新一轮局部
 历史的第一条。
 
-汇报是给 Cortex 的一次性输入，消费掉就清空。
+汇报是给 Cortex 的一次性输入。Reporter 已不是图节点：Executor 结束一次尝试
+（``executor_done=True``）之后图直接回到这里，本节点入口先用
+``agents/reporter/reporter.py`` 的 ``build_executor_report`` 把汇报构建出来，
+消费完把 ``executor_done`` 清成 False。
 
-完成判定留给 Orchestrator 验收。Cortex 只提名，不标 SUCCESS。
+完成判定留给 PlanManager 落状态。Cortex 只提名，不标 SUCCESS。
 
 失败路径不一定问你。失败之后的「换招」是规则，有次数上限
 （``RULE_RETRY_BUDGET``），用完一定回到你。规则的质量不如模型，所以「放弃」
@@ -34,7 +37,6 @@ from typing import Any, Literal, NamedTuple
 
 from jinja2 import Template
 from langchain_core.messages import (
-    AnyMessage,
     BaseMessage,
     HumanMessage,
     RemoveMessage,
@@ -49,7 +51,6 @@ from minitap.mobile_use.agents.cortex.issue_log import (
     count_rule_retries,
 )
 from minitap.mobile_use.agents.cortex.types import CortexOutput
-from minitap.mobile_use.agents.executor.prompt import render_previous_attempt
 from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.agents.planner.utils import (
@@ -57,6 +58,7 @@ from minitap.mobile_use.agents.planner.utils import (
     get_current_subgoal,
     render_subgoal_status,
 )
+from minitap.mobile_use.agents.reporter.reporter import build_executor_report
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
@@ -77,7 +79,7 @@ logger = get_logger(__name__)
 
 CORTEX_PROMPT_ENV = "MOBILE_USE_CORTEX_PROMPT"
 
-CORTEX_PROMPT_PATH = Path(__file__).parent / "cortex.md"
+CORTEX_PROMPT_PATH = Path(__file__).parent / "prompts" / "en" / "cortex.md"
 
 # 模型偶尔会用这些占位串表示“没有内容”，统一当作 None 处理。
 EMPTY_STRING_TOKENS = frozenset({"{}", "[]", "null", "None", ""})
@@ -99,15 +101,14 @@ def load_cortex_template(
 
     两套切换机制，优先级是「环境变量高于语言开关」。
 
-    ``MOBILE_USE_CORTEX_PROMPT`` 可以指向另一个 .md（例如同目录的
-    cortex.zh.md），用来做中英文提示词的 A/B 实测：同一份 context 分别渲染两种
-    语言，再各自真跑一遍，比较 token 与成功率。显式指定了路径就以它为准，
-    那是「我要精确用这个文件」的意思；指针写错不该让整条任务挂掉，所以只
-    warning 并回落到默认模板。
+    ``MOBILE_USE_CORTEX_PROMPT`` 可以指向另一个 .md（例如 ``prompts/zh/cortex.md``），
+    用来做中英文提示词的 A/B 实测：同一份 context 分别渲染两种语言，再各自真跑
+    一遍，比较 token 与成功率。显式指定了路径就以它为准，那是「我要精确用这个
+    文件」的意思；指针写错不该让整条任务挂掉，所以只 warning 并回落到默认模板。
 
-    没设这个变量时按 ``language`` 取：``en`` 取 ``cortex.md``，``zh`` 取
-    ``cortex.zh.md``（没有则回落英文加 warning）。两个开关都不设时读的仍是同目录
-    的 cortex.md，行为与从前逐字节一致，对生产是 no-op。
+    没设这个变量时按 ``language`` 找同构的 ``prompts/<lang>/cortex.md``
+    （zh 缺失则回落英文加 warning）。两个开关都不设时读的仍是
+    ``prompts/en/cortex.md``，行为与从前逐字节一致，对生产是 no-op。
 
     缓存键是（语言，覆盖路径），不是模板正文。正文有 7KB，拿它当键每轮都要哈希
     一遍；覆盖路径必须进键，否则「换个环境变量换份提示词」就不生效了。
@@ -202,7 +203,7 @@ class CortexDecision(NamedTuple):
     ``action`` 三选一：
 
     * ``issue`` —— 下发目标（首次下发，或失败后换招重发）。
-    * ``complete`` —— 上一个子目标达成了（提名给 Orchestrator 验收）。
+    * ``complete`` —— 上一个子目标达成了（提名给 PlanManager 落 SUCCESS）。
     * ``give_up`` —— 换招也没招了：这个子目标本身走不通（标记失败）。
     """
 
@@ -228,7 +229,7 @@ def decide_next_step(
     * 有汇报、没判完成、给了 ``next_subgoal``，动作是 issue，也就是换招重发：
       换个思路达成同一个子目标。
     * 有汇报、没判完成、没给 ``next_subgoal``，动作是 give_up。模型认为换招也
-      没招了，于是标记该子目标失败，让 Orchestrator 重新看计划。这一条是「不能
+      没招了，于是标记该子目标失败，让 PlanManager 判失败并 replan。这一条是「不能
       无限重发」的兜底。
     * 没有汇报，动作是 issue，第一次进 Cortex，下发第一个子目标。
     """
@@ -270,9 +271,9 @@ def decide_next_step(
 # 完全能表达这件事（别重复上次的动作、换个入口、换个顺序、拆成更小的一步），
 # 而 LLM 在这里要花 3~5 秒加 1,000+ token，产出的大体是同一句话。
 #
-# 真机 A/B 实测：每个子目标固定 4 次 LLM 调用（cortex 2 + reporter 1 +
-# orchestrator 1），而子目标内常常只有 1~2 步，失败路径上那次 cortex 调用是纯
-# 开销。
+# 真机 A/B 实测：每个子目标固定 2 次 LLM 调用（cortex 下发 1 + 验收 1；
+# plan_manager 与汇报构建都是纯代码，0 次），而子目标内常常只有 1~2 步，失败
+# 路径上那次 cortex 调用是纯开销。
 #
 # 规则换招的质量肯定不如 LLM 生成的，所以它有明确的次数上限：用完
 # ``RULE_RETRY_BUDGET`` 次之后一律退回 LLM（LLM 还能判「放弃」）。绝不能变成
@@ -282,8 +283,8 @@ def decide_next_step(
 # 每个子目标允许用几次「规则换招」。用完就退回 LLM 换招。
 RULE_RETRY_BUDGET = 1
 
-# 「下发目标」这条 thought 的格式与计数原语放在 `issue_log`，因为 reporter 也要
-# 读它（数「这个子目标被重发过几次」，上报 retry_count），放在这里会让 reporter
+# 「下发目标」这条 thought 的格式与计数原语放在 `issue_log`，因为汇报构建也要
+# 读它（数「这个子目标被重发过几次」，上报 retry_count），放在这里会让汇报
 # 反向依赖整个 cortex 节点模块。
 #
 # 下面三个名字继续从本模块导出：既有调用点（L3 的规则换招、测试）都从
@@ -394,6 +395,16 @@ class CortexNode:
             self.ctx.execution_setup.get_locked_app_package() if self.ctx.execution_setup else None
         )
 
+        # Executor 刚结束一次尝试（done=True）→ 先用代码把这次尝试的汇报做出来。
+        #
+        # 汇报的唯一消费者就是本节点，所以它不再是图节点（2026-10-29 合并进
+        # cortex）。构建是纯代码：结论由代码判、事实逐字直搬、证据从执行日志和
+        # 当屏元素表里取，不调 LLM。
+        #
+        # ``executor_done`` 就是「有一份没被消费的汇报」这个信号：本节点在所有
+        # 出口都把它清掉（见下面的 update）。
+        report = build_executor_report(state, self.ctx) if state.executor_done else None
+
         executor_tools = executor_wrappers(self.ctx)
 
         # system prompt 整段静态：不再接 initial_goal、计划、汇报这类每轮变化的
@@ -452,7 +463,7 @@ class CortexNode:
         #
         # 压缩只压发给 LLM 的这份，state 里的原文不动（trace、TUI、steps_count、
         # outputter 都要全量）。压的是 cortex 的散文，executor 工具结果和
-        # orchestrator 里程碑是事实，逐字保留。
+        # plan_manager 里程碑是事实，逐字保留。
         #
         # 关键在压缩是位置无关的：每条按同一条规则渲染，已经发出去的字节永不改变，
         # 追加语义因此保留，前缀缓存不因压缩而击穿。见 utils/thoughts_compaction.py。
@@ -530,7 +541,7 @@ class CortexNode:
         # Executor 的汇报：每子目标变一次，必须排在 thoughts 之后（它是「每轮变」
         # 的那一档）。汇报不进 agents_thoughts 的散文通道，那是 Cortex 自己的
         # 推理历史；Executor 的报告是外部事实，走独立的消息块。
-        messages.append(HumanMessage(content=render_executor_report(state.executor_report)))
+        messages.append(HumanMessage(content=render_executor_report(report)))
 
         # 跨子目标的失败事实：只增不减，所以排在最后也不影响前缀稳定性。
         messages.append(
@@ -540,7 +551,6 @@ class CortexNode:
             )
         )
 
-        report = state.executor_report
         current_subgoal = get_current_subgoal(state.subgoal_plan)
         subgoal_id = current_subgoal.id if current_subgoal else "(none)"
 
@@ -665,10 +675,10 @@ class CortexNode:
             # latest_ui_hierarchy 没有索引契约，清掉保持工具侧现取
             # （contextor 建完元素表后也清；这里再清一次是兜底）。
             "latest_ui_hierarchy": None,
-            # 汇报是给 Cortex 的一次性输入，消费掉就清空。留着的话下一次进 Cortex
-            # 会把同一份汇报当成新证据再判一次，最坏的情况是把一个已经验收过的
-            # 子目标再提名一次，计划就凭空跳过了一步。
-            "executor_report": None,
+            # 汇报是给 Cortex 的一次性输入，消费掉就清空。留着 True 的话，
+            # PlanManager 启动下一个子目标之后再进本节点，会把**上一轮**的执行
+            # 日志重新汇报一遍，最坏的情况是把一个已经验收过的子目标再提名一次。
+            "executor_done": False,
         }
         agent_thoughts: list[str] = []
 
@@ -681,16 +691,10 @@ class CortexNode:
             # 就按步数线性增长（真机归档 880：末轮 461 条消息、6 万字符、占整个
             # executor prompt 的 54%）。
             #
-            # 清空会丢「上一轮试过什么」。旧实现无条件清正是栽在这里：同一子目标
-            # 换招重发时执行器忘了自己试过什么，在原地打转（真机序列
-            # `(2, completed) → (13, blocked) → (1, completed)`）。所以现在把上一轮
-            # 汇报压成一条事实摘要（summary / 结束原因 / 失败目标），作为新一轮局部
-            # 历史的第一条 —— 消息从零开始，事实照旧带过来，长度不随步数增长。
-            reset_messages: list[AnyMessage] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
-            if report is not None:
-                digest = render_previous_attempt(report, language=self.ctx.prompt_language)
-                if digest:
-                    reset_messages.append(HumanMessage(content=digest))
+            # 每轮从零开始：只清空，不把上一轮的任何内容带进来。
+            # RemoveMessage 是 add_messages 的控制消息，不在 AnyMessage 联合里，
+            # 所以这里用更宽的 BaseMessage，而不是 list[AnyMessage]。
+            reset_messages: list[BaseMessage] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
             update[EXECUTOR_MESSAGES_KEY] = reset_messages
             update["executor_steps"] = 0
             # 上一次的「做不到」标记要清掉，它是本轮内的信号，新一轮开始之后
@@ -699,16 +703,16 @@ class CortexNode:
             # 进展指纹是「本轮内」的，新的一轮就重新开始数
             # （和 `executor_messages` 同一个生命周期）。
             update["executor_progress"] = []
-            # 没判完成就不该有提名：上一次尝试的提名（如果还没被 Orchestrator 消费）
-            # 在这里作废，否则 Orchestrator 会验收一个 Cortex 没判完成的子目标。
+            # 没判完成就不该有提名：上一次尝试的提名（如果还没被 PlanManager 消费）
+            # 在这里作废，否则 PlanManager 会验收一个 Cortex 没判完成的子目标。
             update["complete_subgoals_by_ids"] = []
             agent_thoughts.append(
                 f"Issued goal for subgoal {subgoal_id}: {decision.goal}"
                 + (f" ({decision.reason})" if decision.reason else "")
             )
         elif decision.action == "complete":
-            # 提名给 Orchestrator 验收：真正把子目标标成 SUCCESS 的是它
-            # （`orchestrator.py`），Cortex 只说「我判定它完成了」。
+            # 提名给 PlanManager 验收：真正把子目标标成 SUCCESS 的是它
+            # （`plan_manager.py`），Cortex 只说「我判定它完成了」。
             update["complete_subgoals_by_ids"] = [subgoal_id] if current_subgoal else []
             agent_thoughts.append(
                 f"Subgoal {subgoal_id} judged COMPLETE"
@@ -716,7 +720,7 @@ class CortexNode:
             )
         else:
             # 换招也没招了：这个子目标本身走不通，标记失败。这一步是「计划走不通」
-            # 唯一的处理者：标记成 FAILURE 之后 convergence 会判
+            # 唯一的处理者：标记成 FAILURE 之后 plan_manager_gate 会判
             # one_of_them_is_failure，于是 replan。
             if current_subgoal is not None:
                 update["subgoal_plan"] = fail_current_subgoal(state.subgoal_plan)

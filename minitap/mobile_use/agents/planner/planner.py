@@ -168,13 +168,13 @@ class PlannerNode:
         # 重规划触发计数。
         #
         # 这个埋点唯一的用途是验证看门狗还活着：计划级的失败不能没人管，新
-        # 拓扑里的处理链是 reporter、orchestrator、convergence、replan、planner，
+        # 拓扑里的处理链是 cortex（构建汇报并判断）、plan_manager、replan、planner，
         # 每一次真正走到 replan，就证明这条链通了。反过来，跑了很久却一次
         # replan 都没有，只有两种可能：一次没失败过（正常），或者看门狗断了
         # （子目标失败了没人接手，Cortex 一直重发到撞 recursion_limit）。这两种
         # 光看别的指标分不开。
         #
-        # 埋在这里而不是 `convergence_gate`：那个是纯函数，拿不到 task_id；
+        # 埋在这里而不是 `plan_manager_gate`：那个是纯函数，拿不到 task_id；
         # 而 planner 正好算得出 `needs_replan`。
         #
         # 只报数量，不报子目标原文，原文是用户数据。

@@ -26,11 +26,15 @@
 的地方，拦下来只会让整轮任务挂掉，而「以为在跑中文、其实跑的是英文」
 这件事必须**说出来**，否则 A/B 的结论是错的。
 
-**文件名约定**
+**目录约定**
 --------------
-中文版 = 英文文件名 + 后缀 ``-zh``（``contextor.md`` → ``contextor-zh.md``）。
-历史上 ``cortex.zh.md`` 用的是点号，所以两种后缀都认（见 :data:`ZH_SUFFIXES`）——
-不认的话，那个文件会因为「找不到中文版」被静默回落成英文。
+提示词按语言分目录，两棵树完全同构、相对路径相同::
+
+    <agent>/prompts/en/system/00-identity.md
+    <agent>/prompts/zh/system/00-identity.md
+
+英文是基准文件，中文版住在平行的 ``zh/`` 目录里。加载器把路径中的 ``en``
+目录段换成 ``zh`` 去找中文版，文件名本身不再带语言后缀。
 """
 
 from __future__ import annotations
@@ -68,12 +72,6 @@ DEFAULT_PROMPT_LANGUAGE: PromptLanguage = PromptLanguage.EN
 
 #: 环境变量名。不改代码就能切语言（真机 A/B 用）。
 PROMPT_LANGUAGE_ENV = "MOBILE_USE_PROMPT_LANGUAGE"
-
-#: 中文版文件名的后缀候选，按优先级排。
-#:
-#: * ``-zh`` —— **现行约定**（``00-identity-zh.md``、本次新增的一批）。
-#: * ``.zh`` —— 历史遗留（``cortex.zh.md``）。不认它，那个文件会被静默回落成英文。
-ZH_SUFFIXES: tuple[str, ...] = ("-zh", ".zh")
 
 #: 各种写法的归一化表。用户写 ``zh-CN`` / ``Chinese`` / ``中文`` 都认。
 _LANGUAGE_ALIASES: dict[str, PromptLanguage] = {
@@ -154,12 +152,24 @@ def resolve_prompt_language(
     return DEFAULT_PROMPT_LANGUAGE
 
 
+def _language_variant(base_path: Path, language: PromptLanguage) -> Path | None:
+    """把 ``en`` 目录段换成目标语言；路径里没有 ``en`` 目录时返回 None。
+
+    只认**目录**，不碰文件名 —— ``en`` 出现在文件名里不算数。
+    """
+    parts = base_path.parts
+    for index in range(len(parts) - 2, 0, -1):
+        if parts[index] == PromptLanguage.EN.value:
+            # ``str`` 兜住「直接传 "zh" 字符串」的调用方：StrEnum 的 __str__ 就是值。
+            return Path(*parts[:index], str(language), *parts[index + 1:])
+    return None
+
+
 def resolve_prompt_path(base_path: Path, language: PromptLanguage) -> Path:
     """找到这个提示词在指定语言下对应的文件。
 
-    * ``en`` → 原文件。
-    * ``zh`` → 先试 ``<stem>-zh.md``，再试 ``<stem>.zh.md``（历史命名），
-      都没有就**回落英文并 warning**。
+    * ``en`` → 原文件（``base_path`` 必须指向 ``prompts/en/`` 下的那一份）。
+    * ``zh`` → 同构的 ``prompts/zh/`` 下的同名文件，缺了就**回落英文并 warning**。
 
     回落必须**出声**：「以为在跑中文、其实跑的是英文」会直接把 A/B 结论带歪，
     而这种错误在输出里完全看不出来。
@@ -167,15 +177,13 @@ def resolve_prompt_path(base_path: Path, language: PromptLanguage) -> Path:
     if language == PromptLanguage.EN:
         return base_path
 
-    for suffix in ZH_SUFFIXES:
-        candidate = base_path.with_name(f"{base_path.stem}{suffix}{base_path.suffix}")
-        if candidate.is_file():
-            return candidate
+    candidate = _language_variant(base_path, language)
+    if candidate is not None and candidate.is_file():
+        return candidate
 
-    tried = ", ".join(repr(f"{base_path.stem}{s}{base_path.suffix}") for s in ZH_SUFFIXES)
     logger.warning(
-        f"[prompt-language] 语言=zh 但 {base_path.name!r} 没有中文版"
-        f"（试过 {tried}），回落英文 {base_path.name!r}"
+        f"[prompt-language] 语言={language} 但 {base_path.name!r} 没有中文版"
+        f"（找不到 {candidate}），回落英文 {base_path.name!r}"
     )
     return base_path
 

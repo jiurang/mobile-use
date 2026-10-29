@@ -10,11 +10,6 @@
 {% endfor %}
 {% endif %}
 
-{% if last_ai_message %}
-整条执行链最后生成的一条消息是：
-"{{ last_ai_message }}"
-{% endif %}
-
 {% if not structured_output %}
 请根据下面的说明生成一个结构良好的 JSON 对象：
 

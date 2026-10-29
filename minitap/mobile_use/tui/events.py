@@ -41,17 +41,15 @@ from minitap.mobile_use.utils.llm_usage import extract_usage
 #
 # ⚠️ 这是一份**硬编码白名单**：`on_chain_start` 里 `node not in AGENT_LABELS`
 # 就直接 return，所以名单里没有的节点在 TUI 里**完全不出现**（静默消失，
-# 不是报错）。Executor 自主执行架构（2026-10-21）新增的 `reporter` 节点
-# 必须登记在这里，否则用户看不到「这一轮汇报了」。
+# 不是报错）。图中的节点必须都登记在这里，否则用户看不到那一步。
+# （`reporter` 已于 2026-10-29 合并进 cortex，不再是图节点。）
 AGENT_LABELS: dict[str, str] = {
     "planner": "planner",
-    "orchestrator": "orchestrator",
+    "plan_manager": "plan_manager",
     "contextor": "contextor",
     "cortex": "cortex",
     "executor": "executor",
     "executor_tools": "executor_tools",
-    # 汇报节点：把 executor 的执行日志压成结论，用户要能一眼看出「这一轮汇报了」
-    "reporter": "reporter",
 }
 
 # Nodes that actually drive the device; worth highlighting in the timeline.

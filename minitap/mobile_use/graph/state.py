@@ -4,7 +4,6 @@ from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.graph import add_messages
 from pydantic import BaseModel
 
-from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
 from minitap.mobile_use.context import MobileUseContext
@@ -28,13 +27,12 @@ def merge_dicts(a, b):
 
 
 class State(BaseModel):
-    messages: Annotated[list[AnyMessage], "Sequential messages", add_messages]
     remaining_steps: Annotated[int | None, "Remaining steps before the task is completed"] = None
 
     # planner related keys
     initial_goal: Annotated[str, "Initial goal given by the user"]
 
-    # orchestrator related keys
+    # plan_manager related keys
     subgoal_plan: Annotated[list[Subgoal], "The current plan, made of subgoals"]
 
     # planner related keys（计划日志）
@@ -118,11 +116,6 @@ class State(BaseModel):
     ] = []
 
     # cortex related keys
-    structured_decisions: Annotated[
-        str | None,
-        "Structured decisions made by the cortex, for the executor to follow",
-        take_last,
-    ]
     complete_subgoals_by_ids: Annotated[
         list[str],
         "List of subgoal IDs to complete",
@@ -131,7 +124,6 @@ class State(BaseModel):
 
     # executor related keys
     executor_messages: Annotated[list[AnyMessage], "Sequential Executor messages", add_messages]
-    cortex_last_thought: Annotated[str | None, "Last thought of the cortex for the executor"]
 
     # 🔴 **2026-10-27 移除：`executor_screenshot` 字段。**
     #
@@ -156,11 +148,13 @@ class State(BaseModel):
         "The goal statement for the current subgoal, issued by Cortex",
     ] = None
 
-    # Executor 本轮认为目标已达成。Executor 节点写，graph 的条件边读：
-    # True → 走 Reporter 收尾；False → 走 executor_tools 执行动作。
+    # Executor 本轮认为目标已达成。Executor 节点写，graph 的条件边读；
+    # True 同时是「有一份没被 Cortex 消费的汇报」这个信号 —— Cortex 在入口
+    # 构建汇报，并在所有出口把它清成 False（2026-10-29 reporter 合并进 cortex）。
     executor_done: Annotated[
         bool,
-        "Whether the executor believes the current subgoal is achieved",
+        "Whether the executor believes the current subgoal is achieved "
+        "(also means: an unconsumed attempt report is waiting for Cortex)",
     ] = False
 
     # 本子目标已执行的步数（熔断用）。Executor 节点每轮 +1。
@@ -172,7 +166,7 @@ class State(BaseModel):
     # Executor **明确放弃**了当前子目标（模型自己说「做不到」）。
     #
     # 为什么要有这个字段：`executor_done` 只有一个含义 ——「别再动了，收尾」，
-    # 它**不区分**「做成了」和「做不到」。而 Reporter 的 outcome 是**代码判定**的
+    # 它**不区分**「做成了」和「做不到」。而汇报的 outcome 是**代码判定**的
     # （`agents/executor/types.py::determine_outcome`），`done=True` 一律映射成
     # ``completed`` ⇒ 「做不到」这个状态在契约里**不可表达**。
     #
@@ -207,7 +201,7 @@ class State(BaseModel):
     # 「整个任务跑了多少步」，读到的永远是 0~12 这种小数字。
     #
     # 为什么不能退回 `len(agents_thoughts)`：改造后 **Contextor 每个动作步写 1 条
-    # thought**（`agents/contextor/contextor.py:191`），Cortex / Orchestrator 每个子目标
+    # thought**（`agents/contextor/contextor.py:191`），Cortex / PlanManager 每个子目标
     # 再各写几条 —— thoughts 的**条数**是「感知 + 监督的次数」，和「跑了多少个动作步」
     # 根本不是一个东西（方案 §11.5 M13）。thoughts 仍然是「推理过程」的载体，
     # 口径不能混用。
@@ -253,12 +247,6 @@ class State(BaseModel):
         ActionFailureFact | None,
         "Failure fact of the last action (None when it succeeded); consumed by the Contextor",
         take_last,
-    ] = None
-
-    # Reporter 的产出（Reporter → Cortex / Orchestrator）。
-    executor_report: Annotated[
-        ExecutorReport | None,
-        "The report of the last subgoal attempt",
     ] = None
 
     # common keys

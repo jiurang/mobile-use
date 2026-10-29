@@ -234,16 +234,15 @@ def test_vision_bounds_bypass_the_iou_gate():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("suffix", ["", "-zh"])
-def test_prompts_teach_the_vision_index_contract(suffix):
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_prompts_teach_the_vision_index_contract(language):
     """提示词里必须教 `vision_index`，并且不再有旧的定位失败回灌宏。"""
-    system = (_PROMPTS / f"prompts/system/30-vision{suffix}.md").read_text(encoding="utf-8")
-    message = (_PROMPTS / f"prompts/messages/vision-subjects{suffix}.md").read_text(
-        encoding="utf-8"
-    )
-    assert "vision_index" in system
+    message = (
+        _PROMPTS / f"prompts/{language}/messages/per-turn/vision-subjects.md"
+    ).read_text(encoding="utf-8")
+    assert "vision_index" in message
     assert "{{ rows }}" in message
-    assert "vision_failure_message" not in system + message
+    assert "vision_failure_message" not in message
 
 
 def _wrappers_ctx(vision_enabled: bool) -> SimpleNamespace:

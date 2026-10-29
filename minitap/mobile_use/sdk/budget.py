@@ -84,7 +84,6 @@ def build_budget_report(
     current_goal = getattr(state, "executor_goal", None) or ""
     executor_steps = int(getattr(state, "executor_steps", 0) or 0)
     total_steps = int(getattr(state, "total_steps", 0) or 0)
-    report = getattr(state, "executor_report", None)
 
     done = [s for s in plan if s.status == SubgoalStatus.SUCCESS]
     pending = [s for s in plan if s.status != SubgoalStatus.SUCCESS]
@@ -119,21 +118,15 @@ def build_budget_report(
             f"停在的子目标（已跑 {executor_steps} 步）：{current_goal}"
         )
 
-    if report is not None and getattr(report, "summary", None):
-        lines.append("")
-        lines.append(f"最后一次汇报：{report.summary}")
-        if getattr(report, "failure_reason", None):
-            lines.append(f"（执行器说做不到：{report.failure_reason}）")
-
     lines.append("")
     lines.append(
         "这是**预算**用完，不是任务本身做不到 —— "
         "如果这个任务确实需要更多步，把任务配置里的「最大步数」调大再跑一次。"
     )
-    report = "\n".join(lines)
-    if len(report) > MAX_REPORT_CHARS:
-        report = report[: MAX_REPORT_CHARS - 30] + "\n…（报告过长，已截断）"
-    return report
+    output = "\n".join(lines)
+    if len(output) > MAX_REPORT_CHARS:
+        output = output[: MAX_REPORT_CHARS - 30] + "\n…（报告过长，已截断）"
+    return output
 
 
 __all__ = [

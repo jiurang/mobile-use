@@ -1,5 +1,3 @@
-## ui和ocr感知
-
 屏幕元素，每行一条：[i] "text" | id=<id 尾段> | Class | (x,y,WxH) | flags
 flags：C=可点击 L=可长按 F=可聚焦 K=复选框 S=已选 R=可滚动
 `[i]` 是 1-based，原样填进 `target` 的 `index` 字段。

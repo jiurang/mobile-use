@@ -463,8 +463,9 @@ def test_invalid_tool_call_count_is_in_the_operator_facing_detail():
 #
 # ⇒ 元凶是**名字**（不是描述 —— 加不加 docstring 测不出差别）。
 #
-# 生产的 7 个 schema 现在都不带下划线 ⇒ 这条是**哨兵**：以后谁加一个
+# 生产的 5 个 schema 现在都不带下划线 ⇒ 这条是**哨兵**：以后谁加一个
 # ``class _FooOutput``，这里立刻红。
+# （reporter 的 ``ReporterSummary`` 已随节点移除：汇报是纯代码，不再有 LLM 输出。）
 
 
 def _production_structured_output_schemas() -> list[tuple[str, type]]:
@@ -472,16 +473,12 @@ def _production_structured_output_schemas() -> list[tuple[str, type]]:
     from minitap.mobile_use.agents.cortex.types import CortexOutput
     from minitap.mobile_use.agents.executor.types import ExecutorOutput
     from minitap.mobile_use.agents.hopper.hopper import HopperOutput
-    from minitap.mobile_use.agents.orchestrator.types import OrchestratorOutput
     from minitap.mobile_use.agents.planner.types import PlannerOutput
-    from minitap.mobile_use.agents.reporter.reporter import ReporterSummary
 
     return [
         ("planner", PlannerOutput),
-        ("orchestrator", OrchestratorOutput),
         ("cortex", CortexOutput),
         ("executor", ExecutorOutput),
-        ("reporter", ReporterSummary),
         ("contextor", ContextorOutput),
         ("hopper", HopperOutput),
     ]
@@ -766,8 +763,7 @@ def test_executor_prompt_does_not_promise_empty_actions_is_valid():
 
     text = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(EXECUTOR_PROMPTS_DIR.rglob("*.md"))
-        if not path.stem.endswith("-zh")
+        for path in sorted((EXECUTOR_PROMPTS_DIR / "en").rglob("*.md"))
     )
     assert "An empty `actions` is a valid answer" not in text
     assert "required unless `done`/`failed`, empty when done or failed" in text
@@ -782,7 +778,6 @@ def test_executor_prompt_says_executor_output_is_the_only_tool():
 
     text = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(EXECUTOR_PROMPTS_DIR.rglob("*.md"))
-        if not path.stem.endswith("-zh")
+        for path in sorted((EXECUTOR_PROMPTS_DIR / "en").rglob("*.md"))
     )
     assert "only by calling `ExecutorOutput`" in text

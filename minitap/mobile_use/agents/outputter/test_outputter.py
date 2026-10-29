@@ -40,10 +40,9 @@ mock_dict = {
 
 
 class DummyState:
-    """State 的最小替身：outputter 只读这三个字段。"""
+    """State 的最小替身：outputter 只读这两个字段。"""
 
-    def __init__(self, messages, initial_goal, agents_thoughts) -> None:
-        self.messages = messages
+    def __init__(self, initial_goal, agents_thoughts) -> None:
         self.initial_goal = initial_goal
         self.agents_thoughts = agents_thoughts
 
@@ -63,7 +62,7 @@ def mock_context() -> Mock:
         "orchestrator": LLM(provider="openai", model="gpt-5-nano"),
     }
     ctx.device = Mock()
-    # 提示词语言：outputter 要按它挑 human.md（human.md / human-zh.md）。
+    # 提示词语言：outputter 要按它挑 prompts/<lang>/human.md。
     # 同样是 pydantic 字段，Mock(spec=...) 不会自动生成，得显式给。
     ctx.prompt_language = PromptLanguage.EN
     return ctx
@@ -73,7 +72,6 @@ def mock_context() -> Mock:
 def mock_state() -> DummyState:
     """Create a mock state with test data."""
     return DummyState(
-        messages=[],
         initial_goal="Find a green product on my website",
         agents_thoughts=[
             "Going on http://superwebsite.fr",

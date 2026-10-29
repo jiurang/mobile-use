@@ -26,7 +26,7 @@ _AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
 _EXECUTOR_DIR = _AGENTS_DIR / "executor"
 _EXECUTOR_PROMPTS = _EXECUTOR_DIR / "prompts"
 _EXECUTOR_MANIFEST = _EXECUTOR_DIR / "prompt_manifest.toml"
-_REPORTER_MD = _AGENTS_DIR / "reporter" / "reporter.md"
+_REPORTER_MD = _AGENTS_DIR / "reporter" / "prompts" / "en" / "reporter.md"
 
 
 def _load() -> ModuleType:
@@ -49,10 +49,8 @@ def _manifest() -> dict:
 
 
 def _prompt_files(*, zh: bool = False) -> list[Path]:
-    """Executor 的提示词文件：英文原版，或全部中文兄弟文件。"""
-    return [
-        path for path in sorted(_EXECUTOR_PROMPTS.rglob("*.md")) if path.stem.endswith("-zh") == zh
-    ]
+    """Executor 的提示词文件：``prompts/en/`` 或 ``prompts/zh/`` 整棵树。"""
+    return sorted((_EXECUTOR_PROMPTS / ("zh" if zh else "en")).rglob("*.md"))
 
 
 def _prompt_text(*, zh: bool = False) -> str:
@@ -60,9 +58,9 @@ def _prompt_text(*, zh: bool = False) -> str:
 
 
 def _prompt_file(rel: str, *, zh: bool = False) -> str:
-    """按相对路径取一个段，例如 ``system/40-tools``。"""
-    suffix = "-zh" if zh else ""
-    return (_EXECUTOR_PROMPTS / f"{rel}{suffix}.md").read_text(encoding="utf-8")
+    """按语言目录取的相对路径取一个段，例如 ``system/30-tools``。"""
+    language = "zh" if zh else "en"
+    return (_EXECUTOR_PROMPTS / language / f"{rel}.md").read_text(encoding="utf-8")
 
 
 def test_prompt_templates_render():
@@ -87,18 +85,13 @@ def test_executor_manifest_is_the_single_source_of_order():
     sections = _manifest()["system"]
     assert [s["name"] for s in sections] == [
         "identity",
-        "vision",
+        "rules",
         "tools",
         "output",
     ]
-    assert [s["order"] for s in sections] == [-100, 30, 40, 50]
-    # 只有视觉段是条件段：开关由 Python 给，模板里不写 {% if %}。
-    assert [s.get("when") for s in sections] == [
-        None,
-        "vision_enabled",
-        None,
-        None,
-    ]
+    assert [s["order"] for s in sections] == [-100, 10, 30, 40]
+    # 当前没有条件段：模板里不写 {% if %}。
+    assert [s.get("when") for s in sections] == [None, None, None, None]
 
 
 def test_executor_system_sections_are_pure_interpolation():
@@ -125,7 +118,6 @@ def test_executor_manifest_owns_every_message_block():
     assert [m["name"] for m in messages] == [
         "task_started",
         "goal",
-        "previous_attempt",
         "device_state",
         "screen_elements",
         "vision_subjects",
@@ -141,9 +133,11 @@ def test_executor_manifest_owns_every_message_block():
     allowed = {"per-task", "per-goal", "per-turn", "occasional", "terminal"}
     for row in messages:
         path = Path(row["file"])
-        for suffix in ("", "-zh"):
-            variant = _EXECUTOR_PROMPTS / path.with_name(f"{path.stem}{suffix}{path.suffix}")
+        for language in ("en", "zh"):
+            variant = _EXECUTOR_PROMPTS / language / path
             assert variant.is_file(), f"缺少消息块模板：{variant}"
+        # 目录名就是 volatility，两份契约必须一致：messages/<volatility>/<name>.md
+        assert path.parts[:2] == ("messages", row["volatility"]), f"{path} 不在它声明的目录里"
         assert row["volatility"] in allowed
 
 
@@ -156,28 +150,12 @@ def test_executor_prompt_renders_without_leftover_placeholders():
         {
             "platform": "android",
             "executor_tools_table": "| `tap` | `target` | Tap |",
-            "vision_enabled": True,
         },
         language=PromptLanguage.EN,
     )
     assert "{{" not in rendered and "{%" not in rendered
     assert "You are the **Executor**" in rendered
     assert "## Tools" in rendered
-
-
-def test_executor_vision_section_follows_the_switch():
-    """视觉段只在开关打开时组装；关掉时其余 system 段原样保留。"""
-    from minitap.mobile_use.agents.executor.prompt import render_system
-    from minitap.mobile_use.prompt_language import PromptLanguage
-
-    values = {"platform": "android", "executor_tools_table": "| `tap` | `target` | Tap |"}
-    with_vision = render_system({**values, "vision_enabled": True}, language=PromptLanguage.EN)
-    without_vision = render_system({**values, "vision_enabled": False}, language=PromptLanguage.EN)
-
-    assert "## Visual perception" in with_vision
-    assert "scan_visual_subjects" in with_vision
-    assert "## Visual perception" not in without_vision
-    assert "## Tools" in without_vision
 
 
 def test_executor_system_prompt_does_not_carry_the_goal():
@@ -191,7 +169,7 @@ def test_executor_system_prompt_does_not_carry_the_goal():
     assert "{{ goal }}" not in system_text
     assert "{% if goal" not in system_text
     # 目标只能从消息块进来
-    assert "{{ goal }}" in _prompt_file("messages/goal")
+    assert "{{ goal }}" in _prompt_file("messages/per-goal/goal")
 
 
 def test_executor_prompt_is_an_independent_decider():
@@ -221,7 +199,7 @@ def test_executor_prompt_keeps_element_targeting_contract():
     而不是某一段标题或某一句措辞：标题和措辞还能再变，契约不能丢。
     """
     # 行格式说明书住在运行时消息块里，不在 system 段。
-    text = _prompt_file("messages/screen-elements")
+    text = _prompt_file("messages/per-turn/screen-elements")
     # 行格式说明书：`[i] "text" id=... Type (x,y,WxH) flags`
     assert "[i]" in text
     assert "id=" in text
@@ -239,7 +217,7 @@ def test_executor_prompt_keeps_text_tools_table():
     手写会漂移成「表里有、实际调不到」。行集合的断言见
     ``test_executor_autonomy.py::test_t18d_tools_table_rows_match_the_registered_tools``。
     """
-    text = _prompt_file("system/40-tools")
+    text = _prompt_file("system/30-tools")
     assert "## Tools" in text
     assert "{{ executor_tools_table }}" in text
     assert "| Tool | Arguments | Notes |" in text
@@ -255,9 +233,9 @@ def test_executor_prompt_keeps_perception_channels():
     开关带来的状态由**每轮消息块**自己说清：两条通道全关时
     `device_state` 明确告知「没有感知通道」。
     """
-    screen = _prompt_file("messages/screen-elements")
-    device_state = _prompt_file("messages/device-state")
-    tools = _prompt_file("system/40-tools")
+    screen = _prompt_file("messages/per-turn/screen-elements")
+    device_state = _prompt_file("messages/per-turn/device-state")
+    tools = _prompt_file("system/30-tools")
 
     # 同一张表里包含两种行，且 OCR 行自带置信度说明
     assert "Screen elements" in screen
@@ -297,7 +275,7 @@ def test_executor_prompt_has_no_trace_of_the_picture_channel():
             assert marker not in text, f"{path} 里还有截图痕迹：{marker}"
     # 两条**文字**通道还在：元素表 / 视觉主体列表
     text = _prompt_text()
-    assert "element table" in text
+    assert "Screen elements" in text
     assert "Visual subjects" in text
     assert "vision_index" in text
 
@@ -320,7 +298,7 @@ def test_executor_prompt_has_no_tool_json_schema():
 
 def test_executor_prompt_output_fields_match_executor_output():
     """Output 字段表要和 `agents/executor/types.py:ExecutorOutput` 逐字对齐。"""
-    text = _prompt_file("system/50-output")
+    text = _prompt_file("system/40-output")
     for field in ("actions", "agent_thought", "done", "done_reason"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
     # agent_thought：**先说上一步的结果，再说本动作的原因**（与 zh 版字段表对齐）
@@ -418,23 +396,7 @@ def test_executor_prompt_demands_done_when_the_goal_is_reached():
 
 
 def test_reporter_template_is_static():
-    """reporter.md 完全静态：没有模板变量，渲染结果 == 原文。"""
+    """reporter.md 已随 reporter 节点一起移除（2026-10-29 合并进 cortex）。"""
     template_vars = _load().TEMPLATE_VARS
-    assert template_vars["reporter/reporter.md"] == {}
-    text = _REPORTER_MD.read_text(encoding="utf-8")
-    assert "{{" not in text and "{%" not in text
-    # Jinja 默认不留末尾换行（keep_trailing_newline=False），比对时归一化掉
-    assert _render(_REPORTER_MD, {}).rstrip("\n") == text.rstrip("\n")
-
-
-def test_reporter_prompt_only_writes_summary_and_evidence():
-    """Reporter 只压缩、不判断：outcome 由代码给，事实字段也由代码填。"""
-    text = _REPORTER_MD.read_text(encoding="utf-8")
-    assert "## You are the **Reporter**" in text
-    assert "outcome is already decided by code" in text
-    assert "Report, don't judge" in text
-    assert "Never invent" in text
-    assert "No narration of every step" in text
-    assert "`summary`" in text and "`evidence`" in text
-    # Output 表里不许出现 outcome 行 —— 那是代码的字段，LLM 写了也会被覆盖
-    assert "| `outcome` |" not in text
+    assert "reporter/prompts/en/reporter.md" not in template_vars
+    assert not _REPORTER_MD.exists()

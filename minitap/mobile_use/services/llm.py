@@ -170,7 +170,7 @@ async def invoke_llm_with_timeout_message[T](
     Send a LLM call and display a timeout message if it takes too long.
 
     这是**所有** agent 调 LLM 的唯一汇聚点，所以 token 埋点放在这里 ——
-    一处覆盖 cortex / executor / planner / orchestrator / contextor / outputter /
+    一处覆盖 cortex / executor / planner / contextor / outputter /
     hopper / video_analyzer，不用逐个 agent 改。
 
     Args:
@@ -226,7 +226,7 @@ def _record_usage(
 ) -> None:
     """记录 token 用量。任何异常都不允许影响主流程。
 
-    usage 必须从**原始响应**上取。cortex / planner / orchestrator 走的是
+    usage 必须从**原始响应**上取。cortex / planner 走的是
     `with_structured_output`，返回 pydantic 对象，usage 落不到 result 上；
     原始 AIMessage 由客户端侧（generate/agenerate 包装）塞进捕获槽，这里优先用它。
 
@@ -680,7 +680,7 @@ class _ToolCallStructuredRunnable(Runnable):
     (its default). Passing ``False`` binds the tool without forcing it; the
     model then calls the tool on its own, verified live.
 
-    Other call sites that use ``with_structured_output`` (orchestrator, cortex,
+    Other call sites that use ``with_structured_output`` (cortex,
     executor, contextor, hopper, outputter) all use Pydantic schemas, so this
     single code path covers everything.
     """
@@ -1148,7 +1148,7 @@ def get_deepseek_llm(
 
     * **Thinking mode is on by default** (effort=high). The CoT comes back in
       ``reasoning_content`` and costs extra latency + completion tokens on
-      every planner/orchestrator/cortex/executor call. ``DEEPSEEK_THINKING=false``
+      every planner/cortex/executor call. ``DEEPSEEK_THINKING=false``
       sends ``{"thinking": {"type": "disabled"}}`` to turn it off; unset, we
       send nothing and keep DeepSeek's default.
     * ``temperature`` (and the penalty params) are **ignored while thinking**,

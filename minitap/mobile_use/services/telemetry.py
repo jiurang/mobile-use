@@ -717,7 +717,8 @@ class TelemetryService:
         R16 说的是：「计划级失败（子目标根本做不到）不能没人管」。新拓扑里
         它的处理链是::
 
-            reporter → orchestrator（看门狗）→ convergence → **replan** → planner
+            executor → cortex（构建汇报并判断）→ plan_manager（看门狗）
+            → **replan** → planner
 
         也就是说，**每一次真正走到 replan，就证明这条链是通的**。反过来，
         如果一个任务跑了很久却**一次 replan 都没有**，那要么是它一次没失败过
@@ -726,7 +727,7 @@ class TelemetryService:
         只有一个 replan 计数能分开。
 
         ⚠️ 埋点位置在 **Planner 节点**（它正好算得出 `needs_replan`），
-        不是在 `convergence_gate`（那是纯函数，拿不到 task_id）。
+        不是在 `plan_manager_gate`（那是纯函数，拿不到 task_id）。
 
         ⚠️ 这里**不带任何目标原文**：子目标描述是用户数据。
         只报数量。

@@ -67,7 +67,7 @@ change the approach, do not repeat that route.
 4. **Never build a goal around a failed target.** The failure lists name
    elements and approaches that are already known to be dead.
 5. **Do not invent success.** If the Executor reported a failure, it failed.
-6. **Do not re-plan the whole task.** Re-planning belongs to the Orchestrator.
+6. **Do not re-plan the whole task.** Re-planning is handled by the Plan Manager's rules and the Planner.
    You only choose the next subgoal.
 
 ## How to judge "done"

@@ -13,8 +13,9 @@ Cortex 是监督者：Executor 负责看屏和动作，Cortex 在一个子目标
 
 刻意没有的字段：
 
-* ``needs_replan`` —— 重规划的判断权只在 Orchestrator。两处都能判 replan
-  就会出现两个互相覆盖的判断源。
+* ``needs_replan`` —— 重规划由 PlanManager 的规则（重发预算超限）或 Cortex
+  自己的 ``give_up`` 触发，不在本输出里。两处都能判 replan 就会出现两个互相
+  覆盖的判断源。
 * ``decisions`` / ``decisions_reason`` / ``goals_completion_reason`` ——
   逐轮的动作和长推理不进 Cortex 的输出。
 """

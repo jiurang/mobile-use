@@ -39,7 +39,7 @@ async def hopper(
     """从 ``data`` 里挑出 ``request`` 要的那一份数据。"""
     logger.info("Starting Hopper Agent")
     system_message = load_prompt_template(
-        Path(__file__).parent.joinpath("hopper.md"),
+        Path(__file__).parent.joinpath("prompts", "en", "hopper.md"),
         ctx.prompt_language,
     ).render()
     messages = [

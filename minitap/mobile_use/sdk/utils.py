@@ -22,6 +22,8 @@ logger = get_logger(__name__)
 # 更不该漏掉其中一个 —— 漏掉的那个会静默落回默认模型，是最难查的一类故障。
 AGENT_ROLE_NAMES: tuple[str, ...] = (
     "planner",
+    # 2026-10-29：Orchestrator 节点已移除。角色保留是为了兼容既有
+    # llm-config 覆盖；没有任何节点再调用 get_llm("orchestrator")。
     "orchestrator",
     "contextor",
     "cortex",

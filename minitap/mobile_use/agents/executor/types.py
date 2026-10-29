@@ -3,14 +3,16 @@
 这个文件定义两个模型：一个收模型的话，一个给上层看。
 
 :class:`ExecutorOutput` 是 Executor 的 LLM 每轮吐的东西。它不含 16 个设备工具的
-JSON schema：Executor 只绑定这一个结构化输出 schema，工具的用法靠 ``prompts/system/40-tools.md``
-里的文本工具表教（365 token，静态可缓存）。绑定全量 schema 会让每轮多背 4,008
-token，而那份 schema 不进缓存键，所以每轮都按满价计费（实测，见
-``docs/智能体协作v2.md``）。
+JSON schema：Executor 只绑定这一个结构化输出 schema，工具的用法靠
+``prompts/<lang>/system/30-tools.md`` 里的文本工具表教（365 token，静态可缓存）。
+绑定全量 schema 会让每轮多背 4,008 token，而那份 schema 不进缓存键，
+所以每轮都按满价计费（实测，见 ``docs/智能体协作v2.md``）。
 
-:class:`ExecutorReport` 是 Reporter 产出、给 Cortex 和 Orchestrator 看的东西。
+:class:`ExecutorReport` 是汇报构建（``agents/reporter/reporter.py``，
+Cortex 在入口调用）产出、给 Cortex 看的东西。
 ``outcome`` 由代码判定，不经 LLM（见 :func:`determine_outcome`）；
-``failed_targets`` 与 ``evidence`` 由代码直搬，LLM 只写 ``summary``。
+``failed_targets`` 与 ``evidence`` 由代码直搬，``summary`` 也由代码生成
+（2026-10-29：汇报构建已合并进 Cortex 入口，那一层不再有任何 LLM 调用）。
 
 动作本身不单独建模，用 ``dict`` 承载：它要原样喂给 dispatcher，多一层模型只会
 多一层失配的机会。

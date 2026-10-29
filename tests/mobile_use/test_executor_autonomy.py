@@ -53,12 +53,7 @@ from minitap.mobile_use.agents.executor.types import (  # noqa: E402
 )
 from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus  # noqa: E402
 from minitap.mobile_use.agents.planner.utils import (  # noqa: E402
-    all_completed,
-    complete_subgoals_by_ids,
     get_current_subgoal,
-    get_subgoals_by_ids,
-    nothing_started,
-    start_next_subgoal,
 )
 from minitap.mobile_use.config import LLM, LLMConfig, LLMConfigUtils, LLMWithFallback  # noqa: E402
 from minitap.mobile_use.context import (  # noqa: E402
@@ -129,8 +124,7 @@ def _static_prompt_text() -> str:
     """
     return "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(EXECUTOR_PROMPTS_DIR.rglob("*.md"))
-        if not path.stem.endswith("-zh")
+        for path in sorted((EXECUTOR_PROMPTS_DIR / "en").rglob("*.md"))
     )
 
 
@@ -251,11 +245,14 @@ def test_t18c_the_static_prompt_has_no_image_contract():
 
     for marker in ("take_screenshot", "Image perception", "data:image", '"vision":'):
         assert marker not in system, f"静态提示词里还有旧图片契约：{marker}"
-    # 两条**文字**通道都在：元素表（UI 行 + OCR 行）/ 视觉主体列表
-    assert "element table" in system
-    assert "OCR rows" in system
+    # 视觉工具的教学仍在工具表里
     assert "scan_visual_subjects" in system
-    assert "vision_index" in system
+    # 两条**文字**通道都在：元素表（UI 行 + OCR 行）/ 视觉主体列表
+    text = _static_prompt_text()
+    assert "Screen elements" in text
+    assert "OCR rows" in text
+    assert "Visual subjects" in text
+    assert "vision_index" in text
 
 
 def test_t18d_tools_table_rows_match_the_registered_tools():
@@ -485,21 +482,8 @@ def test_t14c_executor_degrades_instead_of_raising():
 
 
 # ---------------------------------------------------------------------------
-# T15 —— Reporter 免 LLM 模式（每个子目标省一次调用）
+# T15 —— 汇报构建（纯代码，Cortex 入口调用）
 # ---------------------------------------------------------------------------
-
-
-def test_t15_reporter_is_llm_free_by_default():
-    """Reporter 默认**不调 LLM** —— 事实字段本来就是代码直搬的。
-
-    真机 A/B 实测：改造后每个子目标多出 2 次固定调用（reporter + cortex），
-    而子目标内常常只有 1~2 步 ⇒ 这两次是纯开销。
-    省掉 reporter 那一次，**正确性零损失**（summary 只是措辞）。
-    """
-    from minitap.mobile_use.agents.reporter.reporter import ReporterNode
-
-    node = ReporterNode(ctx=_ctx())
-    assert node.llm_free is True
 
 
 def test_t15b_code_summary_produces_usable_text():
@@ -710,7 +694,7 @@ def test_t13d_executor_prompt_has_element_index_contract():
 
 
 def test_t2_state_has_executor_fields():
-    """State 必须有这 5 个新字段，名字和契约一致。"""
+    """State 必须有这 4 个 executor 字段，名字和契约一致。"""
     from minitap.mobile_use.graph.state import State
 
     fields = State.model_fields
@@ -719,9 +703,11 @@ def test_t2_state_has_executor_fields():
         "executor_done",
         "executor_steps",
         "executor_failures",
-        "executor_report",
     ):
         assert name in fields, f"State 缺少字段 {name}"
+    assert "executor_report" not in fields, (
+        "汇报不再是 state 字段：Cortex 在入口用 build_executor_report 构建"
+    )
 
 
 def test_t2b_executor_steps_default_is_zero():
@@ -930,14 +916,14 @@ def test_t18_both_shapes_assemble_without_raising():
 # 交叉验证过「super-step 数 == 节点执行次数」（这张图是纯链，一个 super-step
 # 正好跑一个节点）。
 #
-# 实测模型（探针，误差 0；2026-10-29 移除 Summarizer 后更新）：
-#     super_steps = 3 + S × (3K + 9)
+# 实测模型（探针，误差 0；2026-10-29 移除 Summarizer / convergence / reporter 后更新）：
+#     super_steps = 2 + S × (3K + 5)
 #         S = 子目标数，K = 每个子目标的动作步数
 #     动作步数 E = S × (K + 1)（每个子目标最后还有一轮「我做到了」的收尾）
-#   ⇒ super_steps = 3 + 3E + 6S，而 S ≤ E ⇒ 最坏 3 + 9E（每个动作步自成子目标）
+#   ⇒ super_steps = 2 + 3E + 2S，而 S ≤ E ⇒ 最坏 2 + 5E（每个动作步自成子目标）
 #
-# 最坏系数仍是 9：K=0 时每个子目标要 9 个固定 super-step，和动作步无关。
-# 所以 `SUPER_STEPS_PER_ACTION_STEP = 9` 不变；典型值从 4~5 降到 3.6~4.2。
+# 实际最坏系数是 5：K=0 时每个子目标要 5 个固定 super-step，和动作步数量无关。
+# `SUPER_STEPS_PER_ACTION_STEP = 9` 是刻意留的余量，比实际最坏更保守。
 
 
 def _plan(n: int) -> list[Subgoal]:
@@ -956,51 +942,6 @@ def _stub_planner(n_subgoals: int):
             return {"subgoal_plan": _plan(n_subgoals)}
 
     return _Planner
-
-
-def _stub_orchestrator():
-    class _Orchestrator:
-        def __init__(self, ctx):
-            self.ctx = ctx
-
-        async def __call__(self, state):
-            # 照抄真 orchestrator 的分支结构，只把「调 LLM 验收」换成
-            # 「按 complete_subgoals_by_ids 验收」。
-            plan = state.subgoal_plan
-            if nothing_started(plan) or get_current_subgoal(plan) is None:
-                plan = start_next_subgoal(plan)
-                return await state.asanitize_update(
-                    ctx=self.ctx,
-                    update={
-                        "subgoal_plan": plan,
-                        "complete_subgoals_by_ids": [],
-                        "agents_thoughts": ["starting a subgoal"],
-                    },
-                    agent="orchestrator",
-                )
-            if not get_subgoals_by_ids(plan, state.complete_subgoals_by_ids):
-                return await state.asanitize_update(
-                    ctx=self.ctx,
-                    update={
-                        "complete_subgoals_by_ids": [],
-                        "agents_thoughts": ["no subgoal to examine"],
-                    },
-                    agent="orchestrator",
-                )
-            plan = complete_subgoals_by_ids(plan, state.complete_subgoals_by_ids)
-            if not all_completed(plan):
-                plan = start_next_subgoal(plan)
-            return await state.asanitize_update(
-                ctx=self.ctx,
-                update={
-                    "subgoal_plan": plan,
-                    "complete_subgoals_by_ids": [],
-                    "agents_thoughts": ["examined the subgoal"],
-                },
-                agent="orchestrator",
-            )
-
-    return _Orchestrator
 
 
 def _stub_contextor():
@@ -1027,12 +968,14 @@ def _stub_cortex():
             self.ctx = ctx
 
         async def __call__(self, state):
-            # 照抄 `agents/cortex/cortex.py:412-455` 的语义：
-            # 汇报判完成 → 提名给 orchestrator；否则下发目标 + 归零局部历史。
-            report = state.executor_report
+            # 照抄真 Cortex 的语义：``executor_done`` 表示「有一份没被消费的
+            # 汇报」——是 → 判完成并提名给 plan_manager；否 → 下发目标。
+            #
+            # 汇报构建本身（`build_executor_report`）是纯代码，这里同样用一个
+            # 纯代码的替身：只要 done，就当作 completed。
             current = get_current_subgoal(state.subgoal_plan)
-            update: dict = {"latest_ui_hierarchy": None, "executor_report": None}
-            if report is not None and report.outcome == "completed":
+            update: dict = {"latest_ui_hierarchy": None, "executor_done": False}
+            if state.executor_done:
                 update["complete_subgoals_by_ids"] = [current.id] if current else []
                 thought = "the subgoal looks done"
             else:
@@ -1061,21 +1004,6 @@ def _stub_tool_node():
     return _ToolNode
 
 
-def _stub_reporter():
-    class _Reporter:
-        def __init__(self, ctx):
-            self.ctx = ctx
-
-        async def __call__(self, state):
-            return {
-                "executor_report": ExecutorReport(
-                    outcome="completed", summary="done", evidence="ok"
-                )
-            }
-
-    return _Reporter
-
-
 def _stub_decide(steps_per_subgoal: int):
     """脚本化的 Executor 决策：前 K 轮给动作，之后说「我做到了」。
 
@@ -1101,7 +1029,6 @@ def _stub_decide(steps_per_subgoal: int):
 def _initial_state() -> dict:
     """初始 state —— 照抄 `sdk/agent.py:1213` 的 `_get_graph_state`。"""
     return {
-        "messages": [],
         "initial_goal": "read the wifi name",
         "subgoal_plan": [],
         "latest_ui_hierarchy": None,
@@ -1109,12 +1036,10 @@ def _initial_state() -> dict:
         "latest_screen_elements": None,
         "focused_app_info": None,
         "device_date": None,
-        "structured_decisions": None,
         "complete_subgoals_by_ids": [],
         "agents_thoughts": [],
         "remaining_steps": 400,
         "executor_messages": [],
-        "cortex_last_thought": None,
         "scratchpad": {},
     }
 
@@ -1135,11 +1060,9 @@ async def _run_real_graph(
     import minitap.mobile_use.graph.graph as gg
 
     monkeypatch.setattr(gg, "PlannerNode", _stub_planner(n_subgoals))
-    monkeypatch.setattr(gg, "OrchestratorNode", _stub_orchestrator())
     monkeypatch.setattr(gg, "ContextorNode", _stub_contextor())
     monkeypatch.setattr(gg, "CortexNode", _stub_cortex())
     monkeypatch.setattr(gg, "ExecutorToolNode", _stub_tool_node())
-    monkeypatch.setattr(gg, "ReporterNode", _stub_reporter())
     monkeypatch.setattr(ExecutorNode, "_decide", _stub_decide(steps_per_subgoal))
 
     graph = await gg.get_graph(_ctx())
@@ -1165,13 +1088,13 @@ def test_t20_recursion_limit_covers_the_action_step_budget():
     """T20：换算出来的 `recursion_limit` 足够跑完对应的动作步数。
 
     实测模型（`scripts/probe_superstep_budget.py`）：
-        super_steps = 3 + 3E + 6S，E = 动作步数，S = 子目标数
-    最坏情况是「每个动作步都自成子目标」（S = E）⇒ 3 + 9E。
+        super_steps = 2 + 3E + 2S，E = 动作步数，S = 子目标数
+    最坏情况是「每个动作步都自成子目标」（S = E）⇒ 2 + 5E。
     换算必须覆盖这个最坏情况 —— 给少了任务会在中途崩掉。
     """
     for max_steps in (1, 4, 10, 30, 100, 400):
         limit = compute_recursion_limit(max_steps)
-        worst_case_super_steps = 3 + 9 * max_steps
+        worst_case_super_steps = 2 + 5 * max_steps
         assert limit >= worst_case_super_steps, (
             f"max_steps={max_steps} → recursion_limit={limit}，"
             f"但最坏情况要 {worst_case_super_steps} 个 super-step"
@@ -1192,7 +1115,8 @@ async def test_t20c_converted_recursion_limit_finishes_the_task(monkeypatch):
     """T20：换成算出来的 `recursion_limit` 之后，任务能**跑完**。
 
     脚本：2 个子目标 × 每个 3 个动作步 = 6 个动作步（+ 每子目标 1 轮收尾
-    = 8 个 executor 步），实测要 39 个 super-step（Summarizer 移除前是 45）。
+    = 8 个 executor 步），实测要 30 个 super-step
+    （Summarizer / convergence / reporter 移除前是 45）。
     """
     result = await _run_real_graph(
         monkeypatch,
@@ -1209,7 +1133,7 @@ async def test_t20d_unconverted_recursion_limit_crashes_the_task(monkeypatch):
     """T20 反向验证：**不换算**的话，任务会中途崩。
 
     这就是 M12 要修的东西 —— 同一个 `max_steps` 直接当 `recursion_limit` 用，
-    在新拓扑下根本跑不完（8 个动作步要 39 个 super-step）。
+    在新拓扑下根本跑不完（8 个动作步要 30 个 super-step）。
     """
     result = await _run_real_graph(
         monkeypatch,
@@ -1431,7 +1355,12 @@ def test_t24_short_tool_results_are_never_touched():
 
 
 def _cortex_state(*, report, thoughts, subgoal_id: str = "sg1"):
-    """一个「有汇报、有当前子目标」的 state（给 Cortex 节点用）。"""
+    """一个「有汇报、有当前子目标」的 state（给 Cortex 节点用）。
+
+    ``report`` 不再进 state —— Cortex 在入口用 ``build_executor_report`` 构建。
+    所以这里把 ``executor_done`` 置 True（「有一份没被消费的汇报」），调用方
+    再把 ``build_executor_report`` 打桩成返回 ``report``。
+    """
     from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus
 
     subgoal = Subgoal(
@@ -1443,7 +1372,7 @@ def _cortex_state(*, report, thoughts, subgoal_id: str = "sg1"):
         **{
             **_initial_state(),
             "subgoal_plan": [subgoal],
-            "executor_report": report,
+            "executor_done": True,
             "agents_thoughts": list(thoughts),
         }
     )
@@ -1491,6 +1420,7 @@ async def test_t25_failed_subgoal_uses_the_rule_retry_without_calling_the_llm(mo
         summary="子目标未完成，见失败清单（1 条失败事实）。",
         actions_taken=["tap({'target': {'index': 3}})"],
     )
+    monkeypatch.setattr(cortex_mod, "build_executor_report", lambda *_: report)
     state = _cortex_state(report=report, thoughts=[])
     update = await cortex_mod.CortexNode(_ctx())(state)
 
@@ -1539,6 +1469,7 @@ async def test_t25b_rule_budget_exhausted_falls_back_to_the_llm(monkeypatch):
         "[cortex] Issued goal for subgoal sg1: Enter the WLAN page "
         "(rule-based retry (previous attempt failed))",
     ]
+    monkeypatch.setattr(cortex_mod, "build_executor_report", lambda *_: report)
     state = _cortex_state(report=report, thoughts=thoughts)
     update = await cortex_mod.CortexNode(_ctx())(state)
 
@@ -1613,7 +1544,7 @@ def test_t25c_rule_retry_budget_is_bounded_and_counted_from_the_thoughts():
 # ---------------------------------------------------------------------------
 #
 # 这个埋点只有一个用途：R16 要求「计划级失败不能没人管」，新拓扑里的处理链是
-# ``reporter → orchestrator → convergence → replan → planner``。
+# ``executor → cortex（构建汇报并判断）→ plan_manager（看门狗）→ replan → planner``。
 # **每一次真正走到 replan，就证明这条链是通的**；反过来「跑了很久却一次
 # replan 都没有」有两种可能（一次没失败过 / 看门狗断了），光看别的指标分不开。
 
@@ -2110,16 +2041,11 @@ async def test_t34_cortex_parse_failure_does_not_kill_the_task(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_t35_every_issue_starts_a_fresh_round_with_the_previous_attempt_digest(
-    monkeypatch,
-):
-    """T35：每一轮（一次执行尝试）都清空局部历史，上一轮的事实压成摘要带过来。
+async def test_t35_every_issue_starts_a_fresh_round(monkeypatch):
+    """T35：每一轮（一次执行尝试）都清空局部历史，不带上一轮的任何内容。
 
     清空的理由：局部历史每步约 +3 条消息 / +490 字符，不清就按步数线性增长
     （真机归档 880：末轮 461 条消息 / 6 万字符，占 executor prompt 的 54%）。
-
-    带摘要的理由：只清空会让执行器忘了自己试过什么，在原地打转
-    （真机序列 `(2, completed) → (13, blocked) → (1, completed)`）。
     """
     import minitap.mobile_use.agents.cortex.cortex as cortex_mod
     from minitap.mobile_use.agents.cortex.types import CortexOutput
@@ -2171,22 +2097,15 @@ async def test_t35_every_issue_starts_a_fresh_round_with_the_previous_attempt_di
     messages = update[EXECUTOR_MESSAGES_KEY]
     assert isinstance(messages[0], RemoveMessage)
     assert messages[0].id == REMOVE_ALL_MESSAGES, "新一轮必须先清空上一轮的消息"
-    digest = messages[1]
-    assert isinstance(digest, HumanMessage), "摘要要作为新一轮局部历史的第一条"
-    assert "没进到结果页" in digest.content, "摘要要带上一轮的 summary"
-    assert "目标不在当前屏幕上" in digest.content, "摘要要带上一轮的结束原因"
-    assert "search_box" in digest.content, "摘要要带上一轮失败过的目标"
-    assert "[7]" not in digest.content, "索引每轮重编号，摘要里不许带 index"
+    assert len(messages) == 1, "清空后不带上一轮的任何内容"
 
-    # --- 情形 2：首次下发（**没**汇报）⇒ 只清空，没有摘要 ---
+    # --- 情形 2：首次下发（**没**汇报）⇒ 同样只清空 ---
     state = _cortex_state(report=None, thoughts=[])
     update = await cortex_mod.CortexNode(_ctx())(state)
 
     assert update.get("executor_goal") == "Try the search box instead"
     messages = update[EXECUTOR_MESSAGES_KEY]
-    assert len(messages) == 1 and isinstance(messages[0], RemoveMessage), (
-        "首次下发没有上一轮，只清空、不造摘要"
-    )
+    assert len(messages) == 1 and isinstance(messages[0], RemoveMessage), "首次下发也要清空"
 
 
 # ---------------------------------------------------------------------------

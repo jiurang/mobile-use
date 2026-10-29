@@ -1,11 +1,11 @@
 """Executor 自主执行改造的**路由层**回归测试。
 
 这一轮补的是独立验收（2026-10-21）查出的盲区：``grep`` 全 ``tests/`` 目录，
-``get_graph`` / ``post_executor_gate`` / ``post_cortex_gate`` / ``convergence_gate``
+``get_graph`` / ``post_executor_gate`` / ``plan_manager_gate`` / ``post_cortex_gate``
 **零引用** —— 4 个路由级 bug 全部住在没有一行测试的代码里，其中 3 个是致命级：
 
 * ① ``done: true`` + ``actions: []`` 的完成路径不可达（被 dispatcher 当成空动作拒了）；
-* ② 动作被 dispatcher 拒后，**拒绝理由模型永远看不到**（直接进了 reporter）；
+* ② 动作被 dispatcher 拒后，**拒绝理由模型永远看不到**（直接进了收尾）；
 * ③ 拒绝回灌用了 ToolMessage，协议非法 → OpenAI 兼容端点 400。
 
 ①②③ 已经修好了。本文件的作用是**把路由行为锁进测试**，让这类 bug 以后改不动。
@@ -29,7 +29,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "minitap"
 
 from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 
-from minitap.mobile_use.agents.executor.types import ExecutorReport  # noqa: E402
+from minitap.mobile_use.agents.plan_manager.plan_manager import (  # noqa: E402
+    MAX_ISSUES_PER_SUBGOAL,
+    PlanManagerNode,
+    plan_manager_gate,
+    post_cortex_gate,
+)
 from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus  # noqa: E402
 from minitap.mobile_use.config import LLM, LLMConfig, LLMConfigUtils, LLMWithFallback  # noqa: E402
 from minitap.mobile_use.context import (  # noqa: E402
@@ -37,13 +42,7 @@ from minitap.mobile_use.context import (  # noqa: E402
     DevicePlatform,
     MobileUseContext,
 )
-from minitap.mobile_use.graph.graph import (  # noqa: E402
-    ReportLedger,
-    convergence_gate,
-    get_graph,
-    post_cortex_gate,
-    post_executor_gate,
-)
+from minitap.mobile_use.graph.graph import get_graph, post_executor_gate  # noqa: E402
 from minitap.mobile_use.graph.state import State  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -96,8 +95,9 @@ def _state(
     executor_done: bool = False,
     executor_goal: str | None = None,
     executor_steps: int = 0,
-    executor_report: ExecutorReport | None = None,
     subgoal_plan: list[Subgoal] | None = None,
+    complete_subgoals_by_ids: list[str] | None = None,
+    agents_thoughts: list[str] | None = None,
 ) -> State:
     """造一个**最小**的 State。
 
@@ -105,32 +105,26 @@ def _state(
     路由函数只读 `executor_*` 和 `subgoal_plan` 这几项。
     """
     return State(
-        messages=[],
         initial_goal="打开 WLAN 页面",
         subgoal_plan=subgoal_plan if subgoal_plan is not None else [],
         latest_ui_hierarchy=None,
         latest_ocr_results=None,
         focused_app_info=None,
         device_date=None,
-        structured_decisions=None,
-        complete_subgoals_by_ids=[],
+        complete_subgoals_by_ids=(
+            complete_subgoals_by_ids if complete_subgoals_by_ids is not None else []
+        ),
         executor_messages=executor_messages if executor_messages is not None else [],
-        cortex_last_thought=None,
-        agents_thoughts=[],
-        # 路由函数真正关心的四个字段
+        agents_thoughts=agents_thoughts if agents_thoughts is not None else [],
+        # 路由函数真正关心的三个字段
         executor_done=executor_done,
         executor_goal=executor_goal,
         executor_steps=executor_steps,
-        executor_report=executor_report,
     )
 
 
 def _subgoal(sid: str, status: SubgoalStatus) -> Subgoal:
     return Subgoal(id=sid, description=f"子目标 {sid}", status=status)
-
-
-def _report(outcome: str = "completed", summary: str = "做完了") -> ExecutorReport:
-    return ExecutorReport(outcome=outcome, summary=summary)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +146,7 @@ def test_r1_ai_message_with_tool_calls_goes_to_invoke_tools():
 
 
 def test_r2_executor_done_goes_to_report():
-    """R2：``executor_done=True`` → 去 reporter 收尾。
+    """R2：``executor_done=True`` → 去 cortex 收尾（它在入口构建汇报）。
 
     致命 bug ① 的路由层防线：「完成」这条路必须**可达** ——
     模型说 ``done: true`` 时 actions 是空数组，任何「有没有动作」的判据
@@ -199,7 +193,7 @@ def test_r3_rejection_reason_goes_back_to_executor():
     致命 bug ② 的防线：dispatcher 拒掉动作后，Executor 写的是
     「AIMessage(无 tool_calls) + HumanMessage(拒绝理由)」。
     如果路由只看「最后一条 AIMessage 有没有 tool_calls」，那条 AIMessage
-    确实没有 → 直接进 reporter → **拒绝理由模型永远看不到**，
+    确实没有 → 直接进收尾 → **拒绝理由模型永远看不到**，
     Executor 的自主循环在第一次出岔子时就终止了。
 
     ⇒ 判据必须是「最后一条消息是不是 HumanMessage」。
@@ -219,7 +213,7 @@ def test_r3_rejection_reason_goes_back_to_executor():
 
 
 def test_r4_no_messages_falls_back_to_report():
-    """R4：一条消息都没有 → 去 reporter（兜底，不能卡住）。
+    """R4：一条消息都没有 → 去 cortex 收尾（兜底，不能卡住）。
 
     路由函数不能返回第四种结果，也不能抛异常 —— 卡在 executor 节点
     意味着整个任务挂到 ``recursion_limit`` 才退出。
@@ -228,7 +222,7 @@ def test_r4_no_messages_falls_back_to_report():
 
 
 def test_r4b_ai_message_without_tool_calls_falls_back_to_report():
-    """R4b：最后一条 AIMessage **不带** tool_calls → 也去 reporter。
+    """R4b：最后一条 AIMessage **不带** tool_calls → 也去 cortex 收尾。
 
     这是「模型只想不动手」的形态。必须收尾，不能当成「有动作」执行。
     """
@@ -237,56 +231,8 @@ def test_r4b_ai_message_without_tool_calls_falls_back_to_report():
 
 
 # ---------------------------------------------------------------------------
-# R5~R8 —— post_cortex_gate（Cortex 之后的路由）
+# R7~R8 —— post_cortex_gate（Cortex 之后的路由）
 # ---------------------------------------------------------------------------
-
-
-def test_r5_new_completed_report_goes_to_review():
-    """R5：有一份**新的**（账本没见过）completed 汇报 → 去 orchestrator 验收。
-
-    「子目标完成」的正式验收在 orchestrator（它把子目标标 SUCCESS）。
-    汇报是**每子目标变**的字段，所以必须判新旧：同一份汇报被判两遍，
-    中间的子目标就被跳过了。
-    """
-    ledger = ReportLedger()
-    state = _state(executor_report=_report("completed"))
-    assert post_cortex_gate(state, ledger) == "review"
-
-
-def test_r5b_completed_report_wins_over_pending_goal():
-    """R5b：既有新汇报、又有待跑目标 → **优先 review**。
-
-    顺序是刻意的：先验收完成，再继续下一个子目标（契约 §W8.3）。
-    反过来会让「刚做完的子目标」被当成没做完，验收永远轮不到。
-    """
-    ledger = ReportLedger()
-    state = _state(
-        executor_report=_report("completed"),
-        executor_goal="读出 Wi-Fi 名称",
-        executor_steps=0,
-    )
-    assert post_cortex_gate(state, ledger) == "review"
-
-
-def test_r6_seen_report_is_not_reviewed_again():
-    """R6：**同一份**汇报（账本已经判过了）→ 不是 review。
-
-    账本记得「已经判过哪一份」。同一份汇报再触发一次验收 =
-    同一个子目标被推进两次 → 中间的子目标被跳过。
-    （`convergence` 节点会作废已判过的汇报，但在这之前路由层就得先挡住。）
-    """
-    ledger = ReportLedger()
-    report = _report("completed")
-    ledger.mark_seen(report)
-
-    state = _state(
-        executor_report=report,
-        executor_goal="读出 Wi-Fi 名称",
-        executor_steps=0,
-    )
-    assert post_cortex_gate(state, ledger) != "review"
-    # 具体落到哪：应该继续去执行下一个目标
-    assert post_cortex_gate(state, ledger) == "execute"
 
 
 def test_r7_pending_goal_with_zero_steps_goes_to_execute():
@@ -296,37 +242,62 @@ def test_r7_pending_goal_with_zero_steps_goes_to_execute():
     Cortex 下发新目标时把它归零，Executor 每跑一轮 +1。
     少了它，已经做完的目标会被**再跑一遍**（子目标被重复执行）。
     """
-    ledger = ReportLedger()
     state = _state(executor_goal="读出 Wi-Fi 名称", executor_steps=0)
-    assert post_cortex_gate(state, ledger) == "execute"
+    assert post_cortex_gate(state) == "execute"
 
 
 def test_r7b_already_run_goal_is_not_executed_again():
     """R7b：目标还在，但 ``executor_steps > 0`` → **不是** execute。
 
     这个目标已经跑过了。再执行一遍 = 同一个子目标做两遍。
-    没有待办目标 → 交给 orchestrator 当看门狗。
+    没有待办目标 → 交给 plan_manager 当看门狗。
     """
-    ledger = ReportLedger()
     state = _state(executor_goal="读出 Wi-Fi 名称", executor_steps=3)
-    assert post_cortex_gate(state, ledger) != "execute"
-    assert post_cortex_gate(state, ledger) == "review"
+    assert post_cortex_gate(state) != "execute"
+    assert post_cortex_gate(state) == "review"
 
 
 def test_r8_no_report_and_no_goal_goes_to_review():
-    """R8：既没有新汇报、也没有待跑目标 → 去 orchestrator（看门狗兜底）。
+    """R8：既没有新汇报、也没有待跑目标 → 去 plan_manager（看门狗兜底）。
 
     这是 R16 的落点：没有这条兜底，计划级失败（子目标根本做不到）
     就没有任何处理者 —— Cortex 会一直说「没完成」一直重发，
     最后撞 ``recursion_limit`` **异常退出**（不是「重新拆计划」）。
     """
-    ledger = ReportLedger()
     state = _state()
-    assert post_cortex_gate(state, ledger) == "review"
+    assert post_cortex_gate(state) == "review"
+
+
+def test_r7c_reissue_budget_exceeded_goes_to_budget_exceeded():
+    """R7c：同一个子目标下发次数超过预算 → 不再执行，交给 PlanManager 熔断。
+
+    预算是 ``MAX_ISSUES_PER_SUBGOAL`` 次尝试：第 ``MAX+1`` 次下发前拦下。
+    数的是 ``[cortex] Issued goal for subgoal <id>:`` 这条 append-only thought。
+    """
+    subgoal_plan = [_subgoal("sg1", SubgoalStatus.PENDING)]
+    marker = "[cortex] Issued goal for subgoal sg1:"
+
+    at_budget = _state(
+        subgoal_plan=subgoal_plan,
+        executor_goal="读出 Wi-Fi 名称",
+        executor_steps=0,
+        agents_thoughts=[f"{marker} attempt {i}" for i in range(MAX_ISSUES_PER_SUBGOAL)],
+    )
+    assert post_cortex_gate(at_budget) == "execute"
+
+    over_budget = _state(
+        subgoal_plan=subgoal_plan,
+        executor_goal="读出 Wi-Fi 名称",
+        executor_steps=0,
+        agents_thoughts=[
+            f"{marker} attempt {i}" for i in range(MAX_ISSUES_PER_SUBGOAL + 1)
+        ],
+    )
+    assert post_cortex_gate(over_budget) == "budget_exceeded"
 
 
 # ---------------------------------------------------------------------------
-# R9~R11 —— convergence_gate（计划层的汇合点）
+# R9~R11 —— plan_manager_gate（计划层的汇合点）
 # ---------------------------------------------------------------------------
 
 
@@ -342,7 +313,7 @@ def test_r9_failure_subgoal_triggers_replan():
             _subgoal("c", SubgoalStatus.NOT_STARTED),
         ]
     )
-    assert convergence_gate(state) == "replan"
+    assert plan_manager_gate(state) == "replan"
 
 
 def test_r10_all_success_ends_the_run():
@@ -357,7 +328,7 @@ def test_r10_all_success_ends_the_run():
             _subgoal("b", SubgoalStatus.SUCCESS),
         ]
     )
-    assert convergence_gate(state) == "end"
+    assert plan_manager_gate(state) == "end"
 
 
 def test_r11_in_progress_continues():
@@ -373,41 +344,65 @@ def test_r11_in_progress_continues():
             _subgoal("c", SubgoalStatus.NOT_STARTED),
         ]
     )
-    assert convergence_gate(state) == "continue"
+    assert plan_manager_gate(state) == "continue"
 
 
 # ---------------------------------------------------------------------------
-# R12 —— ReportLedger（汇报的新旧账本）
+# PlanManager 节点 —— 计划状态推进（纯代码，不调 LLM）
 # ---------------------------------------------------------------------------
 
 
-def test_r12_ledger_distinguishes_reports_by_identity_not_by_value():
-    """R12：账本按**对象身份**区分汇报，不按内容。
-
-    两份内容完全相同的汇报（pydantic 认为它们相等）必须被当成**两份**：
-    汇报对象每个子目标新建一个，内容相同不代表是同一次尝试。
-    如果哪天改成按内容判重，第二个子目标的汇报就会被误判成「已经判过」
-    → 直接被跳过。
-    """
-    ledger = ReportLedger()
-    first = _report("completed", summary="同样的内容")
-    second = _report("completed", summary="同样的内容")
-
-    # 前置：两者在 pydantic 层面**相等**（内容一样）
-    assert first == second
-    # 但账本必须按身份区分
-    assert ledger.is_seen(first) is False
-    assert ledger.is_seen(second) is False
-
-    ledger.mark_seen(first)
-    assert ledger.is_seen(first) is True
-    assert ledger.is_seen(second) is False
+def _run_plan_manager(state: State) -> dict:
+    return asyncio.run(PlanManagerNode(_ctx())(state))
 
 
-def test_r12b_ledger_ignores_none():
-    """R12b：``None`` 汇报不算「判过了」（否则第一份汇报会被直接吞掉）。"""
-    ledger = ReportLedger()
-    assert ledger.is_seen(None) is False
+def test_plan_manager_starts_the_first_subgoal():
+    state = _state(subgoal_plan=[_subgoal("sg1", SubgoalStatus.NOT_STARTED)])
+    update = _run_plan_manager(state)
+    plan = update["subgoal_plan"]
+    assert plan[0].status == SubgoalStatus.PENDING
+    assert any("Starting the first subgoal" in t for t in update["agents_thoughts"])
+
+
+def test_plan_manager_accepts_completion_and_starts_next():
+    state = _state(
+        subgoal_plan=[
+            _subgoal("sg1", SubgoalStatus.PENDING),
+            _subgoal("sg2", SubgoalStatus.NOT_STARTED),
+        ],
+        complete_subgoals_by_ids=["sg1"],
+    )
+    update = _run_plan_manager(state)
+    plan = update["subgoal_plan"]
+    assert plan[0].status == SubgoalStatus.SUCCESS
+    assert plan[1].status == SubgoalStatus.PENDING
+    assert update["complete_subgoals_by_ids"] == []
+    assert any("Accepted completion" in t for t in update["agents_thoughts"])
+
+
+def test_plan_manager_ends_after_all_subgoals_complete():
+    state = _state(
+        subgoal_plan=[_subgoal("sg1", SubgoalStatus.PENDING)],
+        complete_subgoals_by_ids=["sg1"],
+    )
+    update = _run_plan_manager(state)
+    assert update["subgoal_plan"][0].status == SubgoalStatus.SUCCESS
+    assert any("All subgoals completed" in t for t in update["agents_thoughts"])
+
+
+def test_plan_manager_breaks_the_reissue_loop():
+    marker = "[cortex] Issued goal for subgoal sg1:"
+    state = _state(
+        subgoal_plan=[_subgoal("sg1", SubgoalStatus.PENDING)],
+        executor_goal="读出 Wi-Fi 名称",
+        executor_steps=0,
+        agents_thoughts=[
+            f"{marker} attempt {i}" for i in range(MAX_ISSUES_PER_SUBGOAL + 1)
+        ],
+    )
+    update = _run_plan_manager(state)
+    assert update["subgoal_plan"][0].status == SubgoalStatus.FAILURE
+    assert any("exceeded the reissue budget" in t for t in update["agents_thoughts"])
 
 
 # ---------------------------------------------------------------------------
@@ -449,18 +444,15 @@ def test_graph_compiles_without_a_device():
     assert graph is not None
 
 
-def test_graph_has_reporter_to_orchestrator_watchdog_edge():
-    """**无条件**边 ``reporter → orchestrator`` 必须存在（看门狗，R16）。
+def test_graph_has_executor_to_cortex_edge():
+    """``executor → cortex``（``report`` 分支）必须存在。
 
-    没有它，计划级失败就没有任何处理者：Cortex 一直重发同一句
-    「没完成」，最后撞 ``recursion_limit`` 异常退出，而不是「重新拆计划」。
-
-    必须是**无条件**边 —— 挂成条件边就意味着「有时候没有处理者」。
+    Reporter 已于 2026-10-29 合并进 cortex：Executor 结束一次尝试之后直接回
+    Cortex，由它在入口用纯代码构建汇报（看门狗 R16 由 Cortex 之后的
+    PlanManager 承担，见下一个测试）。少这条边，计划级失败就没有处理者。
     """
-    assert ("reporter", "orchestrator") in _edges()
-    assert _branch("reporter", "orchestrator") is None, (
-        "reporter → orchestrator 必须是无条件边（条件边 = 有时候没人处理失败）"
-    )
+    assert ("executor", "cortex") in _edges()
+    assert _branch("executor", "cortex") == "report"
 
 
 def test_graph_has_executor_tools_to_contextor_edge():
@@ -487,7 +479,7 @@ def test_graph_has_executor_retry_self_loop():
     致命 bug ② 的修复：动作被 dispatcher 拒了以后，
     **拒绝理由要回灌给模型**（HumanMessage），模型带着理由重新决策。
     少了这条自环，理由就永远送不到模型手里 ——
-    路由直接进了 reporter，Executor 的自主循环第一次出岔子就终止。
+    路由直接进了收尾，Executor 的自主循环第一次出岔子就终止。
     """
     assert ("executor", "executor") in _edges()
     assert _branch("executor", "executor") == "retry", (
@@ -501,12 +493,30 @@ def test_graph_has_all_required_nodes():
     nodes = set(drawable.nodes)
     for required in (
         "planner",
-        "orchestrator",
+        "plan_manager",
         "contextor",
         "cortex",
         "executor",
         "executor_tools",
-        "reporter",
-        "convergence",
     ):
         assert required in nodes, f"图里少了节点 {required}"
+    assert "orchestrator" not in nodes, "orchestrator 已由纯代码 plan_manager 替代"
+    assert "reporter" not in nodes, "reporter 已合并进 cortex（汇报是纯代码）"
+    assert "summarizer" not in nodes, "summarizer 已于 2026-10-29 移除"
+
+
+def test_graph_routes_plan_manager_through_gate():
+    """``plan_manager`` 的条件边就是 plan_manager_gate（continue / replan / end）。"""
+    assert ("plan_manager", "cortex") in _edges()
+    assert _branch("plan_manager", "cortex") == "continue"
+    assert ("plan_manager", "planner") in _edges()
+    assert _branch("plan_manager", "planner") == "replan"
+    assert ("plan_manager", "__end__") in _edges()
+    assert _branch("plan_manager", "__end__") == "end"
+
+
+def test_graph_routes_cortex_to_execute_or_plan_manager():
+    """Cortex 的 ``execute`` 边直达 contextor；其余分支回 plan_manager。"""
+    assert ("cortex", "contextor") in _edges()
+    assert _branch("cortex", "contextor") == "execute"
+    assert ("cortex", "plan_manager") in _edges()

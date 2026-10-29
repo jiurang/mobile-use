@@ -23,7 +23,7 @@ from minitap.mobile_use.tui.session import DeviceType, DemoSession, TuiSession
 DEMO_SCRIPT: list[dict] = [
     {"kind": "node", "name": "planner", "think": 0.6},
     {"kind": "thought", "text": "拆解目标：打开微信 → 搜索张三 → 发一条消息"},
-    {"kind": "node", "name": "orchestrator", "think": 0.4},
+    {"kind": "node", "name": "plan_manager", "think": 0.4},
     {"kind": "node", "name": "contextor", "think": 0.8},
     {
         "kind": "thought",

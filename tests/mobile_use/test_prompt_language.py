@@ -4,8 +4,8 @@
 
 1. **语言怎么定**：任务级 > Agent 级 > 环境变量 > 默认英文。
    写错一个环境变量**不许**让整轮任务挂掉 —— 回落 + 上报即可。
-2. **中文版文件怎么找**：``xxx.md`` → ``xxx-zh.md``（``cortex.zh.md`` 是
-   历史命名，也得认）。找不到中文版时**回落英文 + 明确 warning** ——
+2. **中文版文件怎么找**：``prompts/en/xxx.md`` → ``prompts/zh/xxx.md``
+   （同构目录树）。找不到中文版时**回落英文 + 明确 warning** ——
    「以为在跑中文、其实跑的是英文」会把 A/B 结论带歪，必须出声。
 3. **每个 agent 真的接上了开关**：prompt 里出现的是中文，不是英文。
 
@@ -25,8 +25,6 @@ import pytest  # noqa: E402
 from pytest import MonkeyPatch  # noqa: E402
 
 from minitap.mobile_use.agents.contextor.types import ContextorOutput  # noqa: E402
-from minitap.mobile_use.agents.orchestrator.types import OrchestratorOutput  # noqa: E402
-from minitap.mobile_use.agents.planner.types import Subgoal, SubgoalStatus  # noqa: E402
 from minitap.mobile_use.config import LLM, LLMConfig, LLMConfigUtils, LLMWithFallback  # noqa: E402
 from minitap.mobile_use.context import (  # noqa: E402
     DeviceContext,
@@ -48,32 +46,25 @@ from minitap.mobile_use.prompt_language import (  # noqa: E402
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _AGENTS_DIR = _ROOT / "minitap" / "mobile_use" / "agents"
 
-#: 本次交付翻译的 6 份中文提示词（文件名必须是 ``<stem>-zh.md``）。
+#: 本次交付翻译的中文提示词（必须住在 ``prompts/zh/`` 下）。
 TRANSLATED_PROMPTS = [
-    "contextor/contextor-zh.md",
-    "hopper/hopper-zh.md",
-    "orchestrator/orchestrator-zh.md",
-    "orchestrator/human-zh.md",
-    "outputter/human-zh.md",
-    "reporter/reporter-zh.md",
+    "contextor/prompts/zh/contextor.md",
+    "hopper/prompts/zh/hopper.md",
+    "outputter/prompts/zh/human.md",
 ]
 
-#: 开关覆盖到的全部 agent 提示词（含本次之前就有的中英两版）。
+#: 开关覆盖到的全部 agent 提示词（以英文基准文件为准）。
 #: 每一个都必须能在 zh 下找到中文版 —— 否则开关就是半拉子的。
 #: Executor 已按 manifest 拆段，这里把每个段都列进来。
 _EXECUTOR_PROMPTS = _AGENTS_DIR / "executor" / "prompts"
 SWITCHED_PROMPTS = [
-    "contextor/contextor.md",
-    "hopper/hopper.md",
-    "orchestrator/orchestrator.md",
-    "orchestrator/human.md",
-    "outputter/human.md",
-    "reporter/reporter.md",
-    "cortex/cortex.md",
+    "contextor/prompts/en/contextor.md",
+    "hopper/prompts/en/hopper.md",
+    "outputter/prompts/en/human.md",
+    "cortex/prompts/en/cortex.md",
     *[
         path.relative_to(_AGENTS_DIR).as_posix()
-        for path in sorted(_EXECUTOR_PROMPTS.rglob("*.md"))
-        if not path.stem.endswith("-zh")
+        for path in sorted((_EXECUTOR_PROMPTS / "en").rglob("*.md"))
     ],
 ]
 
@@ -207,36 +198,37 @@ def test_every_switched_prompt_has_a_chinese_version(rel: str):
 
 
 def test_english_always_stays_on_the_original_file():
-    base = _AGENTS_DIR / "contextor/contextor.md"
+    base = _AGENTS_DIR / "contextor/prompts/en/contextor.md"
     assert resolve_prompt_path(base, PromptLanguage.EN) == base
 
 
-def test_cortex_zh_uses_the_legacy_dot_suffix():
-    """``cortex.zh.md`` 是历史命名（点号），也得认。
+def test_zh_variant_lives_under_the_zh_directory():
+    """中文版是 ``prompts/en/`` 同构的 ``prompts/zh/`` 文件，文件名不带语言后缀。"""
+    base = _AGENTS_DIR / "cortex/prompts/en/cortex.md"
+    zh = resolve_prompt_path(base, PromptLanguage.ZH)
+    assert zh == _AGENTS_DIR / "cortex/prompts/zh/cortex.md"
+    assert zh.name == "cortex.md"
 
-    不认它 ⇒ 那个文件在 zh 下会被静默回落成英文 ⇒ A/B 结论直接作废。
-    """
-    zh = resolve_prompt_path(_AGENTS_DIR / "cortex/cortex.md", PromptLanguage.ZH)
-    assert zh.name == "cortex.zh.md"
 
-
-def test_missing_chinese_version_falls_back_to_english_with_a_warning(caplog):
+def test_missing_chinese_version_falls_back_to_english_with_a_warning(caplog, tmp_path):
     """缺中文版 ⇒ **回落英文 + 明确 warning**。
 
     「以为在跑中文、其实跑的是英文」在输出里完全看不出来，
     只有这条 warning 能揭穿它。
     """
-    base = _AGENTS_DIR / "planner/planner.md"
+    base = tmp_path / "en" / "planner.md"
+    base.parent.mkdir()
+    base.write_text("You are the planner", encoding="utf-8")
     with caplog.at_level("WARNING"):
         assert resolve_prompt_path(base, PromptLanguage.ZH) == base
     assert "没有中文版" in caplog.text
 
 
 def test_read_prompt_returns_the_chinese_body():
-    body = read_prompt(_AGENTS_DIR / "reporter/reporter.md", PromptLanguage.ZH)
-    assert "你是 **Reporter**" in body
+    body = read_prompt(_AGENTS_DIR / "hopper/prompts/en/hopper.md", PromptLanguage.ZH)
+    assert "从批量数据里" in body
     # 字面量不许翻：字段名是模型要原样吐出的
-    assert "`summary`" in body and "`evidence`" in body
+    assert "**found**" in body and "**output**" in body
 
 
 def test_pick_switches_between_the_two_wordings():
@@ -257,8 +249,8 @@ def test_executor_prompt_follows_the_switch():
     zh = render_executor_system(_ctx(PromptLanguage.ZH))
     assert "You are the **Executor**" in en
     assert "你是 **Executor**" in zh
-    # 索引字段名不许翻 —— 工具段里讲的是 `index`。
-    assert "`index`" in zh
+    # 字段名不许翻 —— 输出段里讲的是 `ExecutorOutput`。
+    assert "`ExecutorOutput`" in zh
 
 
 def test_cortex_prompt_follows_the_switch(monkeypatch: MonkeyPatch):
@@ -274,40 +266,11 @@ def test_cortex_env_override_beats_the_language_switch(monkeypatch: MonkeyPatch)
     """环境变量显式指定文件 ⇒ 盖过语言开关（那是「我要精确用这个文件」）。"""
     from minitap.mobile_use.agents.cortex.cortex import load_cortex_template
 
-    override = _AGENTS_DIR / "cortex/cortex.md"
+    override = _AGENTS_DIR / "cortex/prompts/en/cortex.md"
     monkeypatch.setenv("MOBILE_USE_CORTEX_PROMPT", str(override))
     rendered = load_cortex_template(PromptLanguage.ZH, str(override)).render()
     assert "You are the Cortex" in rendered
     assert "你是 Cortex" not in rendered
-
-
-def test_reporter_prompt_follows_the_switch():
-    """Reporter：system prompt 静态，两种语言各自缓存。"""
-    from minitap.mobile_use.agents.reporter.reporter import load_reporter_prompt
-
-    assert "你是 **Reporter**" in load_reporter_prompt(PromptLanguage.ZH)
-    assert "You are the **Reporter**" in load_reporter_prompt(PromptLanguage.EN)
-
-
-def test_reporter_human_message_labels_follow_the_switch():
-    from minitap.mobile_use.agents.reporter.reporter import build_reporter_messages
-
-    zh = build_reporter_messages(
-        goal="读出 Wi-Fi 名称",
-        outcome="failed",
-        log_text="tap(3)",
-        failed_targets=[],
-        language=PromptLanguage.ZH,
-    )
-    assert "尝试的子目标：" in _system_text(zh) + str(zh[1].content)
-    en = build_reporter_messages(
-        goal="read the wifi name",
-        outcome="failed",
-        log_text="tap(3)",
-        failed_targets=[],
-        language=PromptLanguage.EN,
-    )
-    assert "Subgoal attempted:" in str(en[1].content)
 
 
 @pytest.mark.asyncio
@@ -340,7 +303,6 @@ async def test_outputter_prompt_follows_the_switch(monkeypatch: MonkeyPatch):
     from minitap.mobile_use.graph.state import State
 
     state = State(
-        messages=[],
         initial_goal="读出 Wi-Fi 名称",
         subgoal_plan=[],
         latest_ui_hierarchy=None,
@@ -350,10 +312,8 @@ async def test_outputter_prompt_follows_the_switch(monkeypatch: MonkeyPatch):
         screen_state="on",
         latest_screen_elements=None,
         last_action_at=None,
-        structured_decisions=None,
         complete_subgoals_by_ids=[],
         executor_messages=[],
-        cortex_last_thought=None,
         agents_thoughts=["想了一下"],
     )
 
@@ -413,53 +373,6 @@ async def test_contextor_prompt_follows_the_switch(monkeypatch: MonkeyPatch):
         current_app_package="com.b",
     )
     assert "You are the **Contextor Agent**" in _system_text(calls[0])
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_prompt_follows_the_switch(monkeypatch: MonkeyPatch):
-    """Orchestrator：system + human 两块都要跟着切。"""
-    import minitap.mobile_use.agents.orchestrator.orchestrator as orchestrator_mod
-    from minitap.mobile_use.graph.state import State
-
-    def _state():
-        return State(
-            messages=[],
-            initial_goal="读出 Wi-Fi 名称",
-            subgoal_plan=[
-                Subgoal(id="sg1", description="打开 Wi-Fi 页", status=SubgoalStatus.PENDING)
-            ],
-            latest_ui_hierarchy=None,
-            latest_ocr_results=None,
-            focused_app_info=None,
-            device_date=None,
-            screen_state="on",
-            latest_screen_elements=None,
-            last_action_at=None,
-            structured_decisions=None,
-            complete_subgoals_by_ids=["sg1"],
-            executor_messages=[],
-            cortex_last_thought=None,
-            agents_thoughts=["想了一下"],
-        )
-
-    calls: list = []
-    monkeypatch.setattr(
-        orchestrator_mod,
-        "get_llm",
-        lambda **kwargs: _FakeLLM(
-            calls, OrchestratorOutput(completed_subgoal_ids=[], needs_replaning=False, reason="ok")
-        ),
-    )
-
-    await orchestrator_mod.OrchestratorNode(_ctx(PromptLanguage.ZH))(_state())
-    zh_text = _system_text(calls[0]) + str(calls[0][1].content)
-    assert "你是 **Orchestrator**" in zh_text
-    assert "以下是供你分析的输入" in zh_text
-
-    calls.clear()
-    await orchestrator_mod.OrchestratorNode(_ctx(PromptLanguage.EN))(_state())
-    en_text = _system_text(calls[0]) + str(calls[0][1].content)
-    assert "You are the **Orchestrator**" in en_text
 
 
 # ---------------------------------------------------------------------------

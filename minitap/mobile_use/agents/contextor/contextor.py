@@ -557,7 +557,7 @@ class ContextorNode:
         MAX_AGENTS_THOUGHTS = 25
 
         system_message = load_prompt_template(
-            Path(__file__).parent.joinpath("contextor.md"),
+            Path(__file__).parent.joinpath("prompts", "en", "contextor.md"),
             self.ctx.prompt_language,
         ).render(
             task_goal=initial_goal,

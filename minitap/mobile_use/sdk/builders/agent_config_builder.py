@@ -372,7 +372,7 @@ class AgentConfigBuilder:
         Set the default language the agent prompts are written in.
 
         ``"zh"`` loads the Chinese versions of the agent prompts (``*.md`` ->
-        ``*-zh.md``); ``"en"`` keeps the English originals.
+        ``prompts/zh/``); ``"en"`` keeps the English originals.
 
         This is the **agent-level** switch. A task can override it
         (``task.with_prompt_language(...)``), and when neither is set the

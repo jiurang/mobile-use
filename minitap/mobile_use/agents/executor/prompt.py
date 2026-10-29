@@ -6,8 +6,9 @@ provider 的缓存是前缀匹配。任何每轮变的内容放在中间，它�
 屏幕元素表每轮都变（每轮重抓屏），所以它必须排在局部历史之后。实测的差别很大：
 元素表排在历史前面，缓存命中率递减到 48%；排在历史后面，命中率递增到 93%。
 
-文案全部在 ``prompt_manifest.toml`` 列出的文件里：``prompts/system/`` 是稳定指令
-（SystemMessage），``prompts/messages/`` 是运行时块（HumanMessage）。本模块只负责
+文案全部在 ``prompt_manifest.toml`` 列出的文件里：``prompts/<lang>/system/`` 是稳定指令
+（SystemMessage），``prompts/<lang>/messages/<volatility>/`` 是运行时块（HumanMessage）。
+``<lang>`` 是 ``en`` / ``zh`` 两棵同构的树。本模块只负责
 挑数据、按 manifest 的 order 拼 system、按显式顺序拼消息列表，不再自带任何提示词
 散文。段边界、顺序、每段多久变一次都写在清单里 —— 这是「为什么它在这」的说明书。
 
@@ -17,7 +18,7 @@ provider 的缓存是前缀匹配。任何每轮变的内容放在中间，它�
 
 不要 bind_tools 那些设备工具。它们的 JSON schema 有 4,000+ token，而且不参与
 缓存键（实测），所以每轮都按满价计费。Executor 的工具用法靠
-``prompts/system/40-tools.md`` 里的文本工具表教，静态，可缓存。
+``prompts/<lang>/system/30-tools.md`` 里的文本工具表教，静态，可缓存。
 
 屏幕描述只有一种形态：统一元素表。Contextor 把所有平台的数据都建成
 ``state.latest_screen_elements`` —— 层级树形状认识时是 UI 行 + OCR 行，
@@ -26,8 +27,9 @@ iOS / 云设备这类不认识的形状只有 OCR 行。模型一律填 ``Target
 ``has_element_table``。
 
 一条感知是元素表（UI 行 + OCR 行）+ **按需视觉主体列表**。
-视觉主体由 Executor 自己调用 ``scan_visual_subjects`` 触发（见
-``prompts/system/30-vision.md`` 的 Visual perception 段）；框架只负责把最近一次
+视觉主体由 Executor 自己调用 ``scan_visual_subjects`` 触发（用法见
+``prompts/<lang>/system/30-tools.md`` 的工具表，回执见
+``prompts/<lang>/messages/per-turn/vision-subjects.md``）；框架只负责把最近一次
 扫描的缓存渲染成一块表，并在屏幕变化后清掉它。
 
 屏幕截图不进模型。prompt 里没有任何图，模型只有两条文字通道：元素表、
@@ -60,12 +62,10 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool
 
-from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template, pick
 from minitap.mobile_use.services.vision import VisionElement, render_vision_rows
 from minitap.mobile_use.tools.index import executor_wrappers, get_tools_from_wrappers
-from minitap.mobile_use.utils.failed_targets import describe_target
 from minitap.mobile_use.utils.message_content import (
     content_to_text,
     has_image_block,
@@ -76,6 +76,7 @@ from minitap.mobile_use.utils.thoughts_compaction import split_sentences
 from minitap.mobile_use.utils.time import format_task_started_at
 
 EXECUTOR_PROMPTS_DIR = Path(__file__).parent / "prompts"
+EXECUTOR_PROMPTS_EN = EXECUTOR_PROMPTS_DIR / "en"
 EXECUTOR_PROMPT_MANIFEST = Path(__file__).parent / "prompt_manifest.toml"
 
 
@@ -128,7 +129,7 @@ def _load_manifest() -> tuple[tuple[_PromptSection, ...], dict[str, _PromptMessa
             raise ValueError(f"prompt_manifest.toml: system 段 {name!r} 重名")
         if order in seen_orders:
             raise ValueError(f"prompt_manifest.toml: system 段 order={order} 重复")
-        if not (EXECUTOR_PROMPTS_DIR / rel).is_file():
+        if not (EXECUTOR_PROMPTS_EN / rel).is_file():
             raise ValueError(f"prompt_manifest.toml: system 段 {name!r} 的文件不存在：{rel}")
         when = row.get("when")
         if when is not None and when not in _WHEN_KEYS:
@@ -148,7 +149,7 @@ def _load_manifest() -> tuple[tuple[_PromptSection, ...], dict[str, _PromptMessa
             raise ValueError(
                 f"prompt_manifest.toml: message 块 {name!r} 的 volatility={volatility!r} 未知"
             )
-        if not (EXECUTOR_PROMPTS_DIR / rel).is_file():
+        if not (EXECUTOR_PROMPTS_EN / rel).is_file():
             raise ValueError(f"prompt_manifest.toml: message 块 {name!r} 的文件不存在：{rel}")
         messages[name] = _PromptMessage(name=name, file=rel, volatility=volatility)
 
@@ -179,7 +180,7 @@ def render_system(
     for section in _SECTIONS:
         if section.when is not None and not values.get(section.when):
             continue
-        text = _render(EXECUTOR_PROMPTS_DIR / section.file, values, language=language)
+        text = _render(EXECUTOR_PROMPTS_EN / section.file, values, language=language)
         if text:
             chunks.append(text)
     return "\n\n".join(chunks)
@@ -193,7 +194,7 @@ def _render_message(
 ) -> str:
     """渲染一个运行时块；名字必须是 manifest 里声明过的。"""
     message = _MESSAGES[name]
-    return _render(EXECUTOR_PROMPTS_DIR / message.file, values, language=language)
+    return _render(EXECUTOR_PROMPTS_EN / message.file, values, language=language)
 
 
 #: 工具表的「说明」列（英文在前、中文在后）。
@@ -311,10 +312,6 @@ def render_executor_system(ctx: MobileUseContext) -> str:
     在换子目标时全部重算。目标走独立的消息块（``goal``，见
     ``build_executor_messages`` 的第 2 项），子目标内它是恒定的。
 
-    ``vision_enabled`` 是感知开关的状态：一次运行里恒定，所以它只决定
-    ``30-vision.md`` 装不装，不伤缓存。条件判断留在 Python，模板里没有
-    ``{% if %}``。
-
     语言跟着 ``ctx.prompt_language`` 走；每个段独立回落 —— 缺哪段的中文版，
     只有那一段变英文（见 ``load_prompt_template``）。
     """
@@ -324,7 +321,6 @@ def render_executor_system(ctx: MobileUseContext) -> str:
             "executor_tools_table": format_executor_tools_table(
                 ctx, language=ctx.prompt_language
             ),
-            "vision_enabled": ctx.perception.vision,
         },
         language=ctx.prompt_language,
     )
@@ -338,31 +334,6 @@ def render_task_started(task_started_at: str, *, language: PromptLanguage) -> st
 def render_goal_message(goal: str, *, language: PromptLanguage) -> str:
     """目标陈述块（子目标内恒定，排在局部历史之前才能被缓存覆盖）。"""
     return _render_message("goal", language=language, goal=goal)
-
-
-def render_previous_attempt(report: ExecutorReport, *, language: PromptLanguage) -> str:
-    """上一轮尝试的事实摘要（Cortex 在轮起点注入，是新一轮局部历史的第一条）。
-
-    为什么需要它：局部历史按「轮」清空（一轮 = 一次执行尝试）。清空挡住了跨轮
-    的线性增长，但模型也会忘掉「哪条路已经走不通」—— 上一轮汇报里的 summary、
-    结束原因和失败目标正好是这个信息。压成一条消息带过来，它的长度只跟失败条数
-    有关，不随步数增长。
-
-    失败目标用 ``describe_target``（**不带 index**）：索引每轮重编号，带进新一轮
-    会让模型去点一个完全无关的元素（见 ``utils/failed_targets.py`` 的说明）。
-    """
-    bits: list[str] = []
-    for target in report.failed_targets or []:
-        identity = describe_target(label=target.label or None, resource_id=target.resource_id)
-        bits.append(f"{identity} ({target.reason[:80]})" if target.reason else identity)
-    return _render_message(
-        "previous_attempt",
-        language=language,
-        outcome=report.outcome,
-        summary=report.summary,
-        reason=report.failure_reason or report.blocked_reason or "",
-        failed_targets="; ".join(bits),
-    )
 
 
 def render_device_state(
@@ -398,7 +369,9 @@ def render_screen_message(elements: list[ScreenElement] | None, *, language: Pro
 
 def render_dispatch_rejection(reason: str, *, language: PromptLanguage) -> str:
     """动作没被派发时的回灌（不是 ToolMessage：那份没有对应的 tool_call）。"""
-    return _render_message("dispatch_rejection", language=language, reason=reason)
+    return _render_message(
+        "dispatch_rejection", language=language, block="dispatch_rejection", reason=reason
+    )
 
 
 def render_vision_subjects_message(
@@ -417,12 +390,12 @@ def render_vision_subjects_message(
 
 def render_retry_nudge(reason: str | None, *, language: PromptLanguage) -> str:
     """解析失败后重试一次时的提醒，必须带上具体的失败原因。"""
-    return _render_message("retry", language=language, reason=reason)
+    return _render_message("retry", language=language, block="retry", reason=reason)
 
 
 def render_extra_actions_notice(count: int, *, language: PromptLanguage) -> str:
     """一轮只执行第一个动作时，告诉模型其余动作没有被执行。"""
-    return _render_message("extra_actions", language=language, count=count)
+    return _render_message("extra_actions", language=language, block="extra_actions", count=count)
 
 
 def render_step_limit_message(limit: int, *, language: PromptLanguage) -> str:
@@ -467,6 +440,7 @@ def render_stall_notice(
     return _render_message(
         "stall_notice",
         language=language,
+        block="stall_notice",
         kind=kind,
         repeats=repeats,
         window=window,

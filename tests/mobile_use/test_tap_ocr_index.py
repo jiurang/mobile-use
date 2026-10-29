@@ -33,17 +33,14 @@ def ocr(text: str, x: int, y: int, w: int = 200, h: int = 60) -> OcrText:
 
 def make_state(ocr_results: list[OcrText] | None) -> State:
     return State(
-        messages=[],
         initial_goal="g",
         subgoal_plan=[],
         latest_ui_hierarchy=None,
         latest_ocr_results=ocr_results,
         focused_app_info=None,
         device_date=None,
-        structured_decisions=None,
         complete_subgoals_by_ids=[],
         executor_messages=[],
-        cortex_last_thought=None,
         agents_thoughts=[],
     )
 

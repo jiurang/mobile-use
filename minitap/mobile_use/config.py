@@ -261,15 +261,23 @@ LLMUtilsNode = Literal["outputter", "hopper", "video_analyzer"]
 LLMUtilsNodeWithFallback = LLMUtilsNode
 AgentNode = Literal[
     "planner",
+    # 2026-10-29：orchestrator 节点已移除（改为纯代码 plan_manager）。
+    # 角色保留是为了兼容既有 llm-config / LLMConfig(...) 构造点；
+    # 没有任何节点再调用 get_llm("orchestrator")。
     "orchestrator",
     "contextor",
     "cortex",
     "executor",
+    # 2026-10-29：reporter 节点已合并进 cortex（汇报是纯代码），本角色不再被
+    # 任何节点调用。保留是为了兼容既有 llm-config / LLMConfig(...) 构造点。
     "reporter",
     # 视觉扫描（`scan_visual_subjects`）用的小调用。**不是决策 agent**：它只看
     # 一张截图、列出当屏全部视觉主体。单独成一个角色是为了能指向 grounding 更强的
     # 模型 —— 真机实测（2026-10-28）：不同模型对图标、图片的框质量差别很大。
     "vision",
+    # 纯代码节点：只写计划状态和路由，不调 LLM。列进来是为了 thoughts 归因
+    # （`state.asanitize_update(agent="plan_manager")`）。
+    "plan_manager",
 ]
 AgentNodeWithFallback = AgentNode
 
@@ -421,14 +429,15 @@ class LLMConfigUtils(BaseModel):
 
 class LLMConfig(BaseModel):
     planner: LLMWithFallback
+    # 2026-10-29：Orchestrator 节点已移除，本字段不再被任何节点读取。
+    # 保留是为了兼容既有 llm-config 文件和 LLMConfig(...) 构造点；
+    # 后续可以单独做一次配置清理。
     orchestrator: LLMWithFallback
     contextor: LLMWithFallback
     cortex: LLMWithFallback
     executor: LLMWithFallback
-    # Reporter 是**可选**角色：能单独配 LLM，但不是必填。
-    # 做成必填会打断仓库里 22 处 `LLMConfig(...)` 构造点（probe 脚本 / example / 测试），
-    # 全部变成 ValidationError（doc/executor-autonomy-plan.md 附录 A.1、审计发现 E6）。
-    # None = 没单独配 → get_agent() 回落到 executor 的配置。
+    # 2026-10-29：Reporter 节点已合并进 cortex（汇报是纯代码），本字段不再被
+    # 读取。保留是为了兼容既有 llm-config 文件和 LLMConfig(...) 构造点。
     reporter: LLMWithFallback | None = None
     # 视觉扫描模型。**可选**：None = 没单独配 → get_agent() 回落 executor，
     # 行为与引入这个角色之前一字不差。
@@ -447,10 +456,9 @@ class LLMConfig(BaseModel):
         self.contextor.validate_provider("Contextor")
         self.cortex.validate_provider("Cortex")
         self.executor.validate_provider("Executor")
-        # Reporter 没配就不校验：它走回落，用的是 executor 那条渠道的密钥。
-        if self.reporter:
-            self.reporter.validate_provider("Reporter")
-        # Vision 同理：没单独配就走回落，用的是 executor 的配置。
+        # Reporter 已不再被调用（汇报是纯代码），所以**不校验**它的渠道：
+        # 老配置里留着 reporter 段不该再向部署索要一把用不上的密钥。
+        # Vision 没单独配就走回落，用的是 executor 的配置。
         if self.vision:
             self.vision.validate_provider("Vision")
         self.utils.outputter.validate_provider("Outputter")
@@ -459,7 +467,7 @@ class LLMConfig(BaseModel):
             self.utils.video_analyzer.validate_provider("VideoAnalyzer")
 
     def __str__(self):
-        # Reporter 没单独配时要说清它回落自谁 —— 配置里看不出「谁在跑」是最难查的一类故障。
+        # Reporter 已不再是节点（汇报由 cortex 用纯代码构建），配置里留着它也不会被用到。
         reporter = (
             self.reporter if self.reporter is not None else f"↩️ Executor fallback ({self.executor})"
         )
@@ -468,11 +476,11 @@ class LLMConfig(BaseModel):
         )
         return f"""
 📃 Planner: {self.planner}
-🎯 Orchestrator: {self.orchestrator}
+🎯 Orchestrator (legacy, unused): {self.orchestrator}
 🔍 Contextor: {self.contextor}
 🧠 Cortex: {self.cortex}
 🛠️ Executor: {self.executor}
-📰 Reporter: {reporter}
+📰 Reporter (legacy, unused): {reporter}
 👁️ Vision: {vision}
 🧩 Utils:
     🔽 Hopper: {self.utils.hopper}
@@ -481,11 +489,13 @@ class LLMConfig(BaseModel):
 """
 
     def get_agent(self, item: AgentNode) -> LLMWithFallback:
+        if item == "plan_manager":
+            raise ValueError("plan_manager is a code-only node; it has no LLM configuration")
         value = getattr(self, item)
         # 可选角色（reporter / vision）：没单独配就回落 Executor。
-        # reporter 只写摘要 + 挑证据，快模型就够（doc/executor-autonomy-plan.md
-        # §2.1.1、附录 A.1）；vision 是「看一张截图、答一个框」的小调用，默认
-        # 与 executor 同档，想换 grounding 更强的模型时单独配。
+        # reporter 自 2026-10-29 起已无调用方，这里保留回落只是为了老配置不炸；
+        # vision 是「看一张截图、答一个框」的小调用，默认与 executor 同档，
+        # 想换 grounding 更强的模型时单独配。
         if value is None:
             return self.executor
         return value

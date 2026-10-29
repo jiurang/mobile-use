@@ -25,12 +25,13 @@
 # ``max_steps`` **从来没有**被当成动作步执行过。它只被乘进 super-step 上限
 # （``sdk/agent.py::compute_recursion_limit``：``N × 9 + 32``），
 # 而真实循环里**一个动作步 ≈ 3 个 super-step**
-# （contextor + executor + executor_tools；Summarizer 已于 2026-10-29 移除）。
-# ⇒ N=80 实际放行 ``(752 − 3 − 6S) / 3 ≈ 230~244`` 个动作步，
-# 是名义值的 **约 2.9~3.0 倍**。
+# （contextor + executor + executor_tools；Summarizer 与 convergence 节点
+# 已于 2026-10-29 移除）。
+# ⇒ N=80 实际放行 ``(752 − 2 − 2S) / 3 ≈ 243~248`` 个动作步，
+# 是名义值的 **约 3.0~3.1 倍**。
 #
-# 最坏情况仍是每个动作步 9 个 super-step（每个动作步都自成子目标，K=0），
-# 所以 ``SUPER_STEPS_PER_ACTION_STEP`` 保持 9 —— 它是天花板，不是典型值。
+# 实际最坏是每个动作步 5 个 super-step（每个动作步都自成子目标，K=0）；
+# ``SUPER_STEPS_PER_ACTION_STEP`` 保持 9，是比实际最坏更保守的天花板。
 #
 # 真机实测（mobile-manager execution 880，Summarizer 移除前）：跑了 **186**
 # 个动作步才撞上限 —— 正好落在当时 4 super-step/动作步的区间里。
