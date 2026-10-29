@@ -250,6 +250,33 @@ async def test_scan_on_a_screen_that_turned_off_is_refused(monkeypatch):
     assert "screen is off" in reason
 
 
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_scan_prompt_defines_granularity_and_box_rules(language):
+    """提示词必须讲清「最小有意义单位」和框的尺度，而不只是「列出图标」。"""
+    text = vision.scan_system_prompt(SimpleNamespace(prompt_language=language))
+
+    assert "0-1000" in text
+    assert "30-120" in text or "30~120" in text
+    assert "smallest" in text.lower() or "最小有意义单位" in text
+    assert "container" in text.lower() or "容器" in text
+    assert str(vision.MAX_SUBJECTS) in text
+
+
+def test_scan_prompt_reads_the_chinese_variant():
+    text = vision.scan_system_prompt(SimpleNamespace(prompt_language="zh"))
+
+    assert "视觉主体" in text
+    assert "归一化" in text
+
+
+def test_scan_prompt_limit_follows_the_constant(monkeypatch):
+    monkeypatch.setattr(vision, "MAX_SUBJECTS", 7)
+
+    text = vision.scan_system_prompt(SimpleNamespace(prompt_language="en"))
+
+    assert "at most 7" in text
+
+
 # ---------------------------------------------------------------------------
 # Target.vision_index 反解
 # ---------------------------------------------------------------------------

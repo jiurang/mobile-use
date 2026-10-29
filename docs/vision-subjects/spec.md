@@ -11,7 +11,10 @@
 > - `epoch` 由元素表（或 OCR）内容派生，取代 `vision_scan_fingerprint`；
 > - `vision_elements` 只属于帧：新帧 `epoch` 相同才继承，不同即作废；
 > - `state` 不再有 `vision_elements` / `vision_scan_fingerprint`；
-> - 工具回执只报数量，编号表只在每轮 Executor prompt 里出现一次。
+> - 工具回执只报数量，编号表只在每轮 Executor prompt 里出现一次；
+> - 扫描的系统提示词移出 Python 内联字符串，改放
+>   `services/prompts/<lang>/vision_scan.md`（只保留主体粒度、排除项、框的
+>   紧度与尺度、描述口径、排序上限；上限由 `MAX_SUBJECTS` 注入）。
 >
 > 接口也随之改名：`scan_current_screen` → `scan_frame(ctx, frame)`，
 > `render_vision_scan_result` → `render_scan_receipt(count)`；

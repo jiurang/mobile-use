@@ -38,19 +38,24 @@ Executor 先描述目标、再让 vision 去找，等于让它猜屏上有什么
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.perception.frame import ScreenFrame, VisionElement
-from minitap.mobile_use.prompt_language import PromptLanguage, pick
+from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template, pick
 from minitap.mobile_use.services.llm import get_structured_llm, invoke_llm_with_timeout_message
 from minitap.mobile_use.utils.image_compress import compress_screenshot_base64
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.ui_hierarchy import ElementBounds
 
 logger = get_logger(__name__)
+
+#: 视觉扫描的系统提示词按语言分目录，英文是基准（``load_prompt_template``
+#: 会把路径里的 ``en`` 段换成 ``zh``）。
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 #: 发给视觉模型的 JPEG 质量，与 OCR / 旧截图通道一致（q50 实测可读）。
 SCREENSHOT_JPEG_QUALITY = 50
@@ -118,36 +123,16 @@ def bounds_from_normalized_box(
 
 
 def scan_system_prompt(ctx: MobileUseContext) -> str:
-    """视觉扫描的系统提示词。
+    """视觉扫描的系统提示词（``services/prompts/<lang>/vision_scan.md``）。
 
-    只讲三件事：什么算视觉主体、坐标口径、看不见怎么办。刻意保持短 ——
-    这是一次独立的小调用，不是 Executor 的决策提示词。
+    它只服务「列清单」这一件事：定义主体粒度、排除项、框的紧度与尺度、
+    描述口径和排序上限。刻意不写 Executor 的决策规则，也不写示例与自检 ——
+    这是一次独立的小调用，指令越短，模型越容易照着做。
+
+    ``max_subjects`` 由常量传入，避免提示词里的数字和 ``MAX_SUBJECTS`` 漂移。
     """
-    return pick(
-        "You inventory the visual subjects in a phone screenshot. A visual subject is "
-        "anything whose meaning is carried by pixels rather than readable text: icons, "
-        "photos, illustrations, avatars, video thumbnails, canvas or custom-drawn "
-        "graphics, and buttons with no label.\n"
-        "List every distinct visual subject you can see. Skip plain text, paragraphs, "
-        "clocks, battery indicators and decorative separators.\n"
-        "For each subject return:\n"
-        "- description: 3-15 words saying what it is and where it is (e.g. 'gear icon, "
-        "top right', 'photo of a red-roofed house in the middle of the feed').\n"
-        "- bounding box x1,y1,x2,y2 normalized to 0-1000 (0,0 is the top-left corner, "
-        "1000,1000 is the bottom-right).\n"
-        "Return at most 20 subjects, most prominent or actionable first. Never invent a "
-        "subject that is not visibly there; if there are none, return an empty list.",
-        "你在清点一张手机截图里的视觉主体。视觉主体指含义由像素而不是可读文字承载的"
-        "东西：图标、照片、插画、头像、视频封面、画布或自绘图形，以及没有文字标签"
-        "的按钮。\n"
-        "请列出所有彼此可区分的视觉主体。纯文字、段落、时钟、电量、装饰分隔线请跳过。\n"
-        "每个主体返回两项：\n"
-        "- description：3~15 个字，说清「是什么 + 在哪」（例如「齿轮图标，右上角」"
-        "「红屋顶房子的照片，信息流中间」）。\n"
-        "- 边界框 x1,y1,x2,y2，归一化到 0-1000（左上角是 0,0，右下角是 1000,1000）。\n"
-        "最多 20 项，按显眼或可操作程度排序。看不见的东西一律不要编造；如果"
-        "一个都没有，返回空列表。",
-        language=ctx.prompt_language,
+    return load_prompt_template(_PROMPTS_DIR / "en" / "vision_scan.md", ctx.prompt_language).render(
+        max_subjects=MAX_SUBJECTS
     )
 
 
