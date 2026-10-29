@@ -3,7 +3,7 @@
 这个文件定义两个模型：一个收模型的话，一个给上层看。
 
 :class:`ExecutorOutput` 是 Executor 的 LLM 每轮吐的东西。它不含 16 个设备工具的
-JSON schema：Executor 只绑定这一个结构化输出 schema，工具的用法靠 ``executor.md``
+JSON schema：Executor 只绑定这一个结构化输出 schema，工具的用法靠 ``prompts/system/40-tools.md``
 里的文本工具表教（365 token，静态可缓存）。绑定全量 schema 会让每轮多背 4,008
 token，而那份 schema 不进缓存键，所以每轮都按满价计费（实测，见
 ``docs/智能体协作v2.md``）。

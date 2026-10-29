@@ -750,7 +750,7 @@ def test_new_parse_succeeds_exactly_where_the_old_one_succeeded():
 
 
 def test_executor_prompt_does_not_promise_empty_actions_is_valid():
-    """``executor.md`` 以前写着「空的 actions 是合法答案」，运行时却拒它。
+    """Executor 的提示词以前写着「空的 actions 是合法答案」，运行时却拒它。
 
     提示词说合法、运行时判非法 ⇒ 模型在「我卡住了」和「我得给个动作」之间
     横跳。现在提示词必须和运行时一致。
@@ -762,9 +762,13 @@ def test_executor_prompt_does_not_promise_empty_actions_is_valid():
     ⚠️ 2026-10-28：新增 `failed` 出口后，合法收尾变成 `done` 或 `failed`，
     措辞同步成「required unless `done`/`failed`, empty when done or failed」。
     """
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
+    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPTS_DIR
 
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(EXECUTOR_PROMPTS_DIR.rglob("*.md"))
+        if not path.stem.endswith("-zh")
+    )
     assert "An empty `actions` is a valid answer" not in text
     assert "required unless `done`/`failed`, empty when done or failed" in text
 
@@ -774,7 +778,11 @@ def test_executor_prompt_says_executor_output_is_the_only_tool():
 
     ⚠️ 2026-10-24：措辞被压缩过（现在是「Answer only by calling `ExecutorOutput`」）。
     """
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
+    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPTS_DIR
 
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(EXECUTOR_PROMPTS_DIR.rglob("*.md"))
+        if not path.stem.endswith("-zh")
+    )
     assert "only by calling `ExecutorOutput`" in text

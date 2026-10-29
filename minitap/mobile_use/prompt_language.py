@@ -71,7 +71,7 @@ PROMPT_LANGUAGE_ENV = "MOBILE_USE_PROMPT_LANGUAGE"
 
 #: 中文版文件名的后缀候选，按优先级排。
 #:
-#: * ``-zh`` —— **现行约定**（``executor-zh.md``、本次新增的一批）。
+#: * ``-zh`` —— **现行约定**（``00-identity-zh.md``、本次新增的一批）。
 #: * ``.zh`` —— 历史遗留（``cortex.zh.md``）。不认它，那个文件会被静默回落成英文。
 ZH_SUFFIXES: tuple[str, ...] = ("-zh", ".zh")
 

@@ -1,0 +1,117 @@
+# Executor 的提示词清单。
+#
+# 两条车道，语义不同，不要混：
+#
+#   [[system]]  稳定指令 -> SystemMessage。整场运行逐字节稳定，才吃得到前缀缓存。
+#   [[message]] 运行时块 -> HumanMessage。顺序由 prompt.build_executor_messages
+#               显式决定（越靠后，越晚失效）；这里的 file / volatility 只描述
+#               「它是什么、多久变一次」，不参与排序。
+#
+# 约定：
+#   - system 段的文本只做 `{{var}}` 插值；条件和派生数据留在 prompt.py。
+#   - `when` 由 Python 传入的布尔值决定这一段是否参与组装。
+#   - 某个段缺 `-zh` 同名文件时，只回落这一段，不整份回落。
+
+[[system]]
+name = "identity"
+order = -100
+file = "system/00-identity.md"
+
+[[system]]
+name = "loop"
+order = 10
+file = "system/10-loop.md"
+
+[[system]]
+name = "perception"
+order = 20
+file = "system/20-perception.md"
+
+[[system]]
+name = "vision"
+order = 30
+file = "system/30-vision.md"
+when = "vision_enabled"
+
+[[system]]
+name = "tools"
+order = 40
+file = "system/40-tools.md"
+
+[[system]]
+name = "output"
+order = 50
+file = "system/50-output.md"
+
+# --- 运行时消息块 ---------------------------------------------------------
+# volatility:
+#   per-task   整场运行不变（任务开始时间）
+#   per-goal   子目标内不变（目标陈述）
+#   per-turn   每轮重建（设备状态 / 元素表 / 视觉主体）
+#   occasional 偶发（拒绝 / 重试 / 丢弃动作 / 停滞提醒）
+#   terminal   收尾（步数上限 / 无目标 / done / failed）
+
+[[message]]
+name = "task_started"
+file = "messages/task-started.md"
+volatility = "per-task"
+
+[[message]]
+name = "goal"
+file = "messages/goal.md"
+volatility = "per-goal"
+
+[[message]]
+name = "device_state"
+file = "messages/device-state.md"
+volatility = "per-turn"
+
+[[message]]
+name = "screen_elements"
+file = "messages/screen-elements.md"
+volatility = "per-turn"
+
+[[message]]
+name = "vision_subjects"
+file = "messages/vision-subjects.md"
+volatility = "per-turn"
+
+[[message]]
+name = "dispatch_rejection"
+file = "messages/dispatch-rejection.md"
+volatility = "occasional"
+
+[[message]]
+name = "retry"
+file = "messages/retry.md"
+volatility = "occasional"
+
+[[message]]
+name = "extra_actions"
+file = "messages/extra-actions.md"
+volatility = "occasional"
+
+[[message]]
+name = "stall_notice"
+file = "messages/stall-notice.md"
+volatility = "occasional"
+
+[[message]]
+name = "step_limit"
+file = "messages/step-limit.md"
+volatility = "terminal"
+
+[[message]]
+name = "no_goal"
+file = "messages/no-goal.md"
+volatility = "terminal"
+
+[[message]]
+name = "done_fallback"
+file = "messages/done-fallback.md"
+volatility = "terminal"
+
+[[message]]
+name = "failed_fallback"
+file = "messages/failed-fallback.md"
+volatility = "terminal"

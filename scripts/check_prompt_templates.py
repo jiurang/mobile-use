@@ -4,9 +4,11 @@
 代价是真机上跑完整条任务才炸 TemplateSyntaxError —— agent 已经启动、已经在点屏幕，
 最后一步渲染 prompt 时才崩。模板必须能在不接设备的情况下先编一遍。
 
-这里的变量表逐条抄自各 agent 真实的 `.render(...)` 调用点（cortex.py / planner.py /
-executor.py / contextor.py / orchestrator.py / hopper.py / video_analyzer.py /
-reporter.py），所以它既能挡住语法错，也能挡住「模板引用了代码从没传过的变量」。
+这里的变量表：其他 agent 逐条抄自真实的 `.render(...)` 调用点（cortex.py /
+planner.py / contextor.py / orchestrator.py / hopper.py / video_analyzer.py /
+reporter.py）；Executor 已按 `prompt_manifest.toml` 拆段，变量表由清单生成
+（40 多个小文件逐条登记容易漏）。所以它既能挡住语法错，也能挡住「模板引用了
+代码从没传过的变量」。
 
 可用变量取值要覆盖两种分支：{% if x %} 只跑一种取值时，少写的 {% else %} / {% endif %}
 依然编得过，所以 locked_app_package / video_recording_enabled 都要试 None 与真值。
@@ -19,12 +21,68 @@ reporter.py），所以它既能挡住语法错，也能挡住「模板引用了
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 from jinja2 import Environment, StrictUndefined
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
+
+# Executor 的提示词按 manifest 拆成 system / messages 两组文件；变量表由清单生成，
+# 新增一段只要在 toml 里登记，这里的覆盖度检查会自动跟上。
+EXECUTOR_DIR = AGENTS_DIR / "executor"
+EXECUTOR_PROMPTS = EXECUTOR_DIR / "prompts"
+EXECUTOR_MANIFEST = EXECUTOR_DIR / "prompt_manifest.toml"
+
+EXECUTOR_SYSTEM_VARS: dict[str, object] = {
+    "platform": "android",
+    "executor_tools_list": "tools",
+    "vision_enabled": True,
+}
+
+EXECUTOR_MESSAGE_VARS: dict[str, dict[str, object]] = {
+    "task_started": {"task_started_at": "2026-10-28 10:00"},
+    "goal": {"goal": "进入 WLAN 页面"},
+    "device_state": {
+        "device_date": "2026-10-28",
+        "focused_app_info": "设置",
+        "screen_off": True,
+        "no_perception": True,
+    },
+    "screen_elements": {"rows": '[1] "WLAN" | Class | (0,0,10,10) | C'},
+    "vision_subjects": {"rows": '[1] "齿轮图标" (0,0,10,10)'},
+    "dispatch_rejection": {"reason": "tap is not a known tool"},
+    "retry": {"reason": "the answer was not an ExecutorOutput object"},
+    "extra_actions": {"count": 2},
+    "stall_notice": {"description": "same target tapped 3 times"},
+    "step_limit": {"limit": 30},
+    "no_goal": {},
+    "done_fallback": {},
+    "failed_fallback": {},
+}
+
+
+def _language_variants(rel: str) -> list[Path]:
+    """英文原版 + 存在的中文兄弟文件。缺中文版只回落那一段，不算错误。"""
+    base = EXECUTOR_PROMPTS / rel
+    zh = base.with_name(f"{base.stem}-zh{base.suffix}")
+    return [base, zh] if zh.is_file() else [base]
+
+
+def _executor_prompt_vars() -> dict[str, dict[str, object]]:
+    """把 manifest 里的每一段映射成「文件 -> 渲染变量」。"""
+    manifest = tomllib.loads(EXECUTOR_MANIFEST.read_text(encoding="utf-8"))
+    entries: dict[str, dict[str, object]] = {}
+    for row in manifest.get("system", []):
+        for path in _language_variants(row["file"]):
+            entries[path.relative_to(AGENTS_DIR).as_posix()] = dict(EXECUTOR_SYSTEM_VARS)
+    for row in manifest.get("message", []):
+        for path in _language_variants(row["file"]):
+            entries[path.relative_to(AGENTS_DIR).as_posix()] = dict(
+                EXECUTOR_MESSAGE_VARS[row["name"]]
+            )
+    return entries
 
 
 class _Perception:
@@ -92,27 +150,8 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
         "initial_goal": "打开快手赚钱",
         "previous_plan": "subgoal-0",
         "agent_thoughts": "thought",
-    },  # executor.py 的 system prompt 渲染（契约 W1.1）—— 三个变量，缺一不可。
-    # 目标**不在** system prompt 里：它每换一个子目标就变，放进静态块会让
-    # 整段缓存从目标那一行起全部重算。目标走紧随其后的 `goal_message` 消息块。
-    # 实测依据见 tools/index.py:69-89：system prompt 内部 58% 处一断，
-    # 缓存从 10,477 token 掉到 1,169。
-    #
-    # `perception` 是**感知通道开关状态**（Manager 侧）：两条通道开着哪几条，
-    # 提示词里要写清楚 —— 否则模型会按一个被关掉的通道去寻址。
-    # 一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
-    "executor/executor.md": {
-        "platform": "android",
-        "executor_tools_list": "tools",
-        "perception": _Perception(True, True),
     },
-    # executor.md 的中文兄弟文件。代码块、jinja 变量与英文版逐字节对齐，
-    # 所以渲染变量表也保持一致。
-    "executor/executor-zh.md": {
-        "platform": "android",
-        "executor_tools_list": "tools",
-        "perception": _Perception(True, True),
-    },
+    # Executor 的 system / messages 在下方由 manifest 生成，这里不逐条登记。
     # reporter.md **完全静态**：没有任何模板变量。Reporter 只写 summary + 挑
     # evidence，outcome / actions_taken / failed_targets 全由代码填（见
     # agents/executor/types.py:ExecutorReport），所以它不需要模板变量。
@@ -176,8 +215,22 @@ TEMPLATE_VARS: dict[str, dict[str, object]] = {
     },
 }
 
+TEMPLATE_VARS.update(_executor_prompt_vars())
+
 # 这些变量在生产里取值可能为 None，每个取值都要编一遍。
-OPTIONAL_VARS = ("locked_app_package", "video_recording_enabled")
+OPTIONAL_VARS = (
+    "locked_app_package",
+    "video_recording_enabled",
+    # Executor system：只控制 vision 段装不装，模板本身不读这个变量。
+    "vision_enabled",
+    # Executor device-state：每个标志为真/为假两条路径都要编到。
+    "device_date",
+    "focused_app_info",
+    "screen_off",
+    "no_perception",
+    # Executor retry / dispatch：失败原因可能缺省。
+    "reason",
+)
 
 
 def _branches(base: dict[str, object]) -> list[dict[str, object]]:
@@ -206,6 +259,8 @@ def check() -> tuple[int, list[str]]:
     uncovered = sorted(on_disk - set(TEMPLATE_VARS))
     for rel in uncovered:
         failures.append(f"{rel}: 磁盘上存在但未登记渲染变量，无法校验")
+    for rel in sorted(set(TEMPLATE_VARS) - on_disk):
+        failures.append(f"{rel}: 变量表登记了但磁盘上不存在")
 
     for rel in sorted(set(TEMPLATE_VARS) & on_disk):
         path = AGENTS_DIR / rel

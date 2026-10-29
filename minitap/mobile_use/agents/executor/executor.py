@@ -6,7 +6,7 @@ Cortex 只给一个子目标（一句自然语言），Executor 自己看屏、�
 三处设计撑着这一环：
 
 - 不 bind_tools 设备工具。那 16 个工具的 schema 不进缓存键，每轮都按满价计费；
-  工具用法改由 ``executor.md`` 里的文本工具表教，只绑定 ``ExecutorOutput``
+  工具用法改由 ``prompts/system/40-tools.md`` 里的文本工具表教，只绑定 ``ExecutorOutput``
   一个结构化输出 schema。
 - dispatcher 拒绝动作时要把拒绝理由回灌给模型。退回 LLM 只会拿回同样的坏动作。
 - prompt 里每轮变化的内容（屏幕元素表）一律放最后，避免破坏前缀缓存。
@@ -295,7 +295,7 @@ class ExecutorNode:
         只绑定 ``ExecutorOutput`` 一个 schema（见 ``get_structured_llm``）。
         解析失败不返回 None，内部会降级成「空动作 + 说明」。
         """
-        # 设备状态模板块，措辞在 executor.md / executor-zh.md 里：
+        # 设备状态模板块，措辞在 prompts/messages/device-state.md 里：
         # 息屏 / 无感知通道要告知模型，否则它会在黑屏上反复尝试。
         device_state = render_device_state(
             device_date=state.device_date,

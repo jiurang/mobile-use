@@ -10,7 +10,7 @@ from minitap.mobile_use.tools.mobile.long_press_on import long_press_on_wrapper
 # 🔴 **2026-10-23 临时停用宏（脚本）工具。**
 #
 # 三个宏工具（`find_macros` / `save_macro` / `run_macro`）不再注册给 Executor，
-# 提示词里对应的工具表行也一并摘掉了（`agents/executor/executor.md`）。
+# 提示词里对应的工具表行也一并摘掉了（`agents/executor/prompts/system/40-tools.md`）。
 #
 # **只摘 LLM 面向的这一层**，宏引擎本体（`minitap/mobile_use/macros/`）和三个工具的
 # 实现（`tools/mobile/macros.py`）都**原封不动** —— 恢复只要把下面三行注释解开。
@@ -36,7 +36,7 @@ from minitap.mobile_use.tools.mobile.wake_screen import wake_screen_wrapper
 # 🔴 **2026-10-23 临时停用笔记（scratchpad）工具。**
 #
 # 三个笔记工具（`save_note` / `read_note` / `list_notes`）不再注册给 Executor，
-# 提示词里对应的工具表行也一并摘掉了（`agents/executor/executor.md`）。
+# 提示词里对应的工具表行也一并摘掉了（`agents/executor/prompts/system/40-tools.md`）。
 #
 # **只摘 LLM 面向的这一层**：`tools/scratchpad.py` 的实现和 `graph/state.py` 里的
 # `scratchpad` 字段都**原封不动** —— 恢复只要把下面几行注释解开。

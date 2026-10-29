@@ -18,13 +18,14 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType
 
-from jinja2 import Environment, StrictUndefined
+from jinja2 import Environment, StrictUndefined, meta
 
 ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = ROOT / "scripts" / "check_prompt_templates.py"
 _AGENTS_DIR = ROOT / "minitap" / "mobile_use" / "agents"
-_EXECUTOR_MD = _AGENTS_DIR / "executor" / "executor.md"
-_EXECUTOR_ZH_MD = _AGENTS_DIR / "executor" / "executor-zh.md"
+_EXECUTOR_DIR = _AGENTS_DIR / "executor"
+_EXECUTOR_PROMPTS = _EXECUTOR_DIR / "prompts"
+_EXECUTOR_MANIFEST = _EXECUTOR_DIR / "prompt_manifest.toml"
 _REPORTER_MD = _AGENTS_DIR / "reporter" / "reporter.md"
 
 
@@ -41,20 +42,27 @@ def _render(template_path: Path, variables: dict[str, object]) -> str:
     return env.from_string(template_path.read_text(encoding="utf-8")).render(**variables)
 
 
-def _render_executor_system(variables: dict[str, object], path: Path = _EXECUTOR_MD) -> str:
-    """Executor 的模板是宏库：正文的渲染入口是 `system_message` 宏。"""
-    env = Environment(undefined=StrictUndefined, autoescape=False)
-    template = env.from_string(path.read_text(encoding="utf-8"))
-    return template.module.system_message(**variables)
+def _manifest() -> dict:
+    import tomllib
+
+    return tomllib.loads(_EXECUTOR_MANIFEST.read_text(encoding="utf-8"))
 
 
-def _perception(
-    ui_hierarchy: bool = True,
-    ocr: bool = True,
-    vision: bool = True,
-):
-    """感知开关的替身（和 `scripts/check_prompt_templates.py` 里的是同一个类）。"""
-    return _load()._Perception(ui_hierarchy, ocr, vision)
+def _prompt_files(*, zh: bool = False) -> list[Path]:
+    """Executor 的提示词文件：英文原版，或全部中文兄弟文件。"""
+    return [
+        path for path in sorted(_EXECUTOR_PROMPTS.rglob("*.md")) if path.stem.endswith("-zh") == zh
+    ]
+
+
+def _prompt_text(*, zh: bool = False) -> str:
+    return "\n".join(path.read_text(encoding="utf-8") for path in _prompt_files(zh=zh))
+
+
+def _prompt_file(rel: str, *, zh: bool = False) -> str:
+    """按相对路径取一个段，例如 ``system/40-tools``。"""
+    suffix = "-zh" if zh else ""
+    return (_EXECUTOR_PROMPTS / f"{rel}{suffix}.md").read_text(encoding="utf-8")
 
 
 def test_prompt_templates_render():
@@ -74,67 +82,106 @@ def test_every_agent_prompt_is_registered():
     assert on_disk - set(template_vars) == set(), "有 .md 没登记渲染变量，无法校验"
 
 
-def test_executor_template_declares_exactly_three_vars():
-    """executor.md 的 system_message 变量恰好三个：platform / executor_tools_list / perception。
-
-    多一个 → 渲染端要多传一个（调用点会对不上）；少一个 → 模板引用了没传的变量。
-
-    `perception` 是**感知通道开关状态**（Manager 侧）：两条通道开着哪几条，
-    提示词里必须写清楚 —— 否则模型会按一个被关掉的通道去寻址。
-    一次运行里它是恒定的 ⇒ 放 system prompt 不伤缓存。
-
-    目标**不是** system prompt 的变量：它每子目标变，只能走独立消息块。
-    """
-    template_vars = _load().TEMPLATE_VARS
-    assert set(template_vars["executor/executor.md"]) == {
-        "platform",
-        "executor_tools_list",
+def test_executor_manifest_is_the_single_source_of_order():
+    """段的顺序与名字只在 manifest 里；顺序是契约，不是排版。"""
+    sections = _manifest()["system"]
+    assert [s["name"] for s in sections] == [
+        "identity",
+        "loop",
         "perception",
-    }
-    assert set(template_vars["executor/executor-zh.md"]) == {
-        "platform",
-        "executor_tools_list",
-        "perception",
-    }
+        "vision",
+        "tools",
+        "output",
+    ]
+    assert [s["order"] for s in sections] == [-100, 10, 20, 30, 40, 50]
+    # 只有视觉段是条件段：开关由 Python 给，模板里不写 {% if %}。
+    assert [s.get("when") for s in sections] == [
+        None,
+        None,
+        None,
+        "vision_enabled",
+        None,
+        None,
+    ]
 
 
-def test_executor_templates_own_every_message_block():
-    """所有进 prompt 的块都必须是模板宏 —— 代码不再自带文案。
+def test_executor_system_sections_are_pure_interpolation():
+    """system 段只引用稳定变量，且模板里没有条件/循环。
 
-    宏名就是「块契约」：prompt.py / executor.py 按名字取，提示词作者只改
-    ``.md``。中英两份必须逐个对齐，缺一个就会在 zh 运行时回落成空串。
+    条件（视觉开关）在 manifest 的 ``when`` 里，由 Python 判断；模板只做
+    ``{{var}}``。目标、设备状态、元素表这些「每轮变」的变量一律不在 system 里。
     """
-    macros = (
-        "system_message",
-        "goal_message",
-        "device_state_message",
-        "screen_elements_message",
-        "dispatch_rejection_message",
-        "vision_subjects_message",
-        "retry_message",
-        "extra_actions_message",
-        "step_limit_message",
-        "no_goal_message",
-        "done_fallback_message",
-    )
-    for path in (_EXECUTOR_MD, _EXECUTOR_ZH_MD):
-        text = path.read_text(encoding="utf-8")
-        for macro in macros:
-            assert f"macro {macro}(" in text, f"{path.name} 缺少宏 {macro}"
+    env = Environment(undefined=StrictUndefined, autoescape=False)
+    used: set[str] = set()
+    for path in [*_prompt_files(), *_prompt_files(zh=True)]:
+        if "system" not in path.parts:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "{%" not in source, f"{path.name} 里出现了模板逻辑"
+        used |= meta.find_undeclared_variables(env.parse(source))
+
+    assert used == {"platform", "executor_tools_list"}
+
+
+def test_executor_manifest_owns_every_message_block():
+    """所有进 prompt 的运行时块都必须在 manifest 里声明，并且中英两份都在。"""
+    messages = _manifest()["message"]
+    assert [m["name"] for m in messages] == [
+        "task_started",
+        "goal",
+        "device_state",
+        "screen_elements",
+        "vision_subjects",
+        "dispatch_rejection",
+        "retry",
+        "extra_actions",
+        "stall_notice",
+        "step_limit",
+        "no_goal",
+        "done_fallback",
+        "failed_fallback",
+    ]
+    allowed = {"per-task", "per-goal", "per-turn", "occasional", "terminal"}
+    for row in messages:
+        path = Path(row["file"])
+        for suffix in ("", "-zh"):
+            variant = _EXECUTOR_PROMPTS / path.with_name(f"{path.stem}{suffix}{path.suffix}")
+            assert variant.is_file(), f"缺少消息块模板：{variant}"
+        assert row["volatility"] in allowed
 
 
 def test_executor_prompt_renders_without_leftover_placeholders():
     """渲染后不能残留 Jinja 占位符 —— 残留在 prompt 里等于给了模型一句废话。"""
-    rendered = _render_executor_system(
+    from minitap.mobile_use.agents.executor.prompt import render_system
+    from minitap.mobile_use.prompt_language import PromptLanguage
+
+    rendered = render_system(
         {
             "platform": "android",
             "executor_tools_list": "tap, back",
-            "perception": _perception(),
-        }
+            "vision_enabled": True,
+        },
+        language=PromptLanguage.EN,
     )
     assert "{{" not in rendered and "{%" not in rendered
     assert "You are the **Executor**" in rendered
     assert "## Tools" in rendered
+
+
+def test_executor_vision_section_follows_the_switch():
+    """视觉段只在开关打开时组装；关掉时其余 system 段原样保留。"""
+    from minitap.mobile_use.agents.executor.prompt import render_system
+    from minitap.mobile_use.prompt_language import PromptLanguage
+
+    values = {"platform": "android", "executor_tools_list": "tap"}
+    with_vision = render_system({**values, "vision_enabled": True}, language=PromptLanguage.EN)
+    without_vision = render_system({**values, "vision_enabled": False}, language=PromptLanguage.EN)
+
+    assert "## Visual perception" in with_vision
+    assert "scan_visual_subjects" in with_vision
+    assert "## Visual perception" not in without_vision
+    assert "## Perception" in without_vision
+    assert "## Tools" in without_vision
 
 
 def test_executor_system_prompt_does_not_carry_the_goal():
@@ -142,13 +189,13 @@ def test_executor_system_prompt_does_not_carry_the_goal():
 
     一旦内联，换子目标时整块 system 缓存从目标那一行起全部重算。
     """
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    system_part, marker, blocks_part = text.partition("{%- macro goal_message")
-    assert marker, "executor.md 缺少 goal_message 宏"
-    assert "{{ goal }}" not in system_part
-    assert "{% if goal" not in system_part
+    system_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in _prompt_files() if "system" in path.parts
+    )
+    assert "{{ goal }}" not in system_text
+    assert "{% if goal" not in system_text
     # 目标只能从消息块进来
-    assert "{{ goal }}" in blocks_part
+    assert "{{ goal }}" in _prompt_file("messages/goal")
 
 
 def test_executor_prompt_is_an_independent_decider():
@@ -157,7 +204,7 @@ def test_executor_prompt_is_an_independent_decider():
     新架构里 Executor 是唯一的决策者（方案 §2.1），留着那条规则会让它
     等着别人给指令，而没人会给。
     """
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    text = _prompt_text()
     assert "Don't reason about strategy" not in text
     assert "just execute what Cortex decided" not in text
     assert "Cortex" not in text
@@ -177,7 +224,8 @@ def test_executor_prompt_keeps_element_targeting_contract():
     —— 行格式、1-based、`index` 寻址 ——
     而不是某一段标题或某一句措辞：标题和措辞还能再变，契约不能丢。
     """
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    # 行格式说明书住在运行时消息块里，不在 system 段。
+    text = _prompt_file("messages/screen-elements")
     # 行格式说明书：`[i] "text" id=... Type (x,y,WxH) flags`
     assert "[i]" in text
     assert "id=" in text
@@ -193,7 +241,7 @@ def test_executor_prompt_keeps_text_tools_table():
     Executor 不 bind_tools（方案 §3.1：schema 每轮多背 4,008 token 且不进缓存键），
     工具怎么用全靠这张表教。
     """
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    text = _prompt_file("system/40-tools")
     assert "## Tools" in text
     assert "Available tools: {{ executor_tools_list }}" in text
     for tool in (
@@ -220,16 +268,19 @@ def test_executor_prompt_keeps_perception_channels():
 
     所以这里断言的是「通道信息没有丢」，而不是「必须在 system prompt 里分支」。
     """
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    assert "## Perception" in text
+    perception = _prompt_file("system/20-perception")
+    device_state = _prompt_file("messages/device-state")
+    tools = _prompt_file("system/40-tools")
+
+    assert "## Perception" in perception
     # 同一张表里包含两种行
-    assert "element table" in text
-    assert "OCR text rows" in text
+    assert "element table" in perception
+    assert "OCR text rows" in perception
     # 开关带来的状态由运行时块承载
-    assert "NO perception channel is available" in text
+    assert "NO perception channel is available" in device_state
     # 息屏告知（真机教训：30 分钟息屏让任务从 30 步涨到 51 步）
-    assert "Screen is OFF" in text
-    assert "wake_screen" in text
+    assert "Screen is OFF" in device_state
+    assert "wake_screen" in tools
 
 
 def test_executor_prompt_has_no_trace_of_the_picture_channel():
@@ -246,7 +297,7 @@ def test_executor_prompt_has_no_trace_of_the_picture_channel():
     这条断言的成本，比留一条「模型得能叫出这个名字」的断言低得多 ——
     截图通道已经**整条**没了，没有模型需要叫的名字。
     """
-    for path in (_EXECUTOR_MD, _EXECUTOR_ZH_MD):
+    for path in [*_prompt_files(), *_prompt_files(zh=True)]:
         text = path.read_text(encoding="utf-8")
         for marker in (
             "need_screenshot",
@@ -255,31 +306,32 @@ def test_executor_prompt_has_no_trace_of_the_picture_channel():
             "Image perception",
             "图片感知",
         ):
-            assert marker not in text, f"{path.name} 里还有截图痕迹：{marker}"
+            assert marker not in text, f"{path} 里还有截图痕迹：{marker}"
     # 两条**文字**通道还在：元素表 / 视觉主体列表
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    text = _prompt_text()
     assert "element table" in text
     assert "visual-subjects" in text
 
 
 def test_executor_prompt_has_no_tool_json_schema():
     """整份 prompt 里不许出现工具的完整参数定义（方案 §3.1）。"""
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
-    for marker in (
-        "bind_tools",
-        '"input_schema"',
-        '"properties"',
-        '"type": "object"',
-        '"type": "array"',
-        '"enum"',
-        '"anyOf"',
-    ):
-        assert marker not in text, f"executor.md 里出现了不该有的东西：{marker}"
+    for path in _prompt_files():
+        text = path.read_text(encoding="utf-8")
+        for marker in (
+            "bind_tools",
+            '"input_schema"',
+            '"properties"',
+            '"type": "object"',
+            '"type": "array"',
+            '"enum"',
+            '"anyOf"',
+        ):
+            assert marker not in text, f"{path.name} 里出现了不该有的东西：{marker}"
 
 
 def test_executor_prompt_output_fields_match_executor_output():
     """Output 字段表要和 `agents/executor/types.py:ExecutorOutput` 逐字对齐。"""
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    text = _prompt_file("system/50-output")
     for field in ("actions", "agent_thought", "done", "done_reason"):
         assert f"`{field}`" in text, f"Output 字段表少了 {field}"
     # agent_thought：**先说上一步的结果，再说本动作的原因**（与 zh 版字段表对齐）
@@ -317,8 +369,8 @@ def test_executor_prompt_tells_the_model_to_use_the_previous_result():
     「这个动作没用」是**相对于目标**的判断，框架做不了 ⇒ 必须由模型做。
     ⇒ 提示词不写清楚，模型就会忽略历史里那几行，继续原地打转。
     """
-    en = " ".join(_EXECUTOR_MD.read_text(encoding="utf-8").split())
-    zh = " ".join(_EXECUTOR_ZH_MD.read_text(encoding="utf-8").split())
+    en = " ".join(_prompt_text().split())
+    zh = " ".join(_prompt_text(zh=True).split())
 
     assert "the result of the previous step" in en
     assert "上一步的结果" in zh
@@ -342,7 +394,7 @@ def test_executor_prompt_keeps_the_anchor_rules():
 
     2026-10-28：Executor 的失败事实块已移除。
     """
-    text = _EXECUTOR_MD.read_text(encoding="utf-8")
+    text = _prompt_text()
     assert "One action at a time" in text
     assert "reach it, or report truthfully that you could not" in text
 
@@ -359,8 +411,8 @@ def test_executor_prompt_demands_done_when_the_goal_is_reached():
     就是模型说 done（``graph.py`` 的 ``post_executor_gate``）。模型不说，
     就永远在里面转。
     """
-    en = _EXECUTOR_MD.read_text(encoding="utf-8")
-    zh = _EXECUTOR_ZH_MD.read_text(encoding="utf-8")
+    en = _prompt_text()
+    zh = _prompt_text(zh=True)
 
     # 归一化空白：提示词是按行宽排版的，断言不能被换行炸掉
     flat_en = " ".join(en.split())

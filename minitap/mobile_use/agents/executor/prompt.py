@@ -6,15 +6,16 @@ provider 的缓存是前缀匹配。任何每轮变的内容放在中间，它�
 屏幕元素表每轮都变（每轮重抓屏），所以它必须排在局部历史之后。实测的差别很大：
 元素表排在历史前面，缓存命中率递减到 48%；排在历史后面，命中率递增到 93%。
 
-文案全部由模板宏提供。``executor.md`` / ``executor-zh.md`` 是宏库：正文在
-``system_message`` 宏里，其余每个运行时消息块（目标 / 设备 / 元素表 / OCR /
-反馈）也各是一个宏。本模块只负责按顺序把宏的渲染结果放进消息列表，不再
-自带任何提示词散文。唯一的例外是元素行 / OCR 行，它们的编号契约要和工具侧的
-反解共用，不能拆两份。
+文案全部在 ``prompt_manifest.toml`` 列出的文件里：``prompts/system/`` 是稳定指令
+（SystemMessage），``prompts/messages/`` 是运行时块（HumanMessage）。本模块只负责
+挑数据、按 manifest 的 order 拼 system、按显式顺序拼消息列表，不再自带任何提示词
+散文。段边界、顺序、每段多久变一次都写在清单里 —— 这是「为什么它在这」的说明书。
+
+唯一的例外是元素行 / OCR 行，它们的编号契约要和工具侧的反解共用，不能拆两份。
 
 不要 bind_tools 那些设备工具。它们的 JSON schema 有 4,000+ token，而且不参与
-缓存键（实测），所以每轮都按满价计费。Executor 的工具用法靠 ``executor.md``
-里的文本工具表教，静态，可缓存。
+缓存键（实测），所以每轮都按满价计费。Executor 的工具用法靠
+``prompts/system/40-tools.md`` 里的文本工具表教，静态，可缓存。
 
 屏幕描述只有一种形态：统一元素表。Contextor 把所有平台的数据都建成
 ``state.latest_screen_elements`` —— 层级树形状认识时是 UI 行 + OCR 行，
@@ -24,7 +25,7 @@ iOS / 云设备这类不认识的形状只有 OCR 行。模型一律填 ``Target
 
 一条感知是元素表（UI 行 + OCR 行）+ **按需视觉主体列表**。
 视觉主体由 Executor 自己调用 ``scan_visual_subjects`` 触发（见
-``agents/executor/executor.md`` 的 Visual perception 段）；框架只负责把最近一次
+``prompts/system/30-vision.md`` 的 Visual perception 段）；框架只负责把最近一次
 扫描的缓存渲染成一块表，并在屏幕变化后清掉它。
 
 屏幕截图不进模型。prompt 里没有任何图，模型只有两条文字通道：元素表、
@@ -42,6 +43,9 @@ iOS / 云设备这类不认识的形状只有 OCR 行。模型一律填 ``Target
 
 from __future__ import annotations
 
+import tomllib
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -66,58 +70,162 @@ from minitap.mobile_use.utils.screen_elements import ScreenElement, render_scree
 from minitap.mobile_use.utils.thoughts_compaction import split_sentences
 from minitap.mobile_use.utils.time import format_task_started_at
 
-EXECUTOR_PROMPT_PATH = Path(__file__).parent / "executor.md"
+EXECUTOR_PROMPTS_DIR = Path(__file__).parent / "prompts"
+EXECUTOR_PROMPT_MANIFEST = Path(__file__).parent / "prompt_manifest.toml"
 
 
-def _blocks(language: PromptLanguage) -> Any:
-    """模板里的宏集合：``system_message`` 加各运行时消息块。
+@dataclass(frozen=True)
+class _PromptSection:
+    """``[[system]]`` 的一行：稳定指令的一段。"""
 
-    返回类型标成 ``Any``：Jinja 的 ``TemplateModule`` 把宏挂在实例 ``__dict__``
-    上（``context.get_exported()``），静态类型里根本没有这些属性名，不标注就
-    全是 ``reportAttributeAccessIssue``。宏名是否真的存在由
-    ``tests/test_prompt_templates.py`` 校验，静态类型帮不上忙。
+    name: str
+    order: int
+    file: str
+    when: str | None = None
 
-    所有会进 prompt 的文案都住在 ``.md`` 里，代码只负责挑数据：系统消息、目标、
-    设备状态、元素表表头、OCR 说明、反馈语。唯一的例外是元素行 /
-    OCR 行本身，它们由共用渲染器生成，因为编号契约是「渲染」和「反解」两端共用的，
-    不能拆成两份。
 
-    ``load_prompt_template`` 按 ``(路径, 语言)`` 缓存编译结果，
-    ``Template.module`` 也是缓存属性，所以同一份模板只编译一次。
+@dataclass(frozen=True)
+class _PromptMessage:
+    """``[[message]]`` 的一行：运行时块。
+
+    顺序不在这里 —— 它由 :func:`build_executor_messages` 的显式序列决定。
+    这里只声明它的文件与生命周期（``volatility``）。
     """
-    return load_prompt_template(EXECUTOR_PROMPT_PATH, language).module
+
+    name: str
+    file: str
+    volatility: str
+
+
+#: 允许出现在 ``[[system]].when`` 里的开关名。写错就是「这段永远不出现」，必须挡住。
+_WHEN_KEYS = frozenset({"vision_enabled"})
+
+#: 消息块的生命周期标签。清单里只做声明与校验，不参与排序。
+_VOLATILITIES = frozenset({"per-task", "per-goal", "per-turn", "occasional", "terminal"})
+
+
+def _load_manifest() -> tuple[tuple[_PromptSection, ...], dict[str, _PromptMessage]]:
+    """读取并校验 ``prompt_manifest.toml``。
+
+    坏清单在 import 时就抛：重名、重复 order、文件缺失、未知的 ``when`` /
+    ``volatility`` 都不该等到第一次真机任务才发现。
+    """
+    data = tomllib.loads(EXECUTOR_PROMPT_MANIFEST.read_text(encoding="utf-8"))
+
+    sections: list[_PromptSection] = []
+    seen_names: set[str] = set()
+    seen_orders: set[int] = set()
+    for row in data.get("system", []):
+        name = str(row["name"])
+        order = int(row["order"])
+        rel = str(row["file"])
+        if name in seen_names:
+            raise ValueError(f"prompt_manifest.toml: system 段 {name!r} 重名")
+        if order in seen_orders:
+            raise ValueError(f"prompt_manifest.toml: system 段 order={order} 重复")
+        if not (EXECUTOR_PROMPTS_DIR / rel).is_file():
+            raise ValueError(f"prompt_manifest.toml: system 段 {name!r} 的文件不存在：{rel}")
+        when = row.get("when")
+        if when is not None and when not in _WHEN_KEYS:
+            raise ValueError(f"prompt_manifest.toml: system 段 {name!r} 的 when={when!r} 未知")
+        seen_names.add(name)
+        seen_orders.add(order)
+        sections.append(_PromptSection(name=name, order=order, file=rel, when=when))
+
+    messages: dict[str, _PromptMessage] = {}
+    for row in data.get("message", []):
+        name = str(row["name"])
+        rel = str(row["file"])
+        volatility = str(row["volatility"])
+        if name in messages:
+            raise ValueError(f"prompt_manifest.toml: message 块 {name!r} 重名")
+        if volatility not in _VOLATILITIES:
+            raise ValueError(
+                f"prompt_manifest.toml: message 块 {name!r} 的 volatility={volatility!r} 未知"
+            )
+        if not (EXECUTOR_PROMPTS_DIR / rel).is_file():
+            raise ValueError(f"prompt_manifest.toml: message 块 {name!r} 的文件不存在：{rel}")
+        messages[name] = _PromptMessage(name=name, file=rel, volatility=volatility)
+
+    sections.sort(key=lambda section: section.order)
+    return tuple(sections), messages
+
+
+# 清单是随包发布的静态资源：import 时就校验一次，坏清单不会等到第一次真机任务才炸。
+_SECTIONS, _MESSAGES = _load_manifest()
+
+
+def _render(path: Path, values: Mapping[str, object], *, language: PromptLanguage) -> str:
+    """渲染一个模板文件；语言按文件逐段回落（见 ``load_prompt_template``）。"""
+    return load_prompt_template(path, language).render(**values).strip()
+
+
+def render_system(
+    values: Mapping[str, object],
+    *,
+    language: PromptLanguage,
+) -> str:
+    """按 manifest 的 order 拼接稳定指令。
+
+    ``when`` 为真的段才参与；渲染为空的段自然消失（与 DSH 的 empty section
+    语义一致）。段与段之间空一行。
+    """
+    chunks: list[str] = []
+    for section in _SECTIONS:
+        if section.when is not None and not values.get(section.when):
+            continue
+        text = _render(EXECUTOR_PROMPTS_DIR / section.file, values, language=language)
+        if text:
+            chunks.append(text)
+    return "\n\n".join(chunks)
+
+
+def _render_message(
+    name: str,
+    *,
+    language: PromptLanguage,
+    **values: object,
+) -> str:
+    """渲染一个运行时块；名字必须是 manifest 里声明过的。"""
+    message = _MESSAGES[name]
+    return _render(EXECUTOR_PROMPTS_DIR / message.file, values, language=language)
 
 
 def render_executor_system(ctx: MobileUseContext) -> str:
-    """渲染 Executor 的 system prompt（静态部分）。
+    """渲染 Executor 的 system prompt（稳定指令，整场运行逐字节不变）。
 
-    ``system_message`` 宏的参数：``platform`` / ``executor_tools_list`` /
-    ``perception``。
-
-    目标不在这个宏里。目标是每子目标变的，放进 system prompt 会让整个 system 块
-    在换子目标时全部重算。目标走独立的消息块（``goal_message``，见
+    目标不在 system 里。目标是每子目标变的，放进 system 会让整个 system 块
+    在换子目标时全部重算。目标走独立的消息块（``goal``，见
     ``build_executor_messages`` 的第 2 项），子目标内它是恒定的。
 
-    ``perception`` 传的是通道开关状态（``ctx.perception``）：两条通道开着哪几条，
-    在一次运行里是恒定的，所以它落在 system prompt 里不会伤缓存，但模型必须知道，
-    否则它会按一个被关掉的通道寻址。
+    ``vision_enabled`` 是感知开关的状态：一次运行里恒定，所以它只决定
+    ``30-vision.md`` 装不装，不伤缓存。条件判断留在 Python，模板里没有
+    ``{% if %}``。
 
-    语言跟着 ``ctx.prompt_language`` 走（``en`` 对应 ``executor.md``，``zh`` 对应
-    ``executor-zh.md``）。
+    语言跟着 ``ctx.prompt_language`` 走；每个段独立回落 —— 缺哪段的中文版，
+    只有那一段变英文（见 ``load_prompt_template``）。
     """
-    return _blocks(ctx.prompt_language).system_message(
-        platform=ctx.device.mobile_platform.value,
-        executor_tools_list=format_tools_list(
-            ctx=ctx,
-            wrappers=executor_wrappers(ctx),
-        ),
-        perception=ctx.perception,
+    return render_system(
+        {
+            "platform": ctx.device.mobile_platform.value,
+            "executor_tools_list": format_tools_list(
+                ctx=ctx,
+                wrappers=executor_wrappers(ctx),
+            ),
+            "vision_enabled": ctx.perception.vision,
+        },
+        language=ctx.prompt_language,
     )
+
+
+def render_task_started(task_started_at: str, *, language: PromptLanguage) -> str:
+    """任务开始时间（整场运行不变，和 system 一起构成可缓存前缀）。"""
+    return _render_message("task_started", language=language, task_started_at=task_started_at)
 
 
 def render_goal_message(goal: str, *, language: PromptLanguage) -> str:
     """目标陈述块（子目标内恒定，排在局部历史之前才能被缓存覆盖）。"""
-    return _blocks(language).goal_message(goal=goal)
+    return _render_message("goal", language=language, goal=goal)
 
 
 def render_device_state(
@@ -133,7 +241,9 @@ def render_device_state(
     息屏那句是关键：真机实测 30 分钟息屏超时让一个任务从 30 步涨到 51 步还没跑完，
     模型看不到「屏是黑的」，就在黑屏上反复尝试。
     """
-    return _blocks(language).device_state_message(
+    return _render_message(
+        "device_state",
+        language=language,
         device_date=device_date,
         focused_app_info=focused_app_info,
         screen_off=screen_off,
@@ -146,12 +256,12 @@ def render_screen_message(elements: list[ScreenElement] | None, *, language: Pro
     rows = render_screen_rows(elements or [])
     if not rows:
         return ""
-    return _blocks(language).screen_elements_message(rows=rows)
+    return _render_message("screen_elements", language=language, rows=rows)
 
 
 def render_dispatch_rejection(reason: str, *, language: PromptLanguage) -> str:
     """动作没被派发时的回灌（不是 ToolMessage：那份没有对应的 tool_call）。"""
-    return _blocks(language).dispatch_rejection_message(reason=reason)
+    return _render_message("dispatch_rejection", language=language, reason=reason)
 
 
 def render_vision_subjects_message(
@@ -165,37 +275,37 @@ def render_vision_subjects_message(
     rows = render_vision_rows(elements or [])
     if not rows:
         return ""
-    return _blocks(language).vision_subjects_message(rows=rows)
+    return _render_message("vision_subjects", language=language, rows=rows)
 
 
 def render_retry_nudge(reason: str | None, *, language: PromptLanguage) -> str:
     """解析失败后重试一次时的提醒，必须带上具体的失败原因。"""
-    return _blocks(language).retry_message(reason=reason)
+    return _render_message("retry", language=language, reason=reason)
 
 
 def render_extra_actions_notice(count: int, *, language: PromptLanguage) -> str:
     """一轮只执行第一个动作时，告诉模型其余动作没有被执行。"""
-    return _blocks(language).extra_actions_message(count=count)
+    return _render_message("extra_actions", language=language, count=count)
 
 
 def render_step_limit_message(limit: int, *, language: PromptLanguage) -> str:
     """步数上限触发时的收尾文案。"""
-    return _blocks(language).step_limit_message(limit=limit)
+    return _render_message("step_limit", language=language, limit=limit)
 
 
 def render_no_goal_message(*, language: PromptLanguage) -> str:
     """没有子目标时的收尾文案。"""
-    return _blocks(language).no_goal_message()
+    return _render_message("no_goal", language=language)
 
 
 def render_done_fallback(*, language: PromptLanguage) -> str:
     """``done`` 但没有 done_reason / agent_thought 时的收尾文案。"""
-    return _blocks(language).done_fallback_message()
+    return _render_message("done_fallback", language=language)
 
 
 def render_failed_fallback(*, language: PromptLanguage) -> str:
     """``failed`` 但没有 failed_reason / agent_thought 时的收尾文案。"""
-    return _blocks(language).failed_fallback_message()
+    return _render_message("failed_fallback", language=language)
 
 
 def render_stall_notice(description: str, *, language: PromptLanguage) -> str:
@@ -205,7 +315,7 @@ def render_stall_notice(description: str, *, language: PromptLanguage) -> str:
     也不替模型做决定（见 ``agents/executor/progress.py``）。它告诉模型两件事：
     别重复刚才那个动作；做不成就用 ``failed`` 说出来。
     """
-    return _blocks(language).stall_notice_message(description=description)
+    return _render_message("stall_notice", language=language, description=description)
 
 
 def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
@@ -496,7 +606,7 @@ def build_executor_messages(
 
     顺序上每轮变的一律靠后：
 
-    1. SystemMessage：``executor.md`` 的渲染结果（静态）。
+    1. SystemMessage：``render_system`` 按 manifest 拼出的稳定指令。
     2. HumanMessage：目标陈述（子目标内恒定）。
     3. 局部历史：动作 + 工具反馈，只追加。
     4. HumanMessage：设备状态（每轮变，前台 app 会变）。
@@ -546,7 +656,7 @@ def build_executor_messages(
     task_started_at = format_task_started_at(ctx.task_started_at)
     if task_started_at:
         messages.append(
-            HumanMessage(content=_blocks(ctx.prompt_language).task_started_message(task_started_at))
+            HumanMessage(content=render_task_started(task_started_at, language=ctx.prompt_language))
         )
 
     messages.append(HumanMessage(content=render_goal_message(goal, language=ctx.prompt_language)))
@@ -583,9 +693,7 @@ def build_executor_messages(
 
     # 视觉主体表：最近一次按需扫描的缓存。它和元素表一样每轮可能变，
     # 但元素表必须保持最后一块（索引契约 + 缓存顺序都有测试守着），所以它放前面。
-    vision_text = render_vision_subjects_message(
-        vision_elements, language=ctx.prompt_language
-    )
+    vision_text = render_vision_subjects_message(vision_elements, language=ctx.prompt_language)
     if vision_text:
         messages.append(HumanMessage(content=vision_text))
 

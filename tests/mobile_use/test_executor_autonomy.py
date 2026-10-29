@@ -42,6 +42,7 @@ from minitap.mobile_use.agents.executor.executor import (  # noqa: E402
     _rejection_code,
 )
 from minitap.mobile_use.agents.executor.prompt import (  # noqa: E402
+    EXECUTOR_PROMPTS_DIR,
     build_executor_messages,
     render_executor_system,
 )
@@ -118,6 +119,19 @@ def _elements(n: int = 5) -> list[ScreenElement]:
         )
         for i in range(1, n + 1)
     ]
+
+
+def _static_prompt_text() -> str:
+    """Executor 的英文提示词全文（所有段拼在一起）。
+
+    断言的是「这条契约还在」，不关心它住在哪个文件；拆段后用这个 helper
+    保持断言不变。
+    """
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(EXECUTOR_PROMPTS_DIR.rglob("*.md"))
+        if not path.stem.endswith("-zh")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -395,18 +409,14 @@ def test_t14_executor_prompt_demands_a_tool_call():
     而 `with_fallback` 兜不住 —— 本机 override 里 fallback 和主模型是同一个模型，
     重试同样失败 → **整个任务挂掉**。
     """
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
-
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    text = _static_prompt_text()
     assert "call the" in text.lower()
     assert "plain text" in text.lower() or "as plain text" in text.lower()
 
 
 def test_t14b_executor_prompt_shows_a_json_example():
     """要有 JSON 示例 —— 表格描述不如示例管用（模型照着抄）。"""
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
-
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    text = _static_prompt_text()
     assert '"actions"' in text
     assert '"agent_thought"' in text
     # done 的形态也要有示例：actions 为空 + done=true
@@ -631,9 +641,7 @@ def test_t13b_executor_prompt_has_no_picture_channel_but_keeps_wake_screen():
     2026-10-27：按需截图**工具**也下线了 ⇒ 提示词里不许再有 `take_screenshot`，
     `need_screenshot` 这种「举手要图」的字段同样不许有。
     """
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
-
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    text = _static_prompt_text()
     # 通道没回来：模型不该再学会「举手要图」
     assert "need_screenshot" not in text
     # 工具也没了：模型没有可喊的名字
@@ -643,19 +651,15 @@ def test_t13b_executor_prompt_has_no_picture_channel_but_keeps_wake_screen():
 
 
 def test_t13c_executor_prompt_has_no_tool_schema():
-    """executor.md **不能**含工具的 JSON schema（那是 4,008 token 且不进缓存键）。"""
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
-
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    """Executor 的提示词 **不能**含工具的 JSON schema（那是 4,008 token 且不进缓存键）。"""
+    text = _static_prompt_text()
     for marker in ("bind_tools", '"input_schema"', '"properties"', "additionalProperties"):
-        assert marker not in text, f"executor.md 不该出现 {marker}"
+        assert marker not in text, f"Executor 的提示词不该出现 {marker}"
 
 
 def test_t13d_executor_prompt_has_element_index_contract():
     """索引契约的说明书必须在（`[i]` 直接用，不抄 id 和坐标）。"""
-    from minitap.mobile_use.agents.executor.prompt import EXECUTOR_PROMPT_PATH
-
-    text = EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8")
+    text = _static_prompt_text()
     assert "1-based" in text
     assert "index" in text
 

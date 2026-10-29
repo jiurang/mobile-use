@@ -60,6 +60,8 @@ TRANSLATED_PROMPTS = [
 
 #: 开关覆盖到的全部 agent 提示词（含本次之前就有的中英两版）。
 #: 每一个都必须能在 zh 下找到中文版 —— 否则开关就是半拉子的。
+#: Executor 已按 manifest 拆段，这里把每个段都列进来。
+_EXECUTOR_PROMPTS = _AGENTS_DIR / "executor" / "prompts"
 SWITCHED_PROMPTS = [
     "contextor/contextor.md",
     "hopper/hopper.md",
@@ -67,8 +69,12 @@ SWITCHED_PROMPTS = [
     "orchestrator/human.md",
     "outputter/human.md",
     "reporter/reporter.md",
-    "executor/executor.md",
     "cortex/cortex.md",
+    *[
+        path.relative_to(_AGENTS_DIR).as_posix()
+        for path in sorted(_EXECUTOR_PROMPTS.rglob("*.md"))
+        if not path.stem.endswith("-zh")
+    ],
 ]
 
 
@@ -244,16 +250,15 @@ def test_pick_switches_between_the_two_wordings():
 
 
 def test_executor_prompt_follows_the_switch():
-    """Executor：system prompt 走 ``executor.md`` / ``executor-zh.md``。"""
+    """Executor：system prompt 按 manifest 逐段切换语言。"""
     from minitap.mobile_use.agents.executor.prompt import render_executor_system
 
     en = render_executor_system(_ctx(PromptLanguage.EN))
     zh = render_executor_system(_ctx(PromptLanguage.ZH))
     assert "You are the **Executor**" in en
     assert "你是 **Executor**" in zh
-    # 索引字段名不许翻 —— 模板里讲的是 `index`。
-    zh_template = (_AGENTS_DIR / "executor/executor-zh.md").read_text(encoding="utf-8")
-    assert "`index`" in zh_template
+    # 索引字段名不许翻 —— 工具段里讲的是 `index`。
+    assert "`index`" in zh
 
 
 def test_cortex_prompt_follows_the_switch(monkeypatch: MonkeyPatch):

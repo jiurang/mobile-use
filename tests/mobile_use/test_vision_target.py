@@ -109,9 +109,7 @@ async def test_scan_maps_subjects_to_a_numbered_table(monkeypatch):
 @pytest.mark.asyncio
 async def test_scan_truncates_to_the_subject_limit(monkeypatch):
     subjects = [
-        vision.VisionSubject(
-            description=f"icon {i}", x1=0, y1=i, x2=100, y2=i + 10
-        )
+        vision.VisionSubject(description=f"icon {i}", x1=0, y1=i, x2=100, y2=i + 10)
         for i in range(vision.MAX_SUBJECTS + 5)
     ]
     _patch_vision_pipeline(monkeypatch, vision.VisionScanOutput(subjects=subjects))
@@ -236,13 +234,16 @@ def test_vision_bounds_bypass_the_iou_gate():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("filename", ["executor.md", "executor-zh.md"])
-def test_prompts_teach_the_vision_index_contract(filename):
+@pytest.mark.parametrize("suffix", ["", "-zh"])
+def test_prompts_teach_the_vision_index_contract(suffix):
     """提示词里必须教 `vision_index`，并且不再有旧的定位失败回灌宏。"""
-    text = (_PROMPTS / filename).read_text(encoding="utf-8")
-    assert "vision_index" in text
-    assert "macro vision_subjects_message(" in text
-    assert "vision_failure_message" not in text
+    system = (_PROMPTS / f"prompts/system/30-vision{suffix}.md").read_text(encoding="utf-8")
+    message = (_PROMPTS / f"prompts/messages/vision-subjects{suffix}.md").read_text(
+        encoding="utf-8"
+    )
+    assert "vision_index" in system
+    assert "{{ rows }}" in message
+    assert "vision_failure_message" not in system + message
 
 
 def _wrappers_ctx(vision_enabled: bool) -> SimpleNamespace:

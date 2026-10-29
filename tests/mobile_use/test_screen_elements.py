@@ -438,7 +438,7 @@ def test_interactive_row_without_text_is_kept():
 def test_scrollable_row_without_text_is_kept():
     """R（scrollable）算可交互。
 
-    `agents/executor/executor.md` 里给模型的说明写着
+    `agents/executor/prompts/messages/screen-elements.md` 里给模型的说明写着
     「`R` scrollable (**use its bounds for swipes**)」—— 模型靠 R 行的
     bounds 决定往哪划。R 行往往没有文字（那是个纯滚动容器），
     当装饰裁掉就等于把「这片能滚」和它的边界一起删了。
