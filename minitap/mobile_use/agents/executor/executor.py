@@ -120,8 +120,8 @@ class ExecutorNode:
         wrappers = executor_wrappers(self.ctx)
         tools = get_tools_from_wrappers(self.ctx, wrappers)
 
-        # 全任务累计动作步数：本节点每跑一轮 +1。
-        # ``executor_steps`` 会在 Cortex 换目标时归零，``total_steps`` 不归零，
+        # 本轮累计动作步数：本节点每跑一轮 +1。
+        # ``executor_steps`` 会在 Cortex 每轮下发目标时归零，``total_steps`` 不归零，
         # 供 SDK 上报整个任务的动作步数。无目标兜底分支不计入两者。
         step_index = state.executor_steps + 1
         next_total_steps = state.total_steps + 1
@@ -174,7 +174,12 @@ class ExecutorNode:
         nudged = False
         if stall_signal is not None and should_nudge(stall_signal):
             stall_notice = render_stall_notice(
-                stall_signal.description, language=self.ctx.prompt_language
+                kind=stall_signal.kind,
+                repeats=stall_signal.repeats,
+                window=stall_signal.window,
+                fingerprint=stall_signal.fingerprint,
+                vision_enabled=self.ctx.perception.vision,
+                language=self.ctx.prompt_language,
             )
             nudged = True
             logger.info(

@@ -150,7 +150,8 @@ def action_fingerprint(action: dict | None) -> str:
 class StallSignal:
     """「没有进展」这个事实的描述。
 
-    它只是事实，不含裁决。「所以该怎么办」归上层决定。
+    它只是事实，不含裁决。「所以该怎么办」归上层决定；给模型看的句子由
+    ``render_stall_notice`` 按语言组装，这里只给字段。
     """
 
     kind: str  # "screen" | "action"
@@ -159,19 +160,6 @@ class StallSignal:
     window: int  # 窗口多大
     steps_in_subgoal: int  # 这个子目标一共走了多少步
     nudges_sent: int  # 已经提醒过几次
-
-    @property
-    def description(self) -> str:
-        # 这段文案会进模型提示词，改动即改变模型行为，保持逐字不变。
-        if self.kind == "screen":
-            return (
-                f"最近 {self.window} 步里，你回到了 {self.repeats} 次**同一个页面**"
-                f"（屏幕指纹 {self.fingerprint}）—— 页面上的东西没有变化。"
-            )
-        return (
-            f"最近 {self.window} 步里，你重复了 {self.repeats} 次**同一个动作**"
-            f"（{self.fingerprint}）—— 结果没有变化。"
-        )
 
 
 def detect_stall(

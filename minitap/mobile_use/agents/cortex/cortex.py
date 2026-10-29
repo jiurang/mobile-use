@@ -12,8 +12,10 @@ Executor 自主执行之后，感知和动作全下沉给了 Executor（它自�
 
 有四条机制不能忘，各自的理由写在代码对应位置。
 
-局部历史的清空责任在这里。``executor_messages`` 是「本子目标内」的历史，换了
-目标就必须清空。
+局部历史的清空责任在这里。``executor_messages`` 是「**一轮**内」的历史（一轮 =
+一次执行尝试）：每次下发目标都清空，包括同一个子目标的换招重发。上一轮的事实
+不丢 —— 汇报里的 summary / 结束原因 / 失败目标会压成一条摘要，作为新一轮局部
+历史的第一条。
 
 汇报是给 Cortex 的一次性输入，消费掉就清空。
 
@@ -32,6 +34,7 @@ from typing import Any, Literal, NamedTuple
 
 from jinja2 import Template
 from langchain_core.messages import (
+    AnyMessage,
     BaseMessage,
     HumanMessage,
     RemoveMessage,
@@ -46,6 +49,7 @@ from minitap.mobile_use.agents.cortex.issue_log import (
     count_rule_retries,
 )
 from minitap.mobile_use.agents.cortex.types import CortexOutput
+from minitap.mobile_use.agents.executor.prompt import render_previous_attempt
 from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.agents.planner.utils import (
@@ -671,35 +675,28 @@ class CortexNode:
         if decision.action == "issue":
             assert decision.goal is not None  # decide_next_step 保证
             update["executor_goal"] = decision.goal
-            # 同目标重发不清局部历史。局部历史只在「Cortex 下发本次任务」这个
-            # 生命周期内，换目标才丢。
+            # 一轮一生命周期：每次下发目标都清空局部历史（含同一子目标的换招重发）。
             #
-            # 判据是有没有汇报：
-            # * `report is None`：这是首次下发（或上一个子目标已完成、要换目标了），
-            #   该清。Executor 不能带着上一个目标的上下文去执行新目标，它自己会
-            #   以为那些动作已经做过了。
-            # * `report is not None`：这是同一个子目标的换招重发（失败或阻塞后
-            #   换个思路再来一次），不该清。
+            # 清空挡的是「跨轮累加」：局部历史每步约 +3 条消息 / +490 字符，不清
+            # 就按步数线性增长（真机归档 880：末轮 461 条消息、6 万字符、占整个
+            # executor prompt 的 54%）。
             #
-            # 旧实现无条件清，于是重发时执行器忘了自己试过什么，在原地打转。
-            # 真机证据（第六轮）：x39h9m 的尝试序列是
-            # `[(2, completed), (13, blocked), (1, completed)]`，第一次 2 步就做成
-            # 了，重发后那次却瞎转 13 步，重发再重发又 1 步就成了。
-            #
-            # 保留历史会让它随重发次数增长。增长有界的唯一保证是全局动作步预算
-            # （`constants.DEFAULT_MAX_STEPS`，也就是 LangGraph 的
-            # `recursion_limit`）：单子目标步数上限默认不限
-            # （`MAX_STEPS_PER_SUBGOAL = None`），所以这里没有「每次尝试的步数
-            # 上限」这层保护了。
-            # 也不做截断。截断历史有把 AIMessage/tool_call 和 ToolMessage 配对
-            # 拆散的风险，那会变成孤儿 tool_call，接口直接报 400，同样致命。
-            if report is None:
-                update[EXECUTOR_MESSAGES_KEY] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
+            # 清空会丢「上一轮试过什么」。旧实现无条件清正是栽在这里：同一子目标
+            # 换招重发时执行器忘了自己试过什么，在原地打转（真机序列
+            # `(2, completed) → (13, blocked) → (1, completed)`）。所以现在把上一轮
+            # 汇报压成一条事实摘要（summary / 结束原因 / 失败目标），作为新一轮局部
+            # 历史的第一条 —— 消息从零开始，事实照旧带过来，长度不随步数增长。
+            reset_messages: list[AnyMessage] = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
+            if report is not None:
+                digest = render_previous_attempt(report, language=self.ctx.prompt_language)
+                if digest:
+                    reset_messages.append(HumanMessage(content=digest))
+            update[EXECUTOR_MESSAGES_KEY] = reset_messages
             update["executor_steps"] = 0
-            # 上一次的「做不到」标记要清掉，它是本子目标内的信号，换目标之后
-            # 它不成立（留着会让下一个子目标的汇报也判成 failed）。
+            # 上一次的「做不到」标记要清掉，它是本轮内的信号，新一轮开始之后
+            # 它不成立（留着会让新的一轮汇报也判成 failed）。
             update["executor_failed"] = False
-            # 进展指纹是「本子目标内」的，换目标就重新开始数
+            # 进展指纹是「本轮内」的，新的一轮就重新开始数
             # （和 `executor_messages` 同一个生命周期）。
             update["executor_progress"] = []
             # 没判完成就不该有提名：上一次尝试的提名（如果还没被 Orchestrator 消费）

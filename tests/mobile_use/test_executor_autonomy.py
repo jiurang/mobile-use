@@ -253,9 +253,49 @@ def test_t18c_the_static_prompt_has_no_image_contract():
         assert marker not in system, f"静态提示词里还有旧图片契约：{marker}"
     # 两条**文字**通道都在：元素表（UI 行 + OCR 行）/ 视觉主体列表
     assert "element table" in system
-    assert "OCR text rows" in system
+    assert "OCR rows" in system
     assert "scan_visual_subjects" in system
     assert "vision_index" in system
+
+
+def test_t18d_tools_table_rows_match_the_registered_tools():
+    """工具表的行 == 这次真正注册的工具，一行不多、一行不少。
+
+    手写表会随开关漂移：录屏工具默认**不注册**，视觉工具默认注册。
+    表里留着调不到的工具，模型就会照着它喊，dispatch 只能回一条
+    "not a known tool"，白烧一轮。
+    """
+    from minitap.mobile_use.agents.executor.prompt import format_executor_tools_table
+    from minitap.mobile_use.prompt_language import PromptLanguage
+    from minitap.mobile_use.tools.index import executor_wrappers, get_tools_from_wrappers
+
+    def _table_names(ctx) -> set[str]:
+        table = format_executor_tools_table(ctx, language=PromptLanguage.EN)
+        return {line.split("`")[1] for line in table.splitlines() if line.startswith("| `")}
+
+    ctx = _ctx()
+    actual = {tool.name for tool in get_tools_from_wrappers(ctx, executor_wrappers(ctx))}
+    names = _table_names(ctx)
+    assert names == actual
+    # 默认：视觉开、录屏关 —— 表里必须如实反映
+    assert "scan_visual_subjects" in names
+    assert "start_video_recording" not in names
+    assert "stop_video_recording" not in names
+
+    # 打开录屏之后，两个工具必须出现在表里
+    video_ctx = ctx.model_copy(update={"video_recording_enabled": True})
+    video_names = _table_names(video_ctx)
+    assert {"start_video_recording", "stop_video_recording"} <= video_names
+
+    table = format_executor_tools_table(ctx, language=PromptLanguage.EN)
+    # agent_thought 是 ExecutorOutput 的顶层字段，不是动作参数
+    assert "`agent_thought`" not in table
+    assert "optional `package_name`" in table
+    assert "*(none)*" in table
+
+    zh_table = format_executor_tools_table(ctx, language=PromptLanguage.ZH)
+    assert "可选 `package_name`" in zh_table
+    assert "点击" in zh_table
 
 
 # ---------------------------------------------------------------------------
@@ -2025,7 +2065,7 @@ def test_t37c_over_budget_keeps_both_ends_and_says_how_many_were_dropped():
 
 
 # ---------------------------------------------------------------------------
-# T34 / T35 —— cortex 的韧性 + 「同目标重发不清历史」
+# T34 / T35 —— cortex 的韧性 + 「一轮一生命周期」（每轮清空 + 上一轮摘要）
 # ---------------------------------------------------------------------------
 #
 # T34 的来源：manager 链路上真机跑出来的（2026-10-22）。MiniMax 偶发返回
@@ -2079,18 +2119,22 @@ async def test_t34_cortex_parse_failure_does_not_kill_the_task(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_t35_reissue_of_the_same_subgoal_keeps_the_local_history(monkeypatch):
-    """T35：**同目标重发不清局部历史**；换目标才清（契约 §4.1）。
+async def test_t35_every_issue_starts_a_fresh_round_with_the_previous_attempt_digest(
+    monkeypatch,
+):
+    """T35：每一轮（一次执行尝试）都清空局部历史，上一轮的事实压成摘要带过来。
 
-    判据是「有没有汇报」：有汇报 = 同一个子目标的换招重发 ⇒ 保留；
-    没汇报 = 首次下发 / 换目标 ⇒ 清空。
+    清空的理由：局部历史每步约 +3 条消息 / +490 字符，不清就按步数线性增长
+    （真机归档 880：末轮 461 条消息 / 6 万字符，占 executor prompt 的 54%）。
 
-    清空会让执行器忘了自己试过什么 ⇒ 在原地打转（真机：13 步瞎转）。
+    带摘要的理由：只清空会让执行器忘了自己试过什么，在原地打转
+    （真机序列 `(2, completed) → (13, blocked) → (1, completed)`）。
     """
     import minitap.mobile_use.agents.cortex.cortex as cortex_mod
     from minitap.mobile_use.agents.cortex.types import CortexOutput
     from minitap.mobile_use.agents.reporter.reporter import ExecutorReport
     from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
+    from minitap.mobile_use.utils.failed_targets import FailedTarget
 
     calls: list = []
 
@@ -2112,24 +2156,46 @@ async def test_t35_reissue_of_the_same_subgoal_keeps_the_local_history(monkeypat
 
     monkeypatch.setattr(cortex_mod, "get_llm", fake_llm)
 
-    # --- 情形 1：同目标重发（**有**汇报）⇒ 局部历史保留 ---
+    # --- 情形 1：同目标重发（**有**汇报）⇒ 清空 + 上一轮摘要 ---
     #
-    # 注意：report.outcome="failed" 且规则额度没用过 ⇒ 走的是 **L3 规则换招**
-    # （不调 LLM）。这没关系 —— 规则换招和 LLM 换招**都是同一个子目标的重发**，
-    # 走的是同一个 `issue` 分支 ⇒ 同样不该清历史。
-    report = ExecutorReport(outcome="failed", summary="没做成")
+    # report.outcome="failed" 且规则额度没用过 ⇒ 走 **L3 规则换招**（不调 LLM）。
+    # 规则换招和 LLM 换招都是「新的一轮」，同样要清空、同样要带摘要。
+    report = ExecutorReport(
+        outcome="failed",
+        summary="点了搜索框，没进到结果页",
+        failure_reason="目标不在当前屏幕上",
+        failed_targets=[
+            FailedTarget(
+                key="k",
+                index=7,
+                resource_id="com.x:id/search_box",
+                label="搜索",
+            )
+        ],
+    )
     state = _cortex_state(report=report, thoughts=[])
     update = await cortex_mod.CortexNode(_ctx())(state)
 
     assert update.get("executor_goal"), "同目标重发必须有一个目标陈述"
-    assert EXECUTOR_MESSAGES_KEY not in update, "同目标重发不该清局部历史"
+    messages = update[EXECUTOR_MESSAGES_KEY]
+    assert isinstance(messages[0], RemoveMessage)
+    assert messages[0].id == REMOVE_ALL_MESSAGES, "新一轮必须先清空上一轮的消息"
+    digest = messages[1]
+    assert isinstance(digest, HumanMessage), "摘要要作为新一轮局部历史的第一条"
+    assert "没进到结果页" in digest.content, "摘要要带上一轮的 summary"
+    assert "目标不在当前屏幕上" in digest.content, "摘要要带上一轮的结束原因"
+    assert "search_box" in digest.content, "摘要要带上一轮失败过的目标"
+    assert "[7]" not in digest.content, "索引每轮重编号，摘要里不许带 index"
 
-    # --- 情形 2：换目标（**没**汇报）⇒ 局部历史清空 ---
+    # --- 情形 2：首次下发（**没**汇报）⇒ 只清空，没有摘要 ---
     state = _cortex_state(report=None, thoughts=[])
     update = await cortex_mod.CortexNode(_ctx())(state)
 
     assert update.get("executor_goal") == "Try the search box instead"
-    assert EXECUTOR_MESSAGES_KEY in update, "换目标必须清局部历史（否则会以为旧动作做过了）"
+    messages = update[EXECUTOR_MESSAGES_KEY]
+    assert len(messages) == 1 and isinstance(messages[0], RemoveMessage), (
+        "首次下发没有上一轮，只清空、不造摘要"
+    )
 
 
 # ---------------------------------------------------------------------------

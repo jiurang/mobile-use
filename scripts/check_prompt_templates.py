@@ -37,13 +37,19 @@ EXECUTOR_MANIFEST = EXECUTOR_DIR / "prompt_manifest.toml"
 
 EXECUTOR_SYSTEM_VARS: dict[str, object] = {
     "platform": "android",
-    "executor_tools_list": "tools",
+    "executor_tools_table": "| `tap` | `target` | Tap |",
     "vision_enabled": True,
 }
 
 EXECUTOR_MESSAGE_VARS: dict[str, dict[str, object]] = {
     "task_started": {"task_started_at": "2026-10-28 10:00"},
     "goal": {"goal": "进入 WLAN 页面"},
+    "previous_attempt": {
+        "outcome": "failed",
+        "summary": "点了搜索框，没进到结果页",
+        "reason": "目标不在当前屏幕上",
+        "failed_targets": '"搜索" search_box',
+    },
     "device_state": {
         "device_date": "2026-10-28",
         "focused_app_info": "设置",
@@ -55,7 +61,13 @@ EXECUTOR_MESSAGE_VARS: dict[str, dict[str, object]] = {
     "dispatch_rejection": {"reason": "tap is not a known tool"},
     "retry": {"reason": "the answer was not an ExecutorOutput object"},
     "extra_actions": {"count": 2},
-    "stall_notice": {"description": "same target tapped 3 times"},
+    "stall_notice": {
+        "kind": "screen",
+        "repeats": 3,
+        "window": 8,
+        "fingerprint": "abc123",
+        "vision_enabled": True,
+    },
     "step_limit": {"limit": 30},
     "no_goal": {},
     "done_fallback": {},
@@ -230,6 +242,8 @@ OPTIONAL_VARS = (
     "no_perception",
     # Executor retry / dispatch：失败原因可能缺省。
     "reason",
+    # Executor stall-notice：两种句式（screen / action）都要编到。
+    "kind",
 )
 
 

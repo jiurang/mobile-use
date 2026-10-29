@@ -11,7 +11,9 @@ provider 的缓存是前缀匹配。任何每轮变的内容放在中间，它�
 挑数据、按 manifest 的 order 拼 system、按显式顺序拼消息列表，不再自带任何提示词
 散文。段边界、顺序、每段多久变一次都写在清单里 —— 这是「为什么它在这」的说明书。
 
-唯一的例外是元素行 / OCR 行，它们的编号契约要和工具侧的反解共用，不能拆两份。
+两处例外：元素行 / OCR 行的编号契约要和工具侧的反解共用，不能拆两份；工具表的
+「说明」列也不在模板里 —— 工具是否出现由 ``executor_wrappers(ctx)`` 决定，说明文字
+必须和它一起生成，否则开关一变，表里就会留下调不到的工具。
 
 不要 bind_tools 那些设备工具。它们的 JSON schema 有 4,000+ token，而且不参与
 缓存键（实测），所以每轮都按满价计费。Executor 的工具用法靠
@@ -56,11 +58,14 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.tools import BaseTool
 
+from minitap.mobile_use.agents.executor.types import ExecutorReport
 from minitap.mobile_use.context import MobileUseContext
-from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template
+from minitap.mobile_use.prompt_language import PromptLanguage, load_prompt_template, pick
 from minitap.mobile_use.services.vision import VisionElement, render_vision_rows
-from minitap.mobile_use.tools.index import executor_wrappers, format_tools_list
+from minitap.mobile_use.tools.index import executor_wrappers, get_tools_from_wrappers
+from minitap.mobile_use.utils.failed_targets import describe_target
 from minitap.mobile_use.utils.message_content import (
     content_to_text,
     has_image_block,
@@ -191,6 +196,114 @@ def _render_message(
     return _render(EXECUTOR_PROMPTS_DIR / message.file, values, language=language)
 
 
+#: 工具表的「说明」列（英文在前、中文在后）。
+#:
+#: 工具**是否出现**由 ``executor_wrappers(ctx)`` 决定 —— 录屏工具跟
+#: ``video_recording_enabled`` 走，视觉扫描跟 ``perception.vision`` 走。所以整张表
+#: 必须在 Python 里和注册集合一起生成；手写在模板里，开关一变就会漂移，模型会照着
+#: 表调一个不存在的工具。
+_TOOL_NOTES: dict[str, tuple[str, str]] = {
+    "launch_app": ("Open an app", "打开应用"),
+    "open_link": ("Handles deep links correctly", "能正确处理深链"),
+    "tap": ("Tap", "点击"),
+    "long_press_on": ("Long press", "长按"),
+    "focus_and_input_text": (
+        "Focus then type; verify if feedback is empty",
+        "先聚焦再输入，如果反馈为空要核实",
+    ),
+    "focus_and_clear_text": (
+        "If it fails: long press -> select all -> `erase_one_char`",
+        "如果失败：长按 -> 全选 -> `erase_one_char`",
+    ),
+    "swipe_percentages": (
+        "**Prefer this**; correct across screen sizes",
+        "**优先用它**；跨屏幕尺寸都正确",
+    ),
+    "swipe_coordinates": (
+        "Only for controls needing precision, e.g. sliders",
+        "只用于需要精确控制的位置，比如滑块",
+    ),
+    "stop_app": ("Close the app", "关闭应用"),
+    "press_key": (
+        "`Enter` confirm/search, `Home` go home, `Back` go back",
+        "`Enter` 确认/搜索、`Home` 回到桌面、`Back` 返回",
+    ),
+    "wait_for_delay": ("Wait that many milliseconds", "等待整数毫秒"),
+    "back": ("—", "—"),
+    "erase_one_char": ("—", "—"),
+    "wake_screen": ("Turn the screen on", "点亮屏幕"),
+    "start_video_recording": (
+        "Starts a background screen recording: max 3 min (Android) / 15 min (iOS), "
+        "no audio; runs until `stop_video_recording`",
+        "开始后台录屏：最长 3 分钟（Android）/ 15 分钟（iOS），不录音频；"
+        "一直录到调用 `stop_video_recording`",
+    ),
+    "stop_video_recording": (
+        'Stops the recording, then analyzes the video; `prompt` says what to extract '
+        '(e.g. "what happens after each 10s")',
+        "停止录制，然后分析视频；`prompt` 说明要提取什么（例如「每 10 秒发生了什么」）",
+    ),
+    "scan_visual_subjects": (
+        "Looks at the current screen and lists **every** visual subject it can see, "
+        "numbered; then pick one with `vision_index`",
+        "看当前屏幕，把能看到的**每一个**视觉主体编号列出；下一轮用 `vision_index` 选一个",
+    ),
+}
+
+#: 不进「参数」列的参数：``agent_thought`` 是 ``ExecutorOutput`` 的顶层字段
+#: （dispatcher 统一注入），其余是 LangChain 的注入参数。
+_HIDDEN_TOOL_ARGS = frozenset(
+    {"agent_thought", "tool_call_id", "state", "store", "runtime", "config"}
+)
+
+
+def _required_tool_args(tool: BaseTool) -> set[str]:
+    """模型可见的必填参数（判据和 dispatcher 的 ``_required_args`` 同源）。"""
+    schema = tool.args_schema
+    fields = getattr(schema, "model_fields", None)
+    if not fields:
+        return set()
+    return {
+        name
+        for name, field in fields.items()
+        if field.is_required() and name not in _HIDDEN_TOOL_ARGS
+    }
+
+
+def _tool_note(tool: BaseTool, *, language: PromptLanguage) -> str:
+    """一个工具的说明；没登记说明时退回工具自己的第一行描述。"""
+    notes = _TOOL_NOTES.get(tool.name)
+    if notes is not None:
+        return pick(*notes, language=language)
+    lines = (tool.description or "").strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def format_executor_tools_table(ctx: MobileUseContext, *, language: PromptLanguage) -> str:
+    """按**实际注册**的工具生成文本工具表（工具 / 参数 / 说明）。
+
+    和 ``executor_wrappers(ctx)`` 同一份集合：这次能调到的工具，一行不多、一行不少。
+    参数名从 ``BaseTool.args`` 取，必填/可选从 ``args_schema`` 的字段定义取，
+    所以工具签名改了，表会跟着改。
+    """
+    tools = get_tools_from_wrappers(ctx, executor_wrappers(ctx))
+    optional = pick("optional", "可选", language=language)
+    none = pick("*(none)*", "*（无）*", language=language)
+
+    rows: list[str] = []
+    for tool in sorted(tools, key=lambda item: item.name):
+        required = _required_tool_args(tool)
+        args = [
+            f"`{name}`" if name in required else f"{optional} `{name}`"
+            for name in tool.args
+            if name not in _HIDDEN_TOOL_ARGS
+        ]
+        rows.append(
+            f"| `{tool.name}` | {', '.join(args) or none} | {_tool_note(tool, language=language)} |"
+        )
+    return "\n".join(rows)
+
+
 def render_executor_system(ctx: MobileUseContext) -> str:
     """渲染 Executor 的 system prompt（稳定指令，整场运行逐字节不变）。
 
@@ -208,9 +321,8 @@ def render_executor_system(ctx: MobileUseContext) -> str:
     return render_system(
         {
             "platform": ctx.device.mobile_platform.value,
-            "executor_tools_list": format_tools_list(
-                ctx=ctx,
-                wrappers=executor_wrappers(ctx),
+            "executor_tools_table": format_executor_tools_table(
+                ctx, language=ctx.prompt_language
             ),
             "vision_enabled": ctx.perception.vision,
         },
@@ -226,6 +338,31 @@ def render_task_started(task_started_at: str, *, language: PromptLanguage) -> st
 def render_goal_message(goal: str, *, language: PromptLanguage) -> str:
     """目标陈述块（子目标内恒定，排在局部历史之前才能被缓存覆盖）。"""
     return _render_message("goal", language=language, goal=goal)
+
+
+def render_previous_attempt(report: ExecutorReport, *, language: PromptLanguage) -> str:
+    """上一轮尝试的事实摘要（Cortex 在轮起点注入，是新一轮局部历史的第一条）。
+
+    为什么需要它：局部历史按「轮」清空（一轮 = 一次执行尝试）。清空挡住了跨轮
+    的线性增长，但模型也会忘掉「哪条路已经走不通」—— 上一轮汇报里的 summary、
+    结束原因和失败目标正好是这个信息。压成一条消息带过来，它的长度只跟失败条数
+    有关，不随步数增长。
+
+    失败目标用 ``describe_target``（**不带 index**）：索引每轮重编号，带进新一轮
+    会让模型去点一个完全无关的元素（见 ``utils/failed_targets.py`` 的说明）。
+    """
+    bits: list[str] = []
+    for target in report.failed_targets or []:
+        identity = describe_target(label=target.label or None, resource_id=target.resource_id)
+        bits.append(f"{identity} ({target.reason[:80]})" if target.reason else identity)
+    return _render_message(
+        "previous_attempt",
+        language=language,
+        outcome=report.outcome,
+        summary=report.summary,
+        reason=report.failure_reason or report.blocked_reason or "",
+        failed_targets="; ".join(bits),
+    )
 
 
 def render_device_state(
@@ -308,14 +445,34 @@ def render_failed_fallback(*, language: PromptLanguage) -> str:
     return _render_message("failed_fallback", language=language)
 
 
-def render_stall_notice(description: str, *, language: PromptLanguage) -> str:
+def render_stall_notice(
+    *,
+    kind: str,
+    repeats: int,
+    window: int,
+    fingerprint: str,
+    vision_enabled: bool,
+    language: PromptLanguage,
+) -> str:
     """「没有进展」的提醒块。
 
     它是信息，不是限制：这块只出现在「检测到重复」的那一轮，不截断、不改结果，
     也不替模型做决定（见 ``agents/executor/progress.py``）。它告诉模型两件事：
     别重复刚才那个动作；做不成就用 ``failed`` 说出来。
+
+    文案（含中英两种句式）住在模板里，``StallSignal`` 只提供事实字段 —— 以前
+    描述句硬编码在 Python 里，英文 prompt 会混进一句中文。``vision_enabled``
+    控制最后一段：视觉关掉时 ``scan_visual_subjects`` 没有注册，不能教模型调它。
     """
-    return _render_message("stall_notice", language=language, description=description)
+    return _render_message(
+        "stall_notice",
+        language=language,
+        kind=kind,
+        repeats=repeats,
+        window=window,
+        fingerprint=fingerprint,
+        vision_enabled=vision_enabled,
+    )
 
 
 def has_element_table(screen_elements: list[ScreenElement] | None) -> bool:
@@ -631,7 +788,7 @@ def build_executor_messages(
         goal: 本次子目标的目标陈述。
         screen_elements: 当屏的统一元素表（Contextor 建的，当屏的；UI 行和 OCR
             行共用一套编号）。空或 None 表示这一屏没有任何可寻址的行。
-        local_messages: 本子目标内的局部历史。发给 LLM 的那份会按需截断过长的
+        local_messages: 本轮内的局部历史。发给 LLM 的那份会按需截断过长的
             成功工具结果（见 :func:`truncate_local_history`），``state`` 里的原
             对象不动，Reporter 读的是原对象。
         device_state_lines: 设备状态行。

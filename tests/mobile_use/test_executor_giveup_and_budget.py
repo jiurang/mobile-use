@@ -367,9 +367,47 @@ def test_stall_notice_tells_the_model_it_may_give_up():
 
     提醒里必须出现 ``failed`` 这个出口，否则模型还是只会继续试。
     """
-    notice = render_stall_notice("you came back to the same page 4 times", language="en")
+    notice = render_stall_notice(
+        kind="screen",
+        repeats=4,
+        window=8,
+        fingerprint="abc123",
+        vision_enabled=True,
+        language="en",
+    )
     assert "failed" in notice
-    assert "same page" in notice
+    assert "4 times" in notice
+
+
+def test_stall_notice_is_localized():
+    """中英各自成句 —— 描述句不能再硬编码在 Python 里（英文 prompt 会混中文）。"""
+    kwargs = {
+        "kind": "screen",
+        "repeats": 4,
+        "window": 8,
+        "fingerprint": "abc123",
+        "vision_enabled": True,
+    }
+    en = render_stall_notice(**kwargs, language="en")
+    zh = render_stall_notice(**kwargs, language="zh")
+
+    assert "same page" in en
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in en), f"英文块里混进了中文：{en}"
+    assert "同一个页面" in zh
+
+
+def test_stall_notice_does_not_ask_for_vision_when_vision_is_off():
+    """视觉关掉时 ``scan_visual_subjects`` 根本没注册，不能教模型去调它。"""
+    notice = render_stall_notice(
+        kind="action",
+        repeats=3,
+        window=8,
+        fingerprint="tap:target",
+        vision_enabled=False,
+        language="en",
+    )
+    assert "scan_visual_subjects" not in notice
+    assert "failed" in notice
 
 
 def test_stall_notice_is_placed_after_the_local_history():

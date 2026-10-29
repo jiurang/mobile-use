@@ -87,17 +87,13 @@ def test_executor_manifest_is_the_single_source_of_order():
     sections = _manifest()["system"]
     assert [s["name"] for s in sections] == [
         "identity",
-        "loop",
-        "perception",
         "vision",
         "tools",
         "output",
     ]
-    assert [s["order"] for s in sections] == [-100, 10, 20, 30, 40, 50]
+    assert [s["order"] for s in sections] == [-100, 30, 40, 50]
     # 只有视觉段是条件段：开关由 Python 给，模板里不写 {% if %}。
     assert [s.get("when") for s in sections] == [
-        None,
-        None,
         None,
         "vision_enabled",
         None,
@@ -120,7 +116,7 @@ def test_executor_system_sections_are_pure_interpolation():
         assert "{%" not in source, f"{path.name} 里出现了模板逻辑"
         used |= meta.find_undeclared_variables(env.parse(source))
 
-    assert used == {"platform", "executor_tools_list"}
+    assert used == {"platform", "executor_tools_table"}
 
 
 def test_executor_manifest_owns_every_message_block():
@@ -129,6 +125,7 @@ def test_executor_manifest_owns_every_message_block():
     assert [m["name"] for m in messages] == [
         "task_started",
         "goal",
+        "previous_attempt",
         "device_state",
         "screen_elements",
         "vision_subjects",
@@ -158,7 +155,7 @@ def test_executor_prompt_renders_without_leftover_placeholders():
     rendered = render_system(
         {
             "platform": "android",
-            "executor_tools_list": "tap, back",
+            "executor_tools_table": "| `tap` | `target` | Tap |",
             "vision_enabled": True,
         },
         language=PromptLanguage.EN,
@@ -173,14 +170,13 @@ def test_executor_vision_section_follows_the_switch():
     from minitap.mobile_use.agents.executor.prompt import render_system
     from minitap.mobile_use.prompt_language import PromptLanguage
 
-    values = {"platform": "android", "executor_tools_list": "tap"}
+    values = {"platform": "android", "executor_tools_table": "| `tap` | `target` | Tap |"}
     with_vision = render_system({**values, "vision_enabled": True}, language=PromptLanguage.EN)
     without_vision = render_system({**values, "vision_enabled": False}, language=PromptLanguage.EN)
 
     assert "## Visual perception" in with_vision
     assert "scan_visual_subjects" in with_vision
     assert "## Visual perception" not in without_vision
-    assert "## Perception" in without_vision
     assert "## Tools" in without_vision
 
 
@@ -210,7 +206,7 @@ def test_executor_prompt_is_an_independent_decider():
     assert "Cortex" not in text
     # 自己决定：目标和循环都在自己手里
     assert "exactly **one** goal" in text
-    assert "## Your Loop" in text
+    assert "One action at a time" in text
 
 
 def test_executor_prompt_keeps_element_targeting_contract():
@@ -236,51 +232,43 @@ def test_executor_prompt_keeps_element_targeting_contract():
 
 
 def test_executor_prompt_keeps_text_tools_table():
-    """文本工具表要留着（含 `{{ executor_tools_list }}` 那行）。
+    """文本工具表的**表头**要留着，行由 Python 按实际注册工具生成。
 
     Executor 不 bind_tools（方案 §3.1：schema 每轮多背 4,008 token 且不进缓存键），
-    工具怎么用全靠这张表教。
+    工具怎么用全靠这张表教。表行不能手写：录屏 / 视觉工具是条件注册的，
+    手写会漂移成「表里有、实际调不到」。行集合的断言见
+    ``test_executor_autonomy.py::test_t18d_tools_table_rows_match_the_registered_tools``。
     """
     text = _prompt_file("system/40-tools")
     assert "## Tools" in text
-    assert "Available tools: {{ executor_tools_list }}" in text
-    for tool in (
-        "`launch_app`",
-        "`tap`",
-        "`long_press_on`",
-        "`focus_and_input_text`",
-        "`focus_and_clear_text`",
-        "`swipe_percentages`",
-        "`press_key`",
-        "`wake_screen`",
-    ):
-        assert tool in text, f"工具表少了 {tool}"
+    assert "{{ executor_tools_table }}" in text
+    assert "| Tool | Arguments | Notes |" in text
+    assert "{{ executor_tools_list }}" not in text
 
 
 def test_executor_prompt_keeps_perception_channels():
     """感知通道不能丢：元素表（UI 行 + OCR 行）+ 设备状态（息屏）。
 
-    2026-10-24：与 zh 版对齐后，system prompt 不再按开关分支渲染 ——
-    两条通道改成一句静态描述，开关带来的差异由**每轮消息块**自己说清：
-    两条通道全关时 `device_state_message` 明确告知「没有感知通道」。
+    行格式和 OCR 置信度规则住在**元素表消息自己的表头**里 —— 那是数据出现的地方；
+    system 里不再有一节「## Perception」转述它。
 
-    2026-10-28：UI 行和 OCR 行已经是同一张元素表，不再有独立的 OCR 块。
-
-    所以这里断言的是「通道信息没有丢」，而不是「必须在 system prompt 里分支」。
+    开关带来的状态由**每轮消息块**自己说清：两条通道全关时
+    `device_state` 明确告知「没有感知通道」。
     """
-    perception = _prompt_file("system/20-perception")
+    screen = _prompt_file("messages/screen-elements")
     device_state = _prompt_file("messages/device-state")
     tools = _prompt_file("system/40-tools")
 
-    assert "## Perception" in perception
-    # 同一张表里包含两种行
-    assert "element table" in perception
-    assert "OCR text rows" in perception
+    # 同一张表里包含两种行，且 OCR 行自带置信度说明
+    assert "Screen elements" in screen
+    assert "OCR text" in screen
+    assert "confidence" in screen and "0.6" in screen
     # 开关带来的状态由运行时块承载
     assert "NO perception channel is available" in device_state
     # 息屏告知（真机教训：30 分钟息屏让任务从 30 步涨到 51 步）
     assert "Screen is OFF" in device_state
-    assert "wake_screen" in tools
+    # wake_screen 的说明行由生成器负责（见注册集合测试）
+    assert "{{ executor_tools_table }}" in tools
 
 
 def test_executor_prompt_has_no_trace_of_the_picture_channel():
@@ -310,7 +298,8 @@ def test_executor_prompt_has_no_trace_of_the_picture_channel():
     # 两条**文字**通道还在：元素表 / 视觉主体列表
     text = _prompt_text()
     assert "element table" in text
-    assert "visual-subjects" in text
+    assert "Visual subjects" in text
+    assert "vision_index" in text
 
 
 def test_executor_prompt_has_no_tool_json_schema():

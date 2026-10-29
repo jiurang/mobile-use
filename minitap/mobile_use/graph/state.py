@@ -144,14 +144,13 @@ class State(BaseModel):
 
     # ---- Executor 自主执行（方案 v2，doc/executor-autonomy-plan.md §8）----
     #
-    # 语义变化：`executor_messages` 从「Cortex 每轮清空」变成
-    # 「**Cortex 下发新子目标时**清空」—— 它现在是 Executor 在**本子目标内**的
-    # 局部历史（动作 + 工具反馈交替）。工具层写这个 key 的代码**不用改**
-    # （`EXECUTOR_MESSAGES_KEY` 常量不变），清空责任从 Cortex 转移到 Cortex 的
-    # 「下发目标」那一刻。
+    # 语义：`executor_messages` 是 Executor 在**一轮内**的局部历史（动作 + 工具
+    # 反馈交替），一轮 = 一次执行尝试。Cortex **每次下发目标**都清空它（含同一个
+    # 子目标的换招重发），并把上一轮汇报压成一条事实摘要放进新一轮的第一条。
+    # 工具层写这个 key 的代码不用改（`EXECUTOR_MESSAGES_KEY` 常量不变）。
 
     # 本次子目标的目标陈述（Cortex → Executor）。Cortex 每次下发新目标时，
-    # 同时清空 executor_messages，让 Executor 的局部历史从零开始。
+    # 同时清空 executor_messages 并注入上一轮的事实摘要，让每一轮都从零开始。
     executor_goal: Annotated[
         str | None,
         "The goal statement for the current subgoal, issued by Cortex",
@@ -188,11 +187,11 @@ class State(BaseModel):
         "Executor explicitly gave up on the current subgoal (cannot be achieved)",
     ] = False
 
-    # 本子目标内的**进展指纹**（每步一条），供「有没有在原地打转」的检测用。
+    # 本轮内的**进展指纹**（每步一条），供「有没有在原地打转」的检测用。
     #
     # 一条 = ``{"action": <动作指纹>, "screen": <屏幕指纹>, "nudged": <bool>}``。
-    # 由 Executor 节点追加，Cortex 下发新目标时清空（和 ``executor_messages``
-    # 同一个生命周期：属于「本子目标内」）。
+    # 由 Executor 节点追加，Cortex 每次下发目标时清空（和 ``executor_messages``
+    # 同一个生命周期：属于「一轮内」）。
     #
     # ⚠️ 这里存的是**指纹**（哈希），不是原始内容 —— 它的唯一用途是
     # 「和上一次比一比是不是同一屏/同一个动作」，不需要原文。
