@@ -41,6 +41,15 @@ def _session_id_from_env() -> str | None:
 
 
 @dataclass
+class InterruptedTurn:
+    """上一进程留下的、没有 ``turn/end`` 的 Turn。"""
+
+    id: str
+    goal: str
+    max_steps: int | None = None
+
+
+@dataclass
 class AgentSessionRecord:
     """一个 agent 在一次 turn 内的局部上下文域。"""
 
@@ -202,6 +211,7 @@ class Session:
         self._open_sessions: dict[str, AgentSessionRecord] = {}
         self._records: list[AgentSessionRecord] = []
         self._open_steps: list[StepHandle] = []
+        self._interrupted: InterruptedTurn | None = None
 
     # ---- session -----------------------------------------------------
     @property
@@ -255,12 +265,14 @@ class Session:
             return 0
 
         open_turns: list[str] = []
+        turn_starts: dict[str, Event] = {}
         open_steps: dict[str, Event] = {}
         open_sessions: dict[str, Event] = {}
         steps_of_session: dict[str, int] = {}
         for event in events:
             if event.type == "turn/start" and event.turn_id:
                 open_turns.append(event.turn_id)
+                turn_starts[event.turn_id] = event
             elif event.type == "turn/end" and event.turn_id in open_turns:
                 open_turns.remove(event.turn_id)
             elif event.type == "agent_session/start" and event.agent_session_id:
@@ -278,6 +290,14 @@ class Session:
 
         written = 0
         for turn_id in open_turns:
+            start = turn_starts.get(turn_id)
+            if start is not None:
+                max_steps = start.payload.get("max_steps")
+                self._interrupted = InterruptedTurn(
+                    id=turn_id,
+                    goal=str(start.payload.get("goal") or ""),
+                    max_steps=max_steps if isinstance(max_steps, int) else None,
+                )
             for step in [e for e in open_steps.values() if e.turn_id == turn_id]:
                 self.log.append(
                     "step/end",
@@ -334,6 +354,24 @@ class Session:
             turn_id=turn.id,
             payload={"goal": goal, **({"max_steps": max_steps} if max_steps else {})},
         )
+        return turn
+
+    def resume_turn(self) -> TurnHandle | None:
+        """接上被中断的那个 Turn：不新开 id、不重发 ``turn/start``。
+
+        没有可恢复的 Turn 时返回 ``None``（调用方自己决定是报错还是开新 turn）。
+        """
+        self.start()
+        info = self._interrupted
+        if info is None:
+            return None
+        self._interrupted = None
+        suffix = info.id.rsplit("_", 1)[-1]
+        if suffix.isdigit():
+            self._turns = max(self._turns, int(suffix))
+        turn = TurnHandle(self, info.id, info.goal, info.max_steps)
+        self._current_turn = turn
+        self.log.append("turn/resume", turn_id=turn.id, payload={"goal": info.goal})
         return turn
 
     # ---- agent session ----------------------------------------------

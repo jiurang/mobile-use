@@ -8,11 +8,14 @@ from io import BytesIO
 from pathlib import Path
 from shutil import which
 from types import NoneType
-from typing import TypeVar, overload
+from typing import Any, TypeVar, overload
 
 import httpx
 from adbutils import AdbClient
 from dotenv import load_dotenv
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from PIL import Image
 from pydantic import BaseModel
@@ -38,6 +41,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
 from minitap.mobile_use.graph.graph import get_graph
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.prompt_language import resolve_prompt_language
+from minitap.mobile_use.runtime.checkpoints import checkpoint_db_path, checkpoint_enabled
 from minitap.mobile_use.runtime.session import Session
 from minitap.mobile_use.sdk.builders.agent_config_builder import get_default_agent_config
 from minitap.mobile_use.sdk.builders.task_request_builder import TaskRequestBuilder
@@ -185,6 +189,9 @@ class Agent:
     _task_lock: asyncio.Lock
     #: 会话运行时：跨 task 存活，一个 Agent 一个 Session（设备独占）。
     _runtime: Session
+    #: 执行快照：只在 P3 续跑时需要；初始化失败时降级为 None（不影响任务）。
+    _checkpointer: BaseCheckpointSaver | None = None
+    _checkpointer_cm: Any = None
     _cloud_instance_id: str | None = None
     _cloud_controller: CloudAndroidController | CloudIosController | None = None
 
@@ -690,9 +697,23 @@ class Agent:
             task_request.with_app_path(app_path=app_path)
         return await self._run_task(task_request.build())
 
+    async def resume_task(
+        self,
+        *,
+        request: TaskRequest[TOutput],
+    ) -> str | dict | TOutput | None:
+        """续跑上一次进程被中断的 Turn。
+
+        需要 ``MOBILE_USE_SESSION_ID`` 指向原来的会话 id；没有可恢复的 Turn 或
+        没有对应 checkpoint 时抛错，不会悄悄开一个新的 turn。
+        """
+        return await self._run_task(request=request, resume=True)
+
     async def _run_task(
         self,
         request: TaskRequest[TOutput],
+        *,
+        resume: bool = False,
     ) -> str | dict | TOutput | None:
         if not self._initialized:
             raise AgentNotInitializedError()
@@ -772,7 +793,8 @@ class Agent:
 
         logger.info(f"[{task_name}] Starting graph with goal: `{request.goal}`")
         state = self._get_graph_state(task=task)
-        graph_input = state.model_dump()
+        # 续跑时输入是 None：从该 thread 的最后一个 checkpoint 继续，不重放首节点。
+        graph_input = None if resume else state.model_dump()
         task_start_time = datetime.now(UTC)
         # 「任务开始的时间」给 Executor / Cortex 看的。
         #
@@ -794,23 +816,53 @@ class Agent:
             last_state: State | None = None
             last_state_snapshot: dict | None = None
             output = None
+            checkpointer: BaseCheckpointSaver | None = None
+            thread_id = ""
             # 会话层：一个 task = 一个 Turn。turn/start 在最外层记一次边界，
             # 内部所有 agent 的 AgentSession 与 Step 都挂在这个 Turn 下。
-            turn = self._runtime.begin_turn(
-                goal=request.goal,
-                max_steps=task.request.max_steps,
-                device_id=self._device_context.device_id,
-            )
+            if resume:
+                turn = self._runtime.resume_turn()
+                if turn is None:
+                    raise AgentTaskRequestError(
+                        f"No interrupted turn to resume for session {self._runtime.id}"
+                    )
+                if request.goal.strip() and request.goal != turn.goal:
+                    raise AgentTaskRequestError(
+                        "Resume goal does not match the interrupted turn: "
+                        f"{request.goal!r} != {turn.goal!r}"
+                    )
+            else:
+                turn = self._runtime.begin_turn(
+                    goal=request.goal,
+                    max_steps=task.request.max_steps,
+                    device_id=self._device_context.device_id,
+                )
             turn_status = "failed"
             try:
                 logger.info(f"[{task_name}] Invoking graph with input: {graph_input}")
                 await task.set_status(status="running", message="Invoking graph...")
-                async for chunk in (await get_graph(context)).astream(
+                checkpointer = await self._ensure_checkpointer()
+                if resume and checkpointer is None:
+                    raise AgentTaskRequestError(
+                        "Cannot resume: checkpoints are disabled (MOBILE_USE_CHECKPOINT=0)"
+                    )
+                thread_id = f"{self._runtime.id}:{turn.id}"
+                graph = await get_graph(context, checkpointer=checkpointer)
+                graph_config: RunnableConfig = {
+                    "recursion_limit": compute_recursion_limit(task.request.max_steps),
+                    "callbacks": self._config.graph_config_callbacks,
+                }
+                if checkpointer is not None:
+                    graph_config["configurable"] = {"thread_id": thread_id}
+                    if graph_input is None:
+                        snapshot = await graph.aget_state(graph_config)
+                        if not snapshot.values:
+                            raise AgentTaskRequestError(
+                                f"No checkpoint to resume for thread {thread_id}"
+                            )
+                async for chunk in graph.astream(
                     input=graph_input,
-                    config={
-                        "recursion_limit": compute_recursion_limit(task.request.max_steps),
-                        "callbacks": self._config.graph_config_callbacks,
-                    },
+                    config=graph_config,
                     stream_mode=["messages", "custom", "updates", "values"],
                 ):
                     stream_mode, payload = chunk
@@ -942,6 +994,13 @@ class Agent:
             finally:
                 # Turn 的终态由上面各分支显式赋值；异常路径兜底为 failed。
                 turn.end(turn_status)
+                # 正常收尾就删掉这一个 thread 的快照：resume 只对「进程被杀、
+                # finally 没跑到」的 turn 有意义，留着的快照只会让库无限长大。
+                if checkpointer is not None and thread_id:
+                    try:
+                        await checkpointer.adelete_thread(thread_id)
+                    except Exception as exc:  # noqa: BLE001 - 清理失败不能影响任务
+                        logger.warning(f"[runtime] cannot delete checkpoint {thread_id}: {exc}")
                 await self._finalize_tracing(task=task, context=context)
 
         async with self._task_lock:
@@ -961,6 +1020,40 @@ class Agent:
                 return await self._current_task
             finally:
                 self._current_task = None
+
+    async def _ensure_checkpointer(self) -> BaseCheckpointSaver | None:
+        """执行快照：懒创建、失败降级。
+
+        快照只是 resume 的缓存，不是任务必需品 —— 库打不开（只读目录 / 缺
+        aiosqlite）时只警告一次，任务照常跑。
+        """
+        if not checkpoint_enabled():
+            return None
+        if self._checkpointer is not None:
+            return self._checkpointer
+        try:
+            path = checkpoint_db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(path))
+            self._checkpointer = await self._checkpointer_cm.__aenter__()
+            logger.info(f"[runtime] checkpoints -> {path}")
+            return self._checkpointer
+        except Exception as exc:  # noqa: BLE001 - 快照失败不能影响任务
+            logger.warning(f"[runtime] checkpoints disabled: {exc}")
+            self._checkpointer = None
+            self._checkpointer_cm = None
+            return None
+
+    async def _close_checkpointer(self) -> None:
+        cm = self._checkpointer_cm
+        self._checkpointer = None
+        self._checkpointer_cm = None
+        if cm is None:
+            return
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception as exc:  # noqa: BLE001 - 关闭失败只影响下次启动
+            logger.warning(f"[runtime] cannot close checkpoints: {exc}")
 
     def stop_current_task(self):
         """Requests cancellation of the currently running automation task."""
@@ -1051,6 +1144,7 @@ class Agent:
     async def clean(self, force: bool = False):
         # 会话层收尾：无论走哪条清理分支，Session 都必须关闭（幂等）。
         self._runtime.end(reason="agent_clean")
+        await self._close_checkpointer()
         if self._cloud_instance_id:
             await self._cleanup_cloud_device()
             self._initialized = False

@@ -40,6 +40,7 @@
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -116,7 +117,17 @@ def post_executor_gate(
     return "report"
 
 
-async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
+async def get_graph(
+    ctx: MobileUseContext,
+    *,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> CompiledStateGraph:
+    """构建整张图。
+
+    ``checkpointer`` 只影响「状态能不能在进程重启后复原」，不改拓扑、不改判定：
+    传入时每个 Turn 以 ``<session_id>:<turn_id>`` 为 thread，崩溃后可以从最后
+    一个 checkpoint 续跑；不传时就是原来的纯内存运行。
+    """
     graph_builder = StateGraph(State)
 
     ## Define nodes
@@ -186,4 +197,4 @@ async def get_graph(ctx: MobileUseContext) -> CompiledStateGraph:
     # 不能直接回 executor：那样工具解析 Target.index 时拿到的是别的屏的编号。
     graph_builder.add_edge("executor_tools", "contextor")
 
-    return graph_builder.compile()
+    return graph_builder.compile(checkpointer=checkpointer)
