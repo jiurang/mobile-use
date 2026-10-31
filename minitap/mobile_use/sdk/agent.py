@@ -38,6 +38,7 @@ from minitap.mobile_use.controllers.platform_specific_commands_controller import
 from minitap.mobile_use.graph.graph import get_graph
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.prompt_language import resolve_prompt_language
+from minitap.mobile_use.runtime.session import Session
 from minitap.mobile_use.sdk.builders.agent_config_builder import get_default_agent_config
 from minitap.mobile_use.sdk.builders.task_request_builder import TaskRequestBuilder
 from minitap.mobile_use.sdk.budget import BudgetExhaustedError, build_budget_report
@@ -182,6 +183,8 @@ class Agent:
     _ios_device_type: DeviceType | None
     _current_task: asyncio.Task | None = None
     _task_lock: asyncio.Lock
+    #: 会话运行时：跨 task 存活，一个 Agent 一个 Session（设备独占）。
+    _runtime: Session
     _cloud_instance_id: str | None = None
     _cloud_controller: CloudAndroidController | CloudIosController | None = None
 
@@ -191,6 +194,7 @@ class Agent:
         self._tmp_traces_dir = Path(tempfile.gettempdir()) / "mobile-use-traces"
         self._initialized = False
         self._task_lock = asyncio.Lock()
+        self._runtime = Session()
 
     async def init(
         self,
@@ -198,6 +202,11 @@ class Agent:
         retry_count: int = 5,
         retry_wait_seconds: int = 5,
     ):
+        # clean() 之后重新 init 的用户应该拿到一段全新的会话记录，而不是
+        # 在已经 session/end 的日志上继续追加。
+        if self._runtime.ended:
+            self._runtime = Session()
+
         # Start telemetry session for SDK usage (if not already started by CLI)
         if not telemetry._session_id:
             telemetry.start_session({"source": "sdk"})
@@ -738,6 +747,7 @@ class Agent:
                 and agent_profile.llm_config.utils.video_analyzer is not None
             ),
             perception=self._config.perception,
+            runtime_session=self._runtime,
             # 提示词语言在这里**定案**：任务级 > Agent 级 > 环境变量 > 英文。
             # 放进 context 之后，各 agent 只管读 context.prompt_language，
             # 不再各自去读环境变量（环境变量是进程级的，读不了「这次任务」）。
@@ -784,6 +794,14 @@ class Agent:
             last_state: State | None = None
             last_state_snapshot: dict | None = None
             output = None
+            # 会话层：一个 task = 一个 Turn。turn/start 在最外层记一次边界，
+            # 内部所有 agent 的 AgentSession 与 Step 都挂在这个 Turn 下。
+            turn = self._runtime.begin_turn(
+                goal=request.goal,
+                max_steps=task.request.max_steps,
+                device_id=self._device_context.device_id,
+            )
+            turn_status = "failed"
             try:
                 logger.info(f"[{task_name}] Invoking graph with input: {graph_input}")
                 await task.set_status(status="running", message="Invoking graph...")
@@ -838,8 +856,10 @@ class Agent:
                     steps_count=steps_count,
                     duration_seconds=duration,
                 )
+                turn_status = "completed"
                 return output
             except asyncio.CancelledError:
+                turn_status = "cancelled"
                 err = f"[{task_name}] Task cancelled"
                 logger.warning(err)
                 await task.finalize(
@@ -859,6 +879,7 @@ class Agent:
                 )
                 raise
             except GraphRecursionError as e:
+                turn_status = "budget_exceeded"
                 # ---- 预算耗尽 → **优雅收尾 + 上报**，不是崩溃 ----
                 #
                 # 撞 `recursion_limit` 不是「异常」，是**预算用完了**。
@@ -919,6 +940,8 @@ class Agent:
                     )
                 raise
             finally:
+                # Turn 的终态由上面各分支显式赋值；异常路径兜底为 failed。
+                turn.end(turn_status)
                 await self._finalize_tracing(task=task, context=context)
 
         async with self._task_lock:
@@ -1026,6 +1049,8 @@ class Agent:
             raise Exception(f"Unsupported platform: {self._device_context.mobile_platform}")
 
     async def clean(self, force: bool = False):
+        # 会话层收尾：无论走哪条清理分支，Session 都必须关闭（幂等）。
+        self._runtime.end(reason="agent_clean")
         if self._cloud_instance_id:
             await self._cleanup_cloud_device()
             self._initialized = False
@@ -1338,18 +1363,28 @@ class Agent:
     ) -> str | dict | TOutput | None:
         if output_config and output_config.needs_structured_format():
             logger.info(f"[{task_name}] Generating structured output...")
+            runtime = ctx.runtime_session
+            step = (
+                runtime.begin_step("outputter", goal=state.initial_goal)
+                if runtime is not None
+                else None
+            )
             try:
                 structured_output = await outputter(
                     ctx=ctx,
                     output_config=output_config,
                     graph_output=state,
                 )
+                if step is not None:
+                    step.end("completed")
                 logger.info(f"[{task_name}] Structured output: {structured_output}")
                 record_events(output_path=request.llm_output_path, events=structured_output)
                 if request.output_format is not None and request.output_format is not NoneType:
                     return request.output_format.model_validate(structured_output)
                 return structured_output
             except Exception as e:
+                if step is not None:
+                    step.end("failed")
                 logger.error(f"[{task_name}] Failed to generate structured output: {e}")
                 return None
         if state and state.agents_thoughts:

@@ -405,6 +405,16 @@ class CortexNode:
         # 出口都把它清掉（见下面的 update）。
         report = build_executor_report(state, self.ctx) if state.executor_done else None
 
+        # 会话层：Executor 的一次尝试在这里结束。汇报被消费的同时关闭它的
+        # AgentSession，下一轮下发目标时再开一个新的（见下面的 issue 分支）。
+        runtime = self.ctx.runtime_session
+        if report is not None and runtime is not None:
+            runtime.close_agent_session(
+                "executor",
+                reason="completed" if report.outcome == "completed" else "failed",
+                summary=report.summary,
+            )
+
         executor_tools = executor_wrappers(self.ctx)
 
         # system prompt 整段静态：不再接 initial_goal、计划、汇报这类每轮变化的
@@ -480,9 +490,7 @@ class CortexNode:
             # （文案硬编码在这里，与本文件既有的做法一致。）
             notes: list[str] = []
             if compaction_enabled:
-                notes.append(
-                    "Older cortex reasoning is compressed to its first and last sentence."
-                )
+                notes.append("Older cortex reasoning is compressed to its first and last sentence.")
             notes.append(
                 "Planning-level entries only: my own reasoning, orchestrator milestones, "
                 "and Executor failures. Successful Executor steps are omitted — the "
@@ -561,6 +569,7 @@ class CortexNode:
         #
         # LLM 客户端也一起跳过：规则路径连 cortex 的模型配置都不需要，少建一个
         # 用不上的客户端，也少一条「模型不可用就整个节点挂掉」的路。
+        step = None
         if report is not None and should_use_rule_retry(
             report=report,
             subgoal_id=subgoal_id,
@@ -576,6 +585,12 @@ class CortexNode:
                 "re-issuing it with the rule-based retry (no LLM call)"
             )
         else:
+            # 只有真正调模型的分支才开 Step：规则换招没有请求，不算一步。
+            if runtime is not None:
+                step = runtime.begin_step(
+                    "cortex",
+                    goal=current_subgoal.description if current_subgoal else None,
+                )
             llm = get_llm(ctx=self.ctx, name="cortex", temperature=1).with_structured_output(
                 CortexOutput
             )
@@ -671,6 +686,9 @@ class CortexNode:
                 )
                 decision_source = "llm"
 
+        if step is not None:
+            step.end("degraded" if decision_source == "degraded" else "completed")
+
         update: dict[str, Any] = {
             # latest_ui_hierarchy 没有索引契约，清掉保持工具侧现取
             # （contextor 建完元素表后也清；这里再清一次是兜底）。
@@ -685,6 +703,14 @@ class CortexNode:
         if decision.action == "issue":
             assert decision.goal is not None  # decide_next_step 保证
             update["executor_goal"] = decision.goal
+            # 会话层：每次下发目标 = 开一个新的 Executor AgentSession。
+            # 上一层尝试已在入口关闭，这里不会出现两个同时打开的 executor 会话。
+            if runtime is not None:
+                runtime.open_agent_session(
+                    "executor",
+                    scope=f"subgoal:{subgoal_id}",
+                    seed=report.summary if report is not None else decision.reason,
+                )
             # 一轮一生命周期：每次下发目标都清空局部历史（含同一子目标的换招重发）。
             #
             # 清空挡的是「跨轮累加」：局部历史每步约 +3 条消息 / +490 字符，不清

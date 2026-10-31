@@ -21,6 +21,7 @@ from minitap.mobile_use.config import AgentNode, LLMConfig
 from minitap.mobile_use.controllers.cloud_device_controller import CloudAndroidController
 from minitap.mobile_use.perception.frame import ScreenFrame
 from minitap.mobile_use.prompt_language import PromptLanguage
+from minitap.mobile_use.runtime.session import Session
 from minitap.mobile_use.services.ocr.types import OcrConfig
 
 
@@ -230,6 +231,14 @@ class MobileUseContext(BaseModel):
     on_plan_changes: Callable[[list[Subgoal], IsReplan], Coroutine] | None = None
     video_recording_enabled: bool = False
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
+
+    #: **会话运行时**（Session / Turn / AgentSession / Step）。
+    #:
+    #: 只用于观测与日志，不参与任何控制流；所有埋点失败都必须降级成 no-op。
+    #: 为 None 时（测试、旧调用方）这一层整体静默 —— 见 ``docs/会话架构方案v1.md``。
+    #:
+    #: ``exclude`` 保证 ctx 被序列化时不把整个会话对象带出去。
+    runtime_session: Session | None = Field(default=None, exclude=True)
 
     #: **本轮感知帧**：Contextor 每步发布，截图、元素表、OCR、视觉主体都挂在
     #: 同一份对象上（见 ``perception/frame.py`` 的不变量）。

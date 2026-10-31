@@ -29,7 +29,7 @@ iOS / 云设备这类不认识的形状只有 OCR 行。模型一律填 ``Target
 一条感知是元素表（UI 行 + OCR 行）+ **按需视觉主体列表**。
 视觉主体由 Executor 自己调用 ``scan_visual_subjects`` 触发（用法见
 ``prompts/<lang>/system/30-tools.md`` 的工具表，回执见
-``prompts/<lang>/messages/per-turn/vision-subjects.md``）；框架只负责把最近一次
+``prompts/<lang>/messages/per-step/vision-subjects.md``）；框架只负责把最近一次
 扫描的缓存渲染成一块表，并在屏幕变化后清掉它。
 
 屏幕截图不进模型。prompt 里没有任何图，模型只有两条文字通道：元素表、
@@ -107,7 +107,9 @@ class _PromptMessage:
 _WHEN_KEYS = frozenset({"vision_enabled"})
 
 #: 消息块的生命周期标签。清单里只做声明与校验，不参与排序。
-_VOLATILITIES = frozenset({"per-task", "per-goal", "per-turn", "occasional", "terminal"})
+#: 名字与目录同名（``messages/<volatility>/<name>.md``），三者由同一个语义决定：
+#: ``per-turn`` 整场运行不变、``per-agent-session`` 局部上下文域内不变、``per-step`` 每步重建。
+_VOLATILITIES = frozenset({"per-turn", "per-agent-session", "per-step", "occasional", "terminal"})
 
 
 def _load_manifest() -> tuple[tuple[_PromptSection, ...], dict[str, _PromptMessage]]:
@@ -240,7 +242,7 @@ _TOOL_NOTES: dict[str, tuple[str, str]] = {
         "一直录到调用 `stop_video_recording`",
     ),
     "stop_video_recording": (
-        'Stops the recording, then analyzes the video; `prompt` says what to extract '
+        "Stops the recording, then analyzes the video; `prompt` says what to extract "
         '(e.g. "what happens after each 10s")',
         "停止录制，然后分析视频；`prompt` 说明要提取什么（例如「每 10 秒发生了什么」）",
     ),
@@ -318,9 +320,7 @@ def render_executor_system(ctx: MobileUseContext) -> str:
     return render_system(
         {
             "platform": ctx.device.mobile_platform.value,
-            "executor_tools_table": format_executor_tools_table(
-                ctx, language=ctx.prompt_language
-            ),
+            "executor_tools_table": format_executor_tools_table(ctx, language=ctx.prompt_language),
         },
         language=ctx.prompt_language,
     )
@@ -723,6 +723,78 @@ def rewrite_history_tool_calls(messages: list[AnyMessage]) -> list[AnyMessage]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# 一个 Step 的前四段（见 docs/会话架构方案v1.md 章节3）
+# ---------------------------------------------------------------------------
+#
+# ``assemble`` 稳定前缀：system（按 manifest 拼装）、任务开始时间、目标陈述。
+# ``propose``  本步的候选块，按固定顺序（越靠后越晚失效）。
+# ``admit``    准入：渲染为空的块不进请求；后续准入策略只改这一个函数。
+# ``render``   拼成消息列表；重试（attempt）复用这份结果，不重新组装。
+
+
+def assemble_executor_prompt(ctx: MobileUseContext, *, goal: str) -> list[BaseMessage]:
+    """稳定前缀：system → 任务开始时间 → 目标陈述。
+
+    这三段在整个 AgentSession 内逐字节稳定，是请求里最大的一段缓存前缀。
+    """
+    messages: list[BaseMessage] = [SystemMessage(content=render_executor_system(ctx))]
+
+    # 任务开始时间：系统提示词之后，单独一条消息。
+    #
+    # 为什么不塞进系统提示词的内容里：系统提示词必须逐字节稳定，它是整段请求里
+    # 最大的一块。塞进去，它就变成「每任务唯一」，同一 persona 的不同任务之间不再
+    # 共享那段缓存。单独一条，系统提示词一个字不动，跨任务照样能复用。
+    #
+    # 为什么这条消息是安全的：任务开始时间整场运行不变，它和它前面的系统提示词
+    # 一样是前缀的一部分，永远命中。
+    task_started_at = format_task_started_at(ctx.task_started_at)
+    if task_started_at:
+        messages.append(
+            HumanMessage(content=render_task_started(task_started_at, language=ctx.prompt_language))
+        )
+
+    messages.append(HumanMessage(content=render_goal_message(goal, language=ctx.prompt_language)))
+    return messages
+
+
+def propose_executor_blocks(
+    *,
+    ctx: MobileUseContext,
+    device_state_lines: list[str],
+    screen_elements: list[ScreenElement] | None,
+    vision_elements: list[VisionElement] | None,
+    stall_notice: str | None,
+) -> list[tuple[str, str]]:
+    """本步的候选块，按固定顺序；空串表示这一块不适用。
+
+    顺序就是缓存顺序：每步变的块排在局部历史之后（由调用方拼接），元素表永远
+    最后 —— 它每步重编号，永不进缓存。
+    """
+    elements = screen_elements or []
+    return [
+        ("device_state", "\n".join(device_state_lines)),
+        ("stall_notice", stall_notice or ""),
+        (
+            "vision_subjects",
+            render_vision_subjects_message(vision_elements, language=ctx.prompt_language),
+        ),
+        (
+            "screen_elements",
+            (
+                render_screen_message(elements, language=ctx.prompt_language)
+                if has_element_table(elements)
+                else ""
+            ),
+        ),
+    ]
+
+
+def admit_executor_blocks(blocks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """准入：渲染为空的块不进入本 Step 的请求。"""
+    return [(name, text) for name, text in blocks if text]
+
+
 def build_executor_messages(
     *,
     ctx: MobileUseContext,
@@ -735,15 +807,15 @@ def build_executor_messages(
 ) -> list[BaseMessage]:
     """组装 Executor 每一轮的 prompt。
 
-    顺序上每轮变的一律靠后：
+    顺序上每步变的一律靠后：
 
     1. SystemMessage：``render_system`` 按 manifest 拼出的稳定指令。
-    2. HumanMessage：目标陈述（子目标内恒定）。
+    2. HumanMessage：目标陈述（AgentSession 内恒定）。
     3. 局部历史：动作 + 工具反馈，只追加。
-    4. HumanMessage：设备状态（每轮变，前台 app 会变）。
-    5. HumanMessage：「没有进展」提醒（偶发，只在检测到重复的那一轮）。
+    4. HumanMessage：设备状态（每步变，前台 app 会变）。
+    5. HumanMessage：「没有进展」提醒（偶发，只在检测到重复的那一步）。
     6. HumanMessage：本屏视觉主体表（只在最近一次按需扫描的缓存还有效时出现）。
-    7. HumanMessage：屏幕元素表（每轮变，重编号；**必须最后一块**）。
+    7. HumanMessage：屏幕元素表（每步变，重编号；**必须最后一块**）。
 
     顺序直接等于缓存命中率。前缀缓存只覆盖从头开始的连续前缀，任何每轮变的内容
     排在局部历史之前，它之后的整段历史每轮都要满价重算。真机实测（2026-10-21）：
@@ -773,27 +845,9 @@ def build_executor_messages(
     Returns:
         发给 LLM 的消息列表。
     """
-    messages: list[BaseMessage] = [
-        SystemMessage(content=render_executor_system(ctx)),
-    ]
+    messages: list[BaseMessage] = assemble_executor_prompt(ctx, goal=goal)
 
-    # 任务开始时间：系统提示词之后，单独一条消息。
-    #
-    # 为什么放这儿而不是塞进系统提示词的内容里：系统提示词必须逐字节稳定，它是
-    # 整段请求里最大的一块。塞进去，它就变成「每任务唯一」，同一 persona 的不同
-    # 任务之间不再共享那段缓存。单独一条，系统提示词一个字不动，跨任务照样能复用。
-    #
-    # 为什么这条消息是安全的：任务开始时间整场运行不变，它和它前面的系统提示词
-    # 一样是前缀的一部分，永远命中。
-    task_started_at = format_task_started_at(ctx.task_started_at)
-    if task_started_at:
-        messages.append(
-            HumanMessage(content=render_task_started(task_started_at, language=ctx.prompt_language))
-        )
-
-    messages.append(HumanMessage(content=render_goal_message(goal, language=ctx.prompt_language)))
-
-    # 局部历史排在「每轮变的块」之前，见模块文档的顺序说明。
+    # 局部历史排在「每步变的块」之前，见模块文档的顺序说明。
     #
     # 工具结果在这一步按需截断：局部历史是唯一随步数线性增长的一段，而过长的一条
     # 结果能把这整段历史撑爆。只截成功结果，错误逐字保留。
@@ -803,38 +857,26 @@ def build_executor_messages(
     # 截掉，等于把模型要读的东西本身丢了。
     messages.extend(rewrite_history_tool_calls(truncate_local_history(local_messages)))
 
-    # 下面这三个块都是「每轮变」的，必须排在局部历史之后。
+    # 下面四块都是「每步变」的，必须排在局部历史之后。
     #
-    # 原因：前缀缓存只覆盖从头开始的连续前缀。任何每轮变的内容出现在局部历史
-    # 之前，它之后的所有字节（也就是整段局部历史）每轮都要满价重算。
+    # 原因：前缀缓存只覆盖从头开始的连续前缀。任何每步变的内容出现在局部历史
+    # 之前，它之后的所有字节（也就是整段局部历史）每步都要满价重算。
     #
     # 真机实测（2026-10-21）：设备状态里「前台 app」几乎每次导航都变，卡在历史
     # 前面时，executor 的缓存命中率只有 15.8%（六个 agent 里最差，而它调用量
     # 最大）。挪到历史之后，历史那段就能被缓存覆盖。
     #
-    # 元素表仍然排在最后，它每轮重编号，永不缓存；设备状态放在它前面、
+    # 元素表仍然排在最后，它每步重编号，永不缓存；设备状态放在它前面、
     # 局部历史之后。
-
-    if device_state_lines:
-        messages.append(HumanMessage(content="\n".join(device_state_lines)))
-
-    # 「没有进展」的提醒放在这里（历史之后、元素表之前）。它是偶发的，只在检测到
-    # 重复的那一轮出现，但出现时每轮都变，所以同样不能排在局部历史前面。
-    if stall_notice:
-        messages.append(HumanMessage(content=stall_notice))
-
-    # 视觉主体表：最近一次按需扫描的缓存。它和元素表一样每轮可能变，
-    # 但元素表必须保持最后一块（索引契约 + 缓存顺序都有测试守着），所以它放前面。
-    vision_text = render_vision_subjects_message(vision_elements, language=ctx.prompt_language)
-    if vision_text:
-        messages.append(HumanMessage(content=vision_text))
-
-    # 元素表每轮都变，所以放最后。判据统一走 has_element_table，提示侧和工具侧
-    # 必须用同一个判据。
-    elements = screen_elements or []
-    if has_element_table(elements):
-        screen_text = render_screen_message(elements, language=ctx.prompt_language)
-        if screen_text:
-            messages.append(HumanMessage(content=screen_text))
+    blocks = admit_executor_blocks(
+        propose_executor_blocks(
+            ctx=ctx,
+            device_state_lines=device_state_lines,
+            screen_elements=screen_elements,
+            vision_elements=vision_elements,
+            stall_notice=stall_notice,
+        )
+    )
+    messages.extend(HumanMessage(content=text) for _, text in blocks)
 
     return messages

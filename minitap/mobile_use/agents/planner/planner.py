@@ -246,8 +246,14 @@ class PlannerNode:
         #
         # 代价要说清：降级后那个子目标可能再失败，于是又 replan 又降级，可能反复
         # 重规划直到全局动作步预算耗尽。全局预算是唯一的兜底。
+        # 会话层：Planner 每个节点调用 = 一个 Step。
+        runtime = self.ctx.runtime_session
+        step = runtime.begin_step("planner", goal=state.initial_goal) if runtime else None
+
         try:
             new_subgoals = await ask_planner(messages)
+            if step is not None:
+                step.end("planned")
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"[planner] LLM call failed ({type(e).__name__}: {str(e)[:160]}); "
@@ -262,10 +268,14 @@ class PlannerNode:
             )
             try:
                 new_subgoals = await ask_planner([*messages, nudge])
+                if step is not None:
+                    step.end("planned_after_retry")
             except Exception as e2:  # noqa: BLE001
                 failed = [s for s in state.subgoal_plan if s.status == SubgoalStatus.FAILURE]
                 if not failed:
                     # 首次规划（或没有失败子目标）没有可退守的东西，只能抛。
+                    if step is not None:
+                        step.end("failed")
                     logger.warning(
                         f"[planner] retry also failed ({type(e2).__name__}: {str(e2)[:160]}) "
                         "and there is no failed subgoal to re-issue; giving up"
@@ -283,6 +293,8 @@ class PlannerNode:
                     )
                     for s in failed
                 ]
+                if step is not None:
+                    step.end("degraded")
         # 重规划时，模型只交回剩下的步骤。已完成的子目标原样保留，所以它们
         # 不会被执行第二遍。
         completed_subgoals = [

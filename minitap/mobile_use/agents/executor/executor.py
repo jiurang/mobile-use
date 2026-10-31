@@ -188,13 +188,35 @@ class ExecutorNode:
                 "telling the model it may report 'cannot be done'"
             )
 
+        # 会话层：一次 Executor 节点调用 = 一个 Step。Step 在 LLM 调用前开，
+        # 在每条出口上结束；异常路径由 Turn 收尾时统一记为 aborted。
+        runtime = self.ctx.runtime_session
+        step = (
+            runtime.begin_step(
+                "executor",
+                index=step_index,
+                goal=goal,
+                extra={"elements": len(state.latest_screen_elements or [])},
+            )
+            if runtime is not None
+            else None
+        )
+
         response = await self._decide(state=state, goal=goal, stall_notice=stall_notice)
+
+        def _step_extra(
+            extra: dict[str, Any] | None = None, *, messages: int = 1
+        ) -> dict[str, Any]:
+            """本步写入后 executor_messages 的条数（观测值，不参与任何判定）。"""
+            return {"history": len(state.executor_messages) + messages, **(extra or {})}
 
         # 目标达成：不碰 actions，直接收尾。
         #
         # done 时 actions 是空数组，会被 dispatcher 判成空动作拒绝，所以必须
         # 先在派发前判定。
         if response.done:
+            if step is not None:
+                step.end("done", _step_extra())
             return await emit(
                 AIMessage(
                     content=response.done_reason
@@ -209,6 +231,8 @@ class ExecutorNode:
         # 没有这条出口时「做不到」在契约里不可表达，模型只能一直试到撞
         # recursion_limit。有了它，Cortex 可以换招或放弃，任务继续往下走。
         if response.failed:
+            if step is not None:
+                step.end("failed", _step_extra())
             logger.info("[executor] Model reported the goal cannot be achieved; wrapping up")
             return await emit(
                 AIMessage(
@@ -244,6 +268,11 @@ class ExecutorNode:
 
         if tool_calls is None:
             # dispatcher 拒了：回灌理由让模型重新决策。退回 LLM 只会重复同样的错。
+            if step is not None:
+                step.end(
+                    "rejected",
+                    _step_extra({"rejection": _rejection_code(reject_reason)}, messages=2),
+                )
             logger.info(f"[executor] Dispatch rejected: {reject_reason}")
             telemetry.capture_executor_dispatch(
                 task_id=self.ctx.trace_id,
@@ -274,6 +303,17 @@ class ExecutorNode:
                 len(response.actions), language=self.ctx.prompt_language
             )
 
+        if step is not None:
+            step.end(
+                "action",
+                _step_extra(
+                    {
+                        "action": (actions[0].get("action") if actions else None),
+                        "actions": len(response.actions),
+                    }
+                ),
+            )
+
         return await emit(
             AIMessage(content=extra_note, tool_calls=tool_calls),
             progress=[
@@ -300,7 +340,7 @@ class ExecutorNode:
         只绑定 ``ExecutorOutput`` 一个 schema（见 ``get_structured_llm``）。
         解析失败不返回 None，内部会降级成「空动作 + 说明」。
         """
-        # 设备状态模板块，措辞在 prompts/<lang>/messages/per-turn/device-state.md 里：
+        # 设备状态模板块，措辞在 prompts/<lang>/messages/per-step/device-state.md 里：
         # 息屏 / 无感知通道要告知模型，否则它会在黑屏上反复尝试。
         device_state = render_device_state(
             device_date=state.device_date,
@@ -334,6 +374,7 @@ class ExecutorNode:
         schema = ExecutorOutput
         runner = get_structured_llm(ctx=self.ctx, name="executor", schema=schema)
 
+        runtime = self.ctx.runtime_session
         response, failure_reason = await self._invoke(runner, messages, schema)
 
         # 解析失败：带 nudge 重试一次。
@@ -342,6 +383,9 @@ class ExecutorNode:
         # 顶层杀掉任务。这里自己重试并明确告诉模型错在哪（failure_reason 来自
         # 解析层），再失败就降级成「空动作 + 说明」，让流程继续。
         if response is None:
+            # 会话层：Attempt = 同一 Step 内的 provider 重试，不新开 Step。
+            if runtime is not None:
+                runtime.note_attempt("executor", reason=failure_reason, retried=True)
             logger.warning(
                 f"[executor] LLM returned no parseable output ({failure_reason}); retrying once"
             )
@@ -353,6 +397,8 @@ class ExecutorNode:
             ]
             response, retry_reason = await self._invoke(runner, retry_messages, schema)
             if response is None:
+                if runtime is not None:
+                    runtime.note_attempt("executor", reason=retry_reason, retried=False)
                 logger.warning(
                     "[executor] Still unparseable after retry "
                     f"({retry_reason}); degrading to an empty "
@@ -364,6 +410,13 @@ class ExecutorNode:
                         "I could not produce a readable action this round; "
                         "reporting back so the supervisor can redirect me."
                     ),
+                )
+            elif runtime is not None:
+                runtime.note_attempt(
+                    "executor",
+                    reason=failure_reason,
+                    retried=True,
+                    recovered=True,
                 )
 
         # 遥测：这一步花了多少 token。

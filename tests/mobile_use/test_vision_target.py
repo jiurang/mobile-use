@@ -351,7 +351,7 @@ def test_vision_bounds_bypass_the_iou_gate():
 @pytest.mark.parametrize("language", ["en", "zh"])
 def test_prompts_teach_the_vision_index_contract(language):
     """提示词里必须教 `vision_index`，并且不再有旧的定位失败回灌宏。"""
-    message = (_PROMPTS / f"prompts/{language}/messages/per-turn/vision-subjects.md").read_text(
+    message = (_PROMPTS / f"prompts/{language}/messages/per-step/vision-subjects.md").read_text(
         encoding="utf-8"
     )
     assert "vision_index" in message

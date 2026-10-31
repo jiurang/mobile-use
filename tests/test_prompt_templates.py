@@ -130,7 +130,7 @@ def test_executor_manifest_owns_every_message_block():
         "done_fallback",
         "failed_fallback",
     ]
-    allowed = {"per-task", "per-goal", "per-turn", "occasional", "terminal"}
+    allowed = {"per-turn", "per-agent-session", "per-step", "occasional", "terminal"}
     for row in messages:
         path = Path(row["file"])
         for language in ("en", "zh"):
@@ -169,7 +169,7 @@ def test_executor_system_prompt_does_not_carry_the_goal():
     assert "{{ goal }}" not in system_text
     assert "{% if goal" not in system_text
     # 目标只能从消息块进来
-    assert "{{ goal }}" in _prompt_file("messages/per-goal/goal")
+    assert "{{ goal }}" in _prompt_file("messages/per-agent-session/goal")
 
 
 def test_executor_prompt_is_an_independent_decider():
@@ -199,7 +199,7 @@ def test_executor_prompt_keeps_element_targeting_contract():
     而不是某一段标题或某一句措辞：标题和措辞还能再变，契约不能丢。
     """
     # 行格式说明书住在运行时消息块里，不在 system 段。
-    text = _prompt_file("messages/per-turn/screen-elements")
+    text = _prompt_file("messages/per-step/screen-elements")
     # 行格式说明书：`[i] "text" id=... Type (x,y,WxH) flags`
     assert "[i]" in text
     assert "id=" in text
@@ -233,8 +233,8 @@ def test_executor_prompt_keeps_perception_channels():
     开关带来的状态由**每轮消息块**自己说清：两条通道全关时
     `device_state` 明确告知「没有感知通道」。
     """
-    screen = _prompt_file("messages/per-turn/screen-elements")
-    device_state = _prompt_file("messages/per-turn/device-state")
+    screen = _prompt_file("messages/per-step/screen-elements")
+    device_state = _prompt_file("messages/per-step/device-state")
     tools = _prompt_file("system/30-tools")
 
     # 同一张表里包含两种行，且 OCR 行自带置信度说明

@@ -294,7 +294,7 @@ def render_screen_rows(elements: list[ScreenElement]) -> str:
 
     **索引契约的唯一来源**：这里印出的 `[i]` 和 `resolve_screen_index` 吃的
     下标是同一条契约的两端。表头属于提示词，住在 Executor 的模板里
-    （`prompts/<lang>/messages/per-turn/screen-elements.md`），
+    （`prompts/<lang>/messages/per-step/screen-elements.md`），
     所以表头可以按语言翻译，编号规则不行。
     """
     if not elements:

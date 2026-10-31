@@ -22,3 +22,6 @@ v/
 
 # 本地 ACL 工具的备份/报告产物（.acl-report/）
 .acl-report/
+
+# 会话事件日志（.mobile-use/sessions/<id>/events.jsonl）
+.mobile-use/

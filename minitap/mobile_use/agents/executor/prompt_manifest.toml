@@ -39,37 +39,37 @@ order = 40
 file = "system/40-output.md"
 
 # --- 运行时消息块 ---------------------------------------------------------
-# volatility:
-#   per-task   整场运行不变（任务开始时间）
-#   per-goal   子目标内不变（目标陈述）
-#   per-turn   每轮重建（设备状态 / 元素表 / 视觉主体）
-#   occasional 偶发（拒绝 / 重试 / 丢弃动作 / 停滞提醒）
-#   terminal   收尾（步数上限 / 无目标 / done / failed）
+# volatility（名字与目录同名：messages/<volatility>/<name>.md）：
+#   per-turn          整场运行不变（任务开始时间）
+#   per-agent-session 一个局部上下文域内不变（目标陈述；换目标 = 换会话）
+#   per-step          每步重建（设备状态 / 元素表 / 视觉主体）
+#   occasional        偶发（拒绝 / 重试 / 丢弃动作 / 停滞提醒）
+#   terminal          收尾（步数上限 / 无目标 / done / failed）
 
 [[message]]
 name = "task_started"
-file = "messages/per-task/task-started.md"
-volatility = "per-task"
+file = "messages/per-turn/task-started.md"
+volatility = "per-turn"
 
 [[message]]
 name = "goal"
-file = "messages/per-goal/goal.md"
-volatility = "per-goal"
+file = "messages/per-agent-session/goal.md"
+volatility = "per-agent-session"
 
 [[message]]
 name = "device_state"
-file = "messages/per-turn/device-state.md"
-volatility = "per-turn"
+file = "messages/per-step/device-state.md"
+volatility = "per-step"
 
 [[message]]
 name = "screen_elements"
-file = "messages/per-turn/screen-elements.md"
-volatility = "per-turn"
+file = "messages/per-step/screen-elements.md"
+volatility = "per-step"
 
 [[message]]
 name = "vision_subjects"
-file = "messages/per-turn/vision-subjects.md"
-volatility = "per-turn"
+file = "messages/per-step/vision-subjects.md"
+volatility = "per-step"
 
 # occasional 的四块是同一类「反馈」，共享一个模板文件；
 # 渲染时用 `block` 选择其中一段（见 prompt.py 的 render_* 函数）。
